@@ -407,3 +407,127 @@ def test_pf_ode_step_accepts_t_as_B_and_B1():
     out_flat = s.step(x, t, dt=-0.05, generator=None)
     out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=None)
     assert torch.equal(out_flat, out_col)
+
+
+# ----------------------------------------------------- task 2.3: Heun (ODE 2º orden)
+
+
+def test_heun_name():
+    # 2.4: la clave del registry queda fijada en la clase (factory llega en 3.1).
+    from diffusion.samplers.heun import HeunODE
+
+    assert HeunODE.name == "heun"
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "ve", "sub_vp"])
+def test_heun_sample_shape_dtype_finite(sde_name):
+    # 1.1, 1.4, 8.3: x_0 de shape (N, data_dim), float32 y finito sobre las 3 SDEs escalares.
+    from diffusion.samplers.heun import HeunODE
+
+    sde = make_sde(sde_name)
+    s = HeunODE(sde, _zero_score, n_steps=20)
+    n = 32
+    x0 = s.sample(n, init=torch.randn(n, sde.data_dim))
+    assert x0.shape == (n, sde.data_dim)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_heun_deterministic_same_init():
+    # 5.1: dos corridas con el MISMO init producen resultados idénticos.
+    from diffusion.samplers.heun import HeunODE
+
+    sde = make_sde("vp")
+    s = HeunODE(sde, _zero_score, n_steps=20)
+    init = torch.randn(16, sde.data_dim)
+    a = s.sample(16, init=init)
+    b = s.sample(16, init=init)
+    assert torch.equal(a, b)
+
+
+def test_heun_ignores_generator():
+    # 5.1 / 2.4: determinístico — con el mismo init, semillas distintas dan el MISMO
+    # resultado (prueba que el sampler ignora la aleatoriedad del generator).
+    from diffusion.samplers.heun import HeunODE
+
+    sde = make_sde("vp")
+    s = HeunODE(sde, _zero_score, n_steps=20)
+    init = torch.randn(16, sde.data_dim)
+    a = s.sample(16, init=init, generator=torch.Generator().manual_seed(1))
+    b = s.sample(16, init=init, generator=torch.Generator().manual_seed(2))
+    assert torch.equal(a, b)
+
+
+def test_heun_step_matches_trapezoidal_formula():
+    # 2.4: el paso es exactamente la regla del trapecio (predictor Euler + corrección):
+    #   d1 = _pfode_drift(x, t); x̂ = x + d1·dt; d2 = _pfode_drift(x̂, t+dt)
+    #   out = x + ½(d1 + d2)·dt
+    from diffusion.samplers.heun import HeunODE
+
+    def score_fn(x, t):
+        # Score no constante en x para que la 2ª evaluación difiera de la 1ª.
+        return x
+
+    sde = make_sde("vp")
+    s = HeunODE(sde, score_fn, n_steps=20)
+    x = torch.randn(8, sde.data_dim)
+    t = torch.full((8, 1), 0.5)
+    dt = -0.05
+    d1 = s._pfode_drift(x, t)
+    x_pred = x + d1 * dt
+    d2 = s._pfode_drift(x_pred, t + dt)
+    expected = x + 0.5 * (d1 + d2) * dt
+    out = s.step(x, t, dt, generator=None)
+    assert torch.equal(out, expected)
+    assert torch.all(torch.isfinite(out))
+
+
+def test_heun_does_two_score_evaluations():
+    # 2.4: costo observable de DOS evaluaciones de score por paso (predictor + corrector).
+    from diffusion.samplers.heun import HeunODE
+
+    calls = {"n": 0}
+
+    def counting_score(x, t):
+        calls["n"] += 1
+        return torch.ones_like(x)
+
+    sde = make_sde("vp")
+    s = HeunODE(sde, counting_score, n_steps=20)
+    x = torch.randn(8, sde.data_dim)
+    t = torch.full((8, 1), 0.5)
+    s.step(x, t, dt=-0.05, generator=None)
+    assert calls["n"] == 2
+
+
+def test_heun_differs_from_single_euler_pfode_step():
+    # 2.4: la corrección de 2º orden es real (no un no-op): con drift no constante,
+    # un paso de Heun difiere de un único paso de Euler sobre el drift de PF-ODE.
+    from diffusion.samplers.heun import HeunODE
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+
+    def score_fn(x, t):
+        return x  # drift depende de x -> d(x̂, t+dt) != d(x, t)
+
+    sde = make_sde("vp")
+    heun = HeunODE(sde, score_fn, n_steps=20)
+    pf = ProbabilityFlowODE(sde, score_fn, n_steps=20)
+    x = torch.randn(8, sde.data_dim)
+    t = torch.full((8, 1), 0.5)
+    dt = -0.05
+    out_heun = heun.step(x, t, dt, generator=None)
+    out_euler = pf.step(x, t, dt, generator=None)
+    assert not torch.equal(out_heun, out_euler)
+
+
+def test_heun_step_accepts_t_as_B_and_B1():
+    # 8.1: t como (B,) y (B,1) dan el mismo resultado (determinístico).
+    from diffusion.samplers.heun import HeunODE
+
+    sde = make_sde("vp")
+    s = HeunODE(sde, _zero_score, n_steps=20)
+    x = torch.randn(8, 2)
+    t = torch.full((8,), 0.5)
+    out_flat = s.step(x, t, dt=-0.05, generator=None)
+    out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=None)
+    assert torch.equal(out_flat, out_col)

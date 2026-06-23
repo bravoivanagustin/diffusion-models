@@ -32,7 +32,7 @@
   - _Requirements: 2.3, 5.1, 1.4_
   - _Boundary: ProbabilityFlowODE_
 
-- [ ] 2.3 (P) Sampler Heun
+- [x] 2.3 (P) Sampler Heun
   - Esquema ODE de 2º orden: predictor Euler + corrección promediando el drift de PF-ODE en ambos extremos (dos evaluaciones de score por paso).
   - Observable: dos corridas con el mismo `init` producen resultados idénticos; muestras finitas.
   - _Depends: 1.2_
