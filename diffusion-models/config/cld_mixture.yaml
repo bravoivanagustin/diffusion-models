@@ -1,0 +1,32 @@
+# Celda del estudio: CLD-SDE (estado aumentado posición-momento) sobre la mezcla de gaussianas.
+# Correr desde diffusion-models/:  python scripts/train.py --config config/cld_mixture.yaml
+#
+# Nota: CLD aumenta el estado a data_dim=4 (x_1, x_2, v_1, v_2). El loop es agnóstico: la SDE
+# recibe la posición 2D que entrega `data` y arma el estado aumentado internamente; la red se
+# instancia automáticamente con data_dim = sde.data_dim = 4.
+
+sde:
+  name: cld
+  beta: 4.0
+  mass: 0.25
+
+data:
+  shape: mixture
+  dim: 2                  # la POSICIÓN es 2D; la SDE agrega el momento
+  n_samples: 4000
+  n_components: 8
+  standardize: true
+  seed: 0
+
+train:
+  epochs: 300
+  batch_size: 256
+  lr: 0.002
+  t_eps: 1.0e-3
+  grad_clip: 1.0
+  seed: 0
+  device: cpu
+
+out:
+  checkpoint: models/cld_mixture.pt
+  loss_curve: models/cld_mixture_loss.png

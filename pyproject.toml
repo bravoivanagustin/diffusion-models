@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffusion-tp"
+version = "0.0.1"
+description = "TP Final Cálculo Estocástico — datos de juguete y experimentos de modelos de difusión"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23",
+    "scikit-learn>=1.1",
+    "matplotlib>=3.5",
+    "torch>=2.0",
+    "pyyaml>=6",
+    "pytest>=7",
+]
+
+[tool.setuptools.packages.find]
+where = ["diffusion-models/src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["diffusion-models/src"]
+testpaths = ["diffusion-models/tests"]

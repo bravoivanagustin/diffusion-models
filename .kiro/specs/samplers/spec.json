@@ -1,0 +1,22 @@
+{
+  "feature_name": "samplers",
+  "created_at": "2026-06-23T01:56:40Z",
+  "updated_at": "2026-06-23T03:08:29Z",
+  "language": "es",
+  "phase": "tasks-generated",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  },
+  "ready_for_implementation": true
+}
