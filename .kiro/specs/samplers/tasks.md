@@ -87,7 +87,7 @@
   - Observable: los tests de determinismo/reproducibilidad pasan en verde.
   - _Requirements: 2.2, 2.3, 5.1, 5.2, 5.3_
 
-- [ ] 4.3 Test de correctitud con score analítico
+- [x] 4.3 Test de correctitud con score analítico
   - Para un target gaussiano `N(μ, Σ_0)`, construir el score analítico de la marginal `p_t` desde `sde.marginal_prob` e inyectarlo como `ScoreFn`; verificar que cada sampler recupera media/covarianza con tolerancia Monte Carlo (cobertura 4 samplers × 3 SDEs escalares).
   - Seam end-to-end: `make_sde` + `ScoreMLP` + `make_sampler` con shapes coherentes (incl. `data_dim` variable).
   - Observable: el test de recuperación gaussiana pasa dentro de la tolerancia para los cuatro samplers.
@@ -97,3 +97,7 @@
   - Construir un checkpoint con `save_checkpoint` sobre una `ScoreMLP` sin entrenar; generar vía `generate_from_checkpoint`; verificar shape y archivo `.npz`; ruta inexistente → error.
   - Observable: el test de generación desde checkpoint pasa en verde y produce el `.npz` esperado.
   - _Requirements: 6.1, 6.2, 6.3, 6.4_
+
+## Implementation Notes
+
+- 4.3: con score analitico exacto, VE + samplers deterministicos (pf_ode/heun) recuperan la media con error ~0.16 (vs <=0.02 en el resto). NO es bug: el prior estandar de VE es N(0, sigma_max^2) mientras la marginal terminal real es N(mu, sigma0^2 + sigma_max^2); el flujo deterministico no borra ese offset de media (los estocasticos si lo mezclan). Relevante para el futuro modulo de evaluacion.

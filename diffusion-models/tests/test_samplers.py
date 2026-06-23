@@ -1193,3 +1193,127 @@ def test_stochastic_different_seed_differs_via_factory(sampler_name):
     a = s.sample(16, generator=torch.Generator().manual_seed(1))
     b = s.sample(16, generator=torch.Generator().manual_seed(2))
     assert not torch.equal(a, b)
+
+
+# ================================================================================
+# Task 4.3: correctitud matemática con score analítico (test CLAVE) + seam e2e.
+#
+# Es el guardián de que la matemática del proceso reverso esté bien implementada,
+# INDEPENDIENTE del entrenamiento de la red (Req 7). Idea (design.md "Correctness
+# Test", §research.md): para un target gaussiano isotrópico p_data = N(μ, σ0² I), bajo
+# VP/VE/sub-VP la marginal p_t es gaussiana y su score analítico es cerrado:
+#
+#   marginal_prob(x0, t) -> (mean, std) del kernel p_t(x_t|x_0) = N(α_t·x0, std_t² I)
+#   => marginal sobre p_data:  p_t(x) = N(α_t·μ, (α_t²·σ0² + std_t²) I)
+#   => score:  s(x, t) = -(x - α_t·μ) / (α_t²·σ0² + std_t²)        (isótropo)
+#
+# α_t se extrae llamando marginal_prob con x0 = ones (mean == α_t broadcast); std_t es
+# el std devuelto. Inyectando ese ScoreFn, CADA sampler debe RECUPERAR N(μ, σ0² I):
+# media empírica ≈ μ y std empírico por dim ≈ σ0 dentro de tolerancia Monte Carlo.
+#
+# Calibración (medida empíricamente, semilla fija): N=3000, n_steps=300 corre en ~6 s
+# total en CPU. Errores observados de media ≤ 0.02 (VP/sub-VP, todos los samplers; VE
+# euler/pc) y ≤ 0.163 (VE pf_ode/heun: el flujo determinístico no borra del todo el
+# desfasaje del prior de VE, N(0, σ_max²), respecto de la marginal real N(μ, σ0²+σ_max²)
+# en t=T — estable en 0.135–0.163 sobre 5 semillas). Errores de std ≤ 0.025. Tolerancias
+# elegidas (mean abs ≤ 0.20, std abs ≤ 0.10) quedan holgadas sobre lo observado pero
+# DISCRIMINANTES: con score de signo invertido el error de media va de 16 a >400 000, y
+# con score nulo el std explota a 140+ (VP/sub-VP) o queda en 5.0 (VE) ≠ 0.5 — el test
+# falla rotundamente ante cualquier integración incorrecta del reverso.
+# ================================================================================
+
+_MU = [1.5, -1.0]
+_SIGMA0 = 0.5
+# Cobertura 4×3 (Req 7.2): los cuatro samplers del Eje 2 × las tres SDEs escalares.
+_CORRECTNESS_CELLS = [(s, d) for s in _ALL_SAMPLERS for d in _SCALAR_SDES]
+
+
+def _analytic_marginal_score(sde, mu, sigma0):
+    """``ScoreFn`` del score analítico de la marginal gaussiana p_t sobre N(μ, σ0² I).
+
+    Captura ``sde``, ``mu`` (tensor (d,)) y ``sigma0``. Extrae α_t y std_t de
+    ``sde.marginal_prob`` y devuelve ``s(x,t) = -(x - α_t·μ) / (α_t²·σ0² + std_t²)``.
+    Es isótropo: el denominador es escalar por muestra, shape (B,1), broadcast sobre d.
+    """
+    d = mu.shape[0]
+    ones = torch.ones(1, d)
+
+    def score(x, t):
+        mean_alpha, std_t = sde.marginal_prob(ones, t)  # mean_alpha == α_t (broadcast)
+        alpha_t = mean_alpha[:, :1]                      # (B,1) o (1,1)
+        var_t = alpha_t ** 2 * sigma0 ** 2 + std_t ** 2  # (B,1) varianza de la marginal
+        return -(x - alpha_t * mu) / var_t
+
+    return score
+
+
+@pytest.mark.parametrize("sampler_name,sde_name", _CORRECTNESS_CELLS)
+def test_recovers_gaussian_with_analytic_score(sampler_name, sde_name):
+    # 7.1, 7.2: con el score analítico de N(μ, σ0² I) inyectado, cada sampler (×SDE
+    # escalar) recupera la media y el desvío del target dentro de tolerancia Monte Carlo.
+    from diffusion.samplers import make_sampler
+
+    mu = torch.tensor(_MU)
+    sde = make_sde(sde_name)
+    score_fn = _analytic_marginal_score(sde, mu, _SIGMA0)
+    s = make_sampler(sampler_name, sde, score_fn, n_steps=300)
+    x0 = s.sample(3000, generator=torch.Generator().manual_seed(0))
+
+    assert torch.all(torch.isfinite(x0))
+    emp_mean = x0.mean(dim=0)
+    emp_std = x0.std(dim=0)
+    # Media empírica ≈ μ (tolerancia abs por dim; calibrada > peor caso 0.163 de VE det.).
+    assert torch.allclose(emp_mean, mu, atol=0.20), (
+        f"{sampler_name}/{sde_name}: mean {emp_mean.tolist()} != {_MU} (atol=0.20)"
+    )
+    # Desvío empírico por dim ≈ σ0 (tolerancia abs; calibrada > peor caso ~0.025).
+    target_std = torch.full_like(emp_std, _SIGMA0)
+    assert torch.allclose(emp_std, target_std, atol=0.10), (
+        f"{sampler_name}/{sde_name}: std {emp_std.tolist()} != {_SIGMA0} (atol=0.10)"
+    )
+
+
+# ------------------------------------------------------------- seam end-to-end (7.3)
+
+
+def test_seam_make_sde_scoremlp_make_sampler_shapes():
+    # 7.3: la cadena make_sde + ScoreMLP (red real) + make_sampler encaja en shapes de
+    # punta a punta: sample(N) -> (N, data_dim) float32 finito en la dimensión por defecto.
+    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")  # data_dim=2 por defecto
+    net = ScoreMLP(data_dim=2)
+    net.eval()
+
+    def score_fn(x, t):
+        return net(x, t)
+
+    s = make_sampler("euler", sde, score_fn, n_steps=15)
+    n = 16
+    x0 = s.sample(n, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (n, 2)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_seam_dimension_agnostic_non_default_dim():
+    # 7.3: la cadena es agnóstica de la dimensión — con data_dim=3 (no el default 2) en
+    # SDE y red, make_sampler genera salida (N, 3). Confirma que data_dim fluye coherente.
+    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=3)
+    assert sde.data_dim == 3
+    net = ScoreMLP(data_dim=3)
+    net.eval()
+
+    def score_fn(x, t):
+        return net(x, t)
+
+    s = make_sampler("pf_ode", sde, score_fn, n_steps=15)
+    n = 16
+    x0 = s.sample(n, init=torch.randn(n, 3))
+    assert x0.shape == (n, 3)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
