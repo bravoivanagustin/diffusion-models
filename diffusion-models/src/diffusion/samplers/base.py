@@ -1,0 +1,173 @@
+"""Base abstracta de los samplers del proceso reverso (Eje 2).
+
+Un :class:`ReverseSampler` integra numéricamente la ecuación reversa de Anderson (1982)
+
+    ``dx = [f(x,t) - g(t)^2 ∇_x log p_t(x)] dt + g(t) dW̄``
+
+—o su flujo de probabilidad determinístico (PF-ODE)— para generar muestras ``x_0`` a
+partir del prior de ruido ``p_T``, **reusando** el score aprendido ``s_θ(x,t)`` sin
+reentrenar la red. Es el **Eje 2** del estudio de ablación (ver ``docs/project/ejes.md``):
+cambiar el sampler reusa el mismo score; cambiar la SDE (Eje 1) sí obliga a reentrenar.
+
+Patrón Template Method: este ABC fija el algoritmo de integración compartido (grilla
+temporal uniforme, drifts reversos derivados de ``sde.sde`` y del score), y cada sampler
+concreto define solo su :meth:`step`. La red se consume como función pura ``ScoreFn`` y la
+estocasticidad vive en el sampler (EM/PC) o se anula (PF-ODE/Heun), nunca en la red.
+
+Igual que :mod:`diffusion.sde`, este módulo importa **torch directamente** (opera sobre
+tensores; torch es dependencia dura).
+"""
+
+from __future__ import annotations
+
+import abc
+from typing import Callable
+
+import torch
+
+from diffusion.sde import ForwardSDE
+
+#: Contrato de inyección del score: ``(x: (B, data_dim), t: (B,) | (B,1)) -> (B, data_dim)``.
+#: Tanto una :class:`diffusion.mlp.ScoreMLP` entrenada como un score analítico en forma
+#: cerrada encajan sin cambios en el sampler.
+ScoreFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+class ReverseSampler(abc.ABC):
+    """Base de todos los samplers del proceso reverso.
+
+    Un sampler concreto fija :attr:`name` (clave del futuro registry) e implementa
+    :meth:`step`. El ABC aporta la grilla temporal uniforme de ``T`` a ``t_eps``, los dos
+    drifts reversos compartidos (:meth:`_reverse_drift` para la SDE y :meth:`_pfode_drift`
+    para el flujo de probabilidad) y la normalización temporal.
+
+    La red se consume como función pura :attr:`score_fn` y **nunca** se muta. Solo se
+    soportan SDEs escalares (VP/VE/sub-VP); las SDEs aumentadas (CLD) se rechazan en el
+    constructor porque su difusión estructurada queda fuera de alcance de esta iteración.
+    """
+
+    #: Clave del registry/factory, p. ej. ``"euler"``. Sobreescribir en cada subclase.
+    name: str = ""
+
+    def __init__(
+        self,
+        sde: ForwardSDE,
+        score_fn: ScoreFn,
+        *,
+        n_steps: int = 500,
+        t_eps: float = 1e-3,
+    ) -> None:
+        """Inicializa el sampler.
+
+        Args:
+            sde: Proceso forward (Eje 1) del que se derivan los coeficientes ``(f, g)`` y
+                el prior ``p_T``. Debe ser escalar (no aumentado).
+            score_fn: Función pura ``(x, t) -> score`` que aproxima ``∇_x log p_t(x)``.
+            n_steps: Número de pasos (intervalos) de integración; ``>= 1``.
+            t_eps: Tiempo terminal de la integración, un piso ``> 0`` que evita integrar
+                hasta ``t = 0`` exacto; debe cumplir ``0 < t_eps < sde.T``.
+
+        Raises:
+            ValueError: Si ``n_steps < 1`` o ``t_eps`` cae fuera de ``(0, sde.T)``.
+            NotImplementedError: Si ``sde`` es aumentada (CLD): fuera de alcance.
+        """
+        if getattr(sde, "is_augmented", False):
+            raise NotImplementedError(
+                f"SDE aumentada '{getattr(sde, 'name', type(sde).__name__)}' "
+                "(CLD) fuera de alcance: los samplers solo soportan SDEs escalares "
+                "(VP/VE/sub-VP) en esta iteración."
+            )
+        if n_steps < 1:
+            raise ValueError(f"n_steps debe ser >= 1; recibí n_steps={n_steps}")
+        if not (0.0 < t_eps < sde.T):
+            raise ValueError(
+                f"t_eps debe cumplir 0 < t_eps < sde.T={sde.T}; recibí t_eps={t_eps}"
+            )
+        self.sde = sde
+        self.score_fn = score_fn
+        self.n_steps = int(n_steps)
+        self.t_eps = float(t_eps)
+
+    # --------------------------------------------------------------- a implementar
+
+    @abc.abstractmethod
+    def step(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        dt: float,
+        *,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """Avanza un paso de integración de ``t`` a ``t + dt`` (con ``dt < 0``).
+
+        Cada sampler concreto define su discretización; las subclases **no** recalculan la
+        grilla (la maneja el driver).
+
+        Args:
+            x: Estado actual de shape ``(B, data_dim)``.
+            t: Tiempo actual de shape ``(B,)`` o ``(B, 1)``.
+            dt: Tamaño de paso (negativo: se integra en tiempo decreciente).
+            generator: Generador de torch para los samplers estocásticos; los
+                determinísticos (PF-ODE/Heun) lo ignoran.
+
+        Returns:
+            El nuevo estado de shape ``(B, data_dim)``.
+        """
+        raise NotImplementedError
+
+    # ----------------------------------------------------------- helpers compartidos
+
+    def _time_grid(self) -> torch.Tensor:
+        """Grilla temporal uniforme de ``T`` a ``t_eps``.
+
+        Returns:
+            Tensor ``float32`` de shape ``(n_steps + 1,)``, decreciente, con extremos
+            ``T`` (primero) y ``t_eps`` (último).
+        """
+        return torch.linspace(self.sde.T, self.t_eps, self.n_steps + 1, dtype=torch.float32)
+
+    def _reverse_drift(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Drift de la SDE reversa ``f - g^2 s``.
+
+        Args:
+            x: Estado de shape ``(B, data_dim)``.
+            t: Tiempo de shape ``(B,)`` o ``(B, 1)``.
+
+        Returns:
+            Tensor de shape ``(B, data_dim)``.
+        """
+        t = self._expand_t(t)
+        f, g = self.sde.sde(x, t)
+        s = self.score_fn(x, t)
+        return f - (g ** 2) * s
+
+    def _pfode_drift(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Drift del flujo de probabilidad (PF-ODE) ``f - ½ g^2 s``.
+
+        Comparte las mismas marginales que la SDE reversa pero sin término de ruido.
+
+        Args:
+            x: Estado de shape ``(B, data_dim)``.
+            t: Tiempo de shape ``(B,)`` o ``(B, 1)``.
+
+        Returns:
+            Tensor de shape ``(B, data_dim)``.
+        """
+        t = self._expand_t(t)
+        f, g = self.sde.sde(x, t)
+        s = self.score_fn(x, t)
+        return f - 0.5 * (g ** 2) * s
+
+    # ----------------------------------------------------------------- internos
+
+    @staticmethod
+    def _expand_t(t: torch.Tensor) -> torch.Tensor:
+        """Normaliza ``t`` de shape ``(B,)`` o ``(B, 1)`` a ``(B, 1)`` para broadcast."""
+        return t.reshape(-1, 1)
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmético
+        return (
+            f"{type(self).__name__}(sde={type(self.sde).__name__}, "
+            f"n_steps={self.n_steps}, t_eps={self.t_eps})"
+        )

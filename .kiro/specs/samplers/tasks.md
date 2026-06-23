@@ -1,7 +1,7 @@
 # Implementation Plan
 
 - [ ] 1. Fundación: base del proceso reverso
-- [ ] 1.1 Crear el paquete `samplers` y el esqueleto de `ReverseSampler` (ABC)
+- [x] 1.1 Crear el paquete `samplers` y el esqueleto de `ReverseSampler` (ABC)
   - Definir el alias `ScoreFn` y la clase base abstracta con su `__init__` (valida `n_steps >= 1` y `0 < t_eps < T`).
   - Guarda explícita: rechazar SDEs aumentadas (`is_augmented`, CLD) con un error claro de "fuera de alcance".
   - Helpers compartidos: grilla temporal uniforme de `T` a `t_eps`; drift reverso `f - g²s` y drift de PF-ODE `f - ½g²s` (derivados de `sde.sde` y `score_fn`); normalización de `t` a `(B,1)`.
