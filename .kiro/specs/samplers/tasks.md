@@ -68,7 +68,7 @@
   - _Requirements: 2.1_
   - _Boundary: samplers __main___
 
-- [ ] 3.4 CLI de generación
+- [x] 3.4 CLI de generación
   - `scripts/sample.py` (argparse) que envuelve `generate_from_checkpoint` (checkpoint, sampler, n_samples, n_steps, seed, salida, flag de trayectoria).
   - Observable: la CLI genera un `.npz` desde un checkpoint dado por argumentos.
   - _Depends: 3.2_

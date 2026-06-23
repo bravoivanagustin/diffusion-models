@@ -919,3 +919,87 @@ def test_main_smoke_runs_all_samplers():
     assert set(summary) == set(available_samplers())
     assert len(summary) == 4
     assert all(summary.values())
+
+
+# ------------------------------------------------------- task 3.4: CLI sample.py
+
+
+def _load_sample_cli():
+    """Importa ``scripts/sample.py`` por ruta (vive fuera del paquete ``diffusion``)."""
+    import importlib.util
+    import pathlib
+
+    script = (
+        pathlib.Path(__file__).resolve().parents[1] / "scripts" / "sample.py"
+    )
+    spec = importlib.util.spec_from_file_location("_sample_cli", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cli_sample_writes_npz(tmp_path):
+    # 6.1/6.2: la CLI genera un .npz con `samples` (N, data_dim) desde un checkpoint.
+    pytest.importorskip("diffusion.mlp")
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    cli = _load_sample_cli()
+    ckpt = _make_checkpoint(tmp_path, sde_name="vp", data_dim=2)
+    out = tmp_path / "gen" / "out.npz"  # subdir inexistente: debe crearse
+    rc = cli.main(
+        [
+            str(ckpt),
+            "--sampler", "pf_ode",
+            "--n-samples", "8",
+            "--n-steps", "5",
+            "--seed", "0",
+            "--out", str(out),
+        ]
+    )
+    assert rc == 0
+    assert out.exists()
+    with np.load(out) as data:
+        assert "samples" in data
+        assert data["samples"].shape == (8, 2)
+        assert "trajectory" not in data
+
+
+def test_cli_sample_trajectory_flag(tmp_path):
+    # 6.3: con --trajectory el .npz también guarda la trayectoria.
+    pytest.importorskip("diffusion.mlp")
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    cli = _load_sample_cli()
+    ckpt = _make_checkpoint(tmp_path)
+    out = tmp_path / "out.npz"
+    n_steps = 5
+    rc = cli.main(
+        [
+            str(ckpt),
+            "--sampler", "pf_ode",
+            "--n-samples", "8",
+            "--n-steps", str(n_steps),
+            "--seed", "0",
+            "--out", str(out),
+            "--trajectory",
+        ]
+    )
+    assert rc == 0
+    with np.load(out) as data:
+        assert "samples" in data
+        assert "trajectory" in data
+        assert data["trajectory"].shape == (n_steps + 1, 8, 2)
+
+
+def test_cli_sample_parser_has_sampler_choices():
+    # 4.2/6.1: el parser ofrece --sampler con las opciones del registry.
+    from diffusion.samplers import available_samplers
+
+    cli = _load_sample_cli()
+    parser = cli.build_parser()
+    # parse mínimo válido: checkpoint + sampler del registry.
+    args = parser.parse_args(["ckpt.pt", "--sampler", available_samplers()[0]])
+    assert args.sampler in available_samplers()
+    assert args.n_steps == 500  # default de generate_from_checkpoint
