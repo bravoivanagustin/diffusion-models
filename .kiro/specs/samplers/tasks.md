@@ -39,7 +39,7 @@
   - _Requirements: 2.4, 5.1, 1.4_
   - _Boundary: HeunODE_
 
-- [ ] 2.4 (P) Sampler predictor–corrector
+- [x] 2.4 (P) Sampler predictor–corrector
   - Paso de Euler–Maruyama (predictor) seguido de `n_corrector` correcciones de Langevin al nivel `t+dt`: `x ← x + ε·s + √(2ε)·Z`, con `ε` derivado de un target de SNR; parámetros propios `snr` y `n_corrector`.
   - Observable: produce muestras finitas; reproducible con `generator` sembrado y distinto con otra semilla.
   - _Depends: 1.2_

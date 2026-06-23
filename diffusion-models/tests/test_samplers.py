@@ -531,3 +531,157 @@ def test_heun_step_accepts_t_as_B_and_B1():
     out_flat = s.step(x, t, dt=-0.05, generator=None)
     out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=None)
     assert torch.equal(out_flat, out_col)
+
+
+# ------------------------------------------- task 2.4: predictor–corrector
+
+
+def _linear_score(x, t):
+    """Score analítico no nulo (apunta al origen) para ejercitar el corrector."""
+    return -x
+
+
+def test_pc_name():
+    # 2.5: la clave del registry queda fijada en la clase (factory llega en 3.1).
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    assert PredictorCorrector.name == "pc"
+
+
+def test_pc_constructor_accepts_extra_kwargs():
+    # 4.4 / 2.5: es el único sampler con kwargs propios (n_corrector, snr).
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde("vp")
+    s = PredictorCorrector(sde, _zero_score, n_steps=20, n_corrector=3, snr=0.2)
+    assert s.n_corrector == 3
+    assert s.snr == pytest.approx(0.2)
+
+
+def test_pc_constructor_defaults():
+    # 2.5: defaults documentados (Song et al.): n_corrector=1, snr=0.16.
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde("vp")
+    s = PredictorCorrector(sde, _zero_score, n_steps=20)
+    assert s.n_corrector == 1
+    assert s.snr == pytest.approx(0.16)
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "ve", "sub_vp"])
+def test_pc_sample_shape_dtype_finite(sde_name):
+    # 1.1, 1.4, 8.3: x_0 de shape (N, data_dim), float32 y finito sobre las 3 SDEs escalares.
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde(sde_name)
+    s = PredictorCorrector(sde, _linear_score, n_steps=20, n_corrector=1)
+    n = 32
+    x0 = s.sample(n, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (n, sde.data_dim)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_pc_sample_finite_with_real_mlp():
+    # 1.4: con una ScoreMLP real (sin entrenar) el corrector se ejercita y produce finito.
+    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde("vp", data_dim=2)
+    net = ScoreMLP(data_dim=2)
+    net.eval()
+
+    def score_fn(x, t):
+        return net(x, t)
+
+    s = PredictorCorrector(sde, score_fn, n_steps=20, n_corrector=2)
+    x0 = s.sample(16, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (16, 2)
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_pc_reproducible_same_seed():
+    # 5.2: dos corridas con generadores del MISMO seed coinciden exactamente.
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde("vp")
+    s = PredictorCorrector(sde, _linear_score, n_steps=20)
+    a = s.sample(16, generator=torch.Generator().manual_seed(123))
+    b = s.sample(16, generator=torch.Generator().manual_seed(123))
+    assert torch.equal(a, b)
+
+
+def test_pc_differs_with_different_seed():
+    # 5.3: semillas distintas -> muestras distintas.
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde("vp")
+    s = PredictorCorrector(sde, _linear_score, n_steps=20)
+    a = s.sample(16, generator=torch.Generator().manual_seed(1))
+    b = s.sample(16, generator=torch.Generator().manual_seed(2))
+    assert not torch.equal(a, b)
+
+
+def test_pc_n_corrector_zero_reduces_to_predictor():
+    # 2.5: n_corrector controla el número de correcciones de Langevin. Con n_corrector=0
+    # el paso es solo el predictor (Euler–Maruyama); debe diferir de n_corrector=2.
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+
+    sde = make_sde("vp")
+    x = torch.randn(8, sde.data_dim)
+    t = torch.full((8, 1), 0.5)
+    dt = -0.05
+
+    pc0 = PredictorCorrector(sde, _linear_score, n_steps=20, n_corrector=0)
+    em = EulerMaruyama(sde, _linear_score, n_steps=20)
+    out0 = pc0.step(x, t, dt, generator=torch.Generator().manual_seed(5))
+    out_em = em.step(x, t, dt, generator=torch.Generator().manual_seed(5))
+    # Sin correcciones, el paso PC coincide con el predictor Euler–Maruyama.
+    assert torch.equal(out0, out_em)
+
+    pc2 = PredictorCorrector(sde, _linear_score, n_steps=20, n_corrector=2)
+    out2 = pc2.step(x, t, dt, generator=torch.Generator().manual_seed(5))
+    # Con correcciones de Langevin el resultado difiere del predictor solo.
+    assert not torch.equal(out2, out0)
+
+
+def test_pc_counts_score_calls():
+    # 2.5: predictor usa el drift reverso (1 eval de score) + n_corrector evals de Langevin.
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    calls = {"n": 0}
+
+    def counting_score(x, t):
+        calls["n"] += 1
+        return -x
+
+    sde = make_sde("vp")
+    s = PredictorCorrector(sde, counting_score, n_steps=20, n_corrector=3)
+    x = torch.randn(8, sde.data_dim)
+    t = torch.full((8, 1), 0.5)
+    s.step(x, t, dt=-0.05, generator=torch.Generator().manual_seed(0))
+    assert calls["n"] == 1 + 3  # predictor (reverse drift) + n_corrector Langevin
+
+
+def test_pc_nan_safe_with_zero_score():
+    # 8.2: con score nulo el denominador ‖s‖ es ~0; el piso evita div-by-zero / NaN.
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde("vp")
+    s = PredictorCorrector(sde, _zero_score, n_steps=20, n_corrector=2)
+    x0 = s.sample(16, generator=torch.Generator().manual_seed(0))
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_pc_step_accepts_t_as_B_and_B1():
+    # 8.1: t como (B,) y (B,1) dan el mismo resultado (mismo generador sembrado).
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    sde = make_sde("vp")
+    s = PredictorCorrector(sde, _linear_score, n_steps=20)
+    x = torch.randn(8, 2)
+    t = torch.full((8,), 0.5)
+    out_flat = s.step(x, t, dt=-0.05, generator=torch.Generator().manual_seed(7))
+    out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=torch.Generator().manual_seed(7))
+    assert torch.equal(out_flat, out_col)
