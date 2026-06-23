@@ -253,3 +253,77 @@ def test_sample_determinism_with_fixed_init():
     a = s.sample(16, init=init)
     b = s.sample(16, init=init)
     assert torch.equal(a, b)
+
+
+# ----------------------------------------------------- task 2.1: Euler–Maruyama
+
+
+def test_euler_name():
+    # 2.1: la clave del registry queda fijada en la clase (factory llega en 3.1).
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+
+    assert EulerMaruyama.name == "euler"
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "ve", "sub_vp"])
+def test_euler_sample_shape_dtype_finite(sde_name):
+    # 1.1, 1.4, 8.3: x_0 de shape (N, data_dim), float32 y finito sobre las 3 SDEs escalares.
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+
+    sde = make_sde(sde_name)
+    s = EulerMaruyama(sde, _zero_score, n_steps=20)
+    n = 32
+    x0 = s.sample(n, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (n, sde.data_dim)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_euler_reproducible_same_seed():
+    # 5.2: dos corridas con generadores del MISMO seed coinciden exactamente.
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+
+    sde = make_sde("vp")
+    s = EulerMaruyama(sde, _zero_score, n_steps=20)
+    a = s.sample(16, generator=torch.Generator().manual_seed(123))
+    b = s.sample(16, generator=torch.Generator().manual_seed(123))
+    assert torch.equal(a, b)
+
+
+def test_euler_differs_with_different_seed():
+    # 5.3: semillas distintas -> muestras distintas.
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+
+    sde = make_sde("vp")
+    s = EulerMaruyama(sde, _zero_score, n_steps=20)
+    a = s.sample(16, generator=torch.Generator().manual_seed(1))
+    b = s.sample(16, generator=torch.Generator().manual_seed(2))
+    assert not torch.equal(a, b)
+
+
+def test_euler_step_injects_noise():
+    # 2.2: el paso es genuinamente estocástico — con score y drift nulos (VE: drift 0)
+    # el estado igual cambia por la inyección de ruido del término de difusión.
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+
+    sde = make_sde("ve")  # drift nulo
+    s = EulerMaruyama(sde, _zero_score, n_steps=20)
+    x = torch.zeros(8, sde.data_dim)
+    t = torch.full((8, 1), sde.T)
+    out = s.step(x, t, dt=-0.05, generator=torch.Generator().manual_seed(0))
+    # Con f=0 y s=0, out = g·√|dt|·Z, que no puede ser idénticamente x (=0).
+    assert not torch.equal(out, x)
+    assert torch.all(torch.isfinite(out))
+
+
+def test_euler_step_accepts_t_as_B_and_B1():
+    # 8.1: t como (B,) y (B,1) dan el mismo resultado (mismo generador sembrado).
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+
+    sde = make_sde("vp")
+    s = EulerMaruyama(sde, _zero_score, n_steps=20)
+    x = torch.randn(8, 2)
+    t = torch.full((8,), 0.5)
+    out_flat = s.step(x, t, dt=-0.05, generator=torch.Generator().manual_seed(7))
+    out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=torch.Generator().manual_seed(7))
+    assert torch.equal(out_flat, out_col)

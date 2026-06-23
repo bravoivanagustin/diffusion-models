@@ -18,7 +18,7 @@
   - _Boundary: ReverseSampler base_
 
 - [ ] 2. Core: los cuatro samplers (un archivo por sampler)
-- [ ] 2.1 (P) Sampler Euler–Maruyama
+- [x] 2.1 (P) Sampler Euler–Maruyama
   - Paso de SDE reversa: `x + (f - g²s)·dt + g·√|dt|·Z`, con ruido tomado del `generator` (estocástico).
   - Observable: produce muestras finitas; dos corridas con el mismo `generator` sembrado coinciden y con semillas distintas difieren.
   - _Depends: 1.2_
