@@ -76,7 +76,7 @@
   - _Boundary: scripts/sample.py_
 
 - [ ] 4. Validación: suite de tests (comparten `tests/test_samplers.py`, secuenciales)
-- [ ] 4.1 Tests de contrato y factory
+- [x] 4.1 Tests de contrato y factory
   - Parametrizar sobre samplers × SDEs escalares: shape `(N, data_dim)`, `dtype float32`, finitud; grilla arranca en `T` y termina en `t_eps`; `return_trajectory` con shape coherente; `t` como `(B,)` y `(B,1)` da igual resultado; `n_steps` configurable.
   - Factory: `available_samplers()` esperado, tipo correcto, nombre desconocido → error, kwargs filtrados; los parámetros de una `ScoreMLP` no cambian tras `sample()`.
   - Observable: `python -m pytest` corre estos tests en verde.

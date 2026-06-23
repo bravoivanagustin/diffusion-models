@@ -1003,3 +1003,118 @@ def test_cli_sample_parser_has_sampler_choices():
     args = parser.parse_args(["ckpt.pt", "--sampler", available_samplers()[0]])
     assert args.sampler in available_samplers()
     assert args.n_steps == 500  # default de generate_from_checkpoint
+
+
+# ================================================================================
+# Task 4.1: contrato + factory consolidados sobre la matriz 4 samplers × 3 SDEs.
+#
+# Las tasks 1.x–3.1 ya cubrieron cada ítem con tests focalizados (construyendo las
+# clases concretas directamente). Acá se consolida el producto cruzado COMPLETO por
+# el camino del registry (``make_sampler``), que es la interfaz real del estudio de
+# ablación, y se cierran los huecos que sólo se ejercitaban sobre el doble de test
+# ``_PFODESampler`` (trayectoria y red-intacta) o sólo a nivel atributo (n_steps).
+# ================================================================================
+
+# Los cuatro samplers del Eje 2 × las tres SDEs escalares (2.1, 7.2).
+_ALL_SAMPLERS = ["euler", "pf_ode", "heun", "pc"]
+_SCALAR_SDES = ["vp", "ve", "sub_vp"]
+_SAMPLER_X_SDE = [(s, d) for s in _ALL_SAMPLERS for d in _SCALAR_SDES]
+
+
+@pytest.mark.parametrize("sampler_name,sde_name", _SAMPLER_X_SDE)
+def test_contract_sample_shape_dtype_finite_via_factory(sampler_name, sde_name):
+    # 1.1, 1.4, 8.3, 2.1, 4.1, 7.2: para CADA sampler × CADA SDE escalar, construido
+    # por el registry (make_sampler), sample(N) devuelve (N, data_dim) float32 finito.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde(sde_name)
+    # _linear_score (apunta al origen) es no trivial y mantiene a PC numéricamente sano.
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=15)
+    n = 24
+    x0 = s.sample(n, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (n, sde.data_dim)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_contract_return_trajectory_shape_via_factory(sampler_name):
+    # 1.5, 8.4: para cada sampler real (vía factory), return_trajectory devuelve
+    # (n_steps+1, N, data_dim) float32, coherente con el n_steps configurado, y el
+    # último estado de la trayectoria coincide con x_0.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    n_steps = 12
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=n_steps)
+    n = 8
+    x0, traj = s.sample(
+        n, generator=torch.Generator().manual_seed(0), return_trajectory=True
+    )
+    assert x0.shape == (n, sde.data_dim)
+    assert traj.shape == (n_steps + 1, n, sde.data_dim)
+    assert traj.dtype == torch.float32
+    assert torch.equal(traj[-1], x0)
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_contract_n_steps_configurable_changes_trajectory_length(sampler_name):
+    # 8.4: n_steps es configurable y se refleja de punta a punta — la longitud de la
+    # trayectoria sigue a n_steps (n_steps+1 capas), no es un valor fijo cableado.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    n = 8
+    s_short = make_sampler(sampler_name, sde, _linear_score, n_steps=7)
+    s_long = make_sampler(sampler_name, sde, _linear_score, n_steps=21)
+    assert s_short.n_steps == 7
+    assert s_long.n_steps == 21
+    _, traj_short = s_short.sample(
+        n, generator=torch.Generator().manual_seed(0), return_trajectory=True
+    )
+    _, traj_long = s_long.sample(
+        n, generator=torch.Generator().manual_seed(0), return_trajectory=True
+    )
+    assert traj_short.shape[0] == 7 + 1
+    assert traj_long.shape[0] == 21 + 1
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_contract_grid_starts_at_T_ends_at_t_eps_via_factory(sampler_name):
+    # 1.2, 8.2, 8.4: la grilla de cada sampler (vía factory) arranca en T, termina en
+    # t_eps (>0) y tiene n_steps+1 puntos, decreciente.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    n_steps = 10
+    t_eps = 2e-3
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=n_steps, t_eps=t_eps)
+    grid = s._time_grid()
+    assert grid.shape == (n_steps + 1,)
+    assert grid[0].item() == pytest.approx(sde.T)
+    assert grid[-1].item() == pytest.approx(t_eps)
+    assert torch.all(grid > 0.0)
+    assert torch.all(grid[:-1] > grid[1:])
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_contract_net_params_unchanged_after_sample_via_factory(sampler_name):
+    # 3.3, 3.2: con una ScoreMLP real inyectada como score_fn, ningún sampler (vía
+    # factory) altera los parámetros de la red durante sample().
+    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=2)
+    net = ScoreMLP(data_dim=2)
+    net.eval()
+    before = [p.detach().clone() for p in net.parameters()]
+
+    def score_fn(x, t):
+        return net(x, t)
+
+    s = make_sampler(sampler_name, sde, score_fn, n_steps=10)
+    s.sample(16, generator=torch.Generator().manual_seed(0))
+    after = list(net.parameters())
+    assert len(before) == len(after)
+    for b, a in zip(before, after):
+        assert torch.equal(b, a)
