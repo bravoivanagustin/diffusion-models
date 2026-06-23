@@ -47,7 +47,7 @@
   - _Boundary: PredictorCorrector_
 
 - [ ] 3. Integración: factory, generación y entrypoints
-- [ ] 3.1 Registry y factory por nombre
+- [x] 3.1 Registry y factory por nombre
   - Construir el `REGISTRY` con los cuatro samplers; exponer `available_samplers()` y `make_sampler(name, sde, score_fn, **kwargs)` filtrando kwargs por firma.
   - Observable: `make_sampler` devuelve la instancia correcta; nombre desconocido lanza error enumerando las opciones; kwargs no aplicables se descartan sin fallar.
   - _Requirements: 2.1, 3.1, 4.1, 4.2, 4.3, 4.4_

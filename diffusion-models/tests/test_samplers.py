@@ -685,3 +685,94 @@ def test_pc_step_accepts_t_as_B_and_B1():
     out_flat = s.step(x, t, dt=-0.05, generator=torch.Generator().manual_seed(7))
     out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=torch.Generator().manual_seed(7))
     assert torch.equal(out_flat, out_col)
+
+
+# ----------------------------------------------- task 3.1: registry y factory
+
+
+def test_available_samplers_sorted_names():
+    # 4.2: la factory expone la lista de nombres disponibles (ordenados).
+    from diffusion.samplers import available_samplers
+
+    assert available_samplers() == ["euler", "heun", "pc", "pf_ode"]
+
+
+def test_registry_maps_names_to_classes():
+    # 4.1/2.1: REGISTRY mapea cada nombre a su clase de sampler.
+    from diffusion.samplers import REGISTRY
+    from diffusion.samplers.euler_maruyama import EulerMaruyama
+    from diffusion.samplers.heun import HeunODE
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+    from diffusion.samplers.predictor_corrector import PredictorCorrector
+
+    assert REGISTRY == {
+        "euler": EulerMaruyama,
+        "pf_ode": ProbabilityFlowODE,
+        "heun": HeunODE,
+        "pc": PredictorCorrector,
+    }
+
+
+@pytest.mark.parametrize(
+    "name,cls_name",
+    [
+        ("euler", "EulerMaruyama"),
+        ("pf_ode", "ProbabilityFlowODE"),
+        ("heun", "HeunODE"),
+        ("pc", "PredictorCorrector"),
+    ],
+)
+def test_make_sampler_returns_correct_type(name, cls_name):
+    # 4.1/2.1: make_sampler instancia el sampler correcto configurado con sde y score.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler(name, sde, _zero_score)
+    assert type(s).__name__ == cls_name
+    assert s.sde is sde
+    assert s.score_fn is _zero_score
+
+
+def test_make_sampler_unknown_name_lists_options():
+    # 4.3: nombre desconocido -> ValueError enumerando las opciones válidas.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    with pytest.raises(ValueError) as excinfo:
+        make_sampler("does_not_exist", sde, _zero_score)
+    msg = str(excinfo.value)
+    for opt in ("euler", "heun", "pc", "pf_ode"):
+        assert opt in msg
+
+
+def test_make_sampler_discards_inapplicable_kwargs():
+    # 4.4: kwargs que no aplican al sampler elegido se descartan sin fallar (caller genérico).
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    # snr/n_corrector son exclusivos de PC; euler debe ignorarlos sin error.
+    s = make_sampler("euler", sde, _zero_score, snr=0.5, n_corrector=3)
+    assert type(s).__name__ == "EulerMaruyama"
+    assert not hasattr(s, "n_corrector")
+    assert not hasattr(s, "snr")
+
+
+def test_make_sampler_applies_pc_kwargs():
+    # 4.4: para PC, los kwargs propios SÍ se aplican (no se descartan).
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler("pc", sde, _zero_score, snr=0.5, n_corrector=3)
+    assert type(s).__name__ == "PredictorCorrector"
+    assert s.n_corrector == 3
+    assert s.snr == pytest.approx(0.5)
+
+
+def test_make_sampler_passes_common_kwargs():
+    # 4.1/8.4: kwargs comunes (n_steps, t_eps) llegan al constructor base.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler("euler", sde, _zero_score, n_steps=33, t_eps=5e-3)
+    assert s.n_steps == 33
+    assert s.t_eps == pytest.approx(5e-3)
