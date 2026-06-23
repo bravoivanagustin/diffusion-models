@@ -86,3 +86,26 @@ Este documento contiene el historial del projecto. Aca se suben creaciones, modi
 - Próximo módulo: los **samplers** del reverso (Euler–Maruyama, PF-ODE, Heun, predictor–corrector) — el Eje 2 —, que reusan los checkpoints entrenados.
 - Sigue pendiente el dataset final de imágenes (gatos / CIFAR-10 / FashionMNIST), de `proyecto.md`.
 - (Menor) El `.claude/CLAUDE.md` quedó desactualizado (lista `sde` y `training` como no implementados); conviene refrescarlo.
+
+### 23/06/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Quinto módulo de código: los samplers del proceso reverso (`diffusion.samplers`, **Eje 2**) — Euler–Maruyama, Probability-Flow ODE, Heun y predictor–corrector —, construidos vía el flujo Kiro spec-driven. Validados sobre VP/VE/sub-VP; CLD queda con guarda explícita (fuera de alcance, atado al pesado HSM).
+
+**Contexto:** Con `sde` (forward) y `training` (la red entrenada) ya entregados, faltaba cerrar el ciclo: integrar la ecuación reversa para generar muestras a partir de ruido. Es el **Eje 2** de `ejes.md`, y a diferencia del Eje 1 **no reentrena** (los cuatro samplers comparten el mismo score). Se construyó usando el pipeline Kiro spec-driven, y en discovery se acotó el alcance: SDEs escalares primero (CLD con guarda, pendiente del HSM), samplers "puros" con captura opcional de trayectoria (la visualización va en un módulo aparte).
+
+**Acciones realizadas:**
+- Creado el paquete `diffusion.samplers` (`base.py` + un archivo por sampler + `generate.py` + `__init__.py` + `__main__.py`) con torch como dependencia dura; patrón **Template Method**, espejo de `sde/`.
+- `ReverseSampler` (ABC): el **score como función inyectable** (`ScoreFn`; `ScoreMLP` la cumple tal cual, y admite el score analítico para validar); grilla temporal `T→t_eps`; drifts reversos compartidos (`f−g²s` y `f−½g²s`); driver `sample(...)` (arranca del prior o de `init`, integra hacia atrás bajo `no_grad`/`float32` sin mutar la red, `return_trajectory` opcional); guarda que rechaza SDEs aumentadas (CLD).
+- Los cuatro samplers, uno por archivo: `euler` (SDE estocástico, baseline), `pf_ode` (ODE determinístico), `heun` (ODE 2º orden, 2 evals/paso), `pc` (Euler–Maruyama + `n_corrector` correcciones de Langevin con `ε` por target de SNR; `snr=0.16`, `n_corrector=1`). Integran la SDE reversa de Anderson y la PF-ODE de Song et al.
+- Registry/factory (`make_sampler`, `available_samplers`) calcado de `sde`, con filtrado de kwargs por firma. Generación config/checkpoint-driven: `generate_from_checkpoint` reusa `training.load_checkpoint`, reconstruye la SDE desde la metadata y guarda `.npz`; CLI `scripts/sample.py`.
+- Suite de pytest parametrizada sobre **4 samplers × 3 SDEs escalares** (suite completa en verde, 254 pasan; el único skip es preexistente, por `pyyaml` ausente en el entorno): contrato/factory, determinismo/reproducibilidad, **correctitud con score analítico** (cada sampler recupera una gaussiana conocida `N(μ,Σ₀)` dentro de tolerancia Monte Carlo) y generación desde checkpoint. Doc del módulo en `docs/project/samplers.md`.
+- **Proceso (Kiro spec-driven):** discovery → requirements → design (con `/kiro-validate-design`) → tasks → implementación autónoma (un subagente por tarea + review adversarial independiente + validación final GO). Artefactos en `.kiro/specs/samplers/` (brief, requirements, design, research, tasks); rama `feat/samplers`, 14 sub-tareas, un commit por tarea.
+- Refrescado el `.claude/CLAUDE.md` (resuelve el follow-up menor de la entrada anterior): marca `sde`/`training` como hechos y suma `samplers` como el módulo en curso.
+
+**Follow-ups:**
+- **Pesado de HSM para CLD** sigue pendiente; recién después, la dinámica reversa de CLD (hoy la guarda la rechaza). Nota validada: con score exacto, VE + samplers determinísticos dejan un offset de media residual — es correcto (prior `N(0,σ_max²)` vs marginal `N(μ,σ₀²+σ_max²)`), no un bug.
+- Módulo de **evaluación / visualización** de Fase 1 (campos de score, trayectorias, densidad, comparación con el score analítico de la mezcla; FID/IS en Fase 2). Los samplers ya exponen `return_trajectory` para alimentarlo.
+- La **matriz 4×4 escalar** ya es ejecutable (VP/VE/sub-VP × los 4 samplers, reusando checkpoints).
+- Sigue pendiente el dataset final de imágenes (gatos / CIFAR-10 / FashionMNIST), de `proyecto.md`.

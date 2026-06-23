@@ -2,7 +2,7 @@
 
 Este documento contiene las tareas pendientes a desarrollar para el proyecto.
 
-La tabla de abajo consolida los **"Próximos Pasos" / Follow-ups** de `cronica.md`, deduplicando los ítems repetidos entre entradas. Los módulos ya entregados figuran como 🟢 Hecho —`data_generation` (29/05), `mlp` (01/06), el forward SDE `sde` (04/06) y el loop de entrenamiento `training` (04/06)— para dar el panorama completo. El orden sigue la secuencia implícita de `ejes.md`: forward SDE → entrenamiento → samplers, más las tareas transversales.
+La tabla de abajo consolida los **"Próximos Pasos" / Follow-ups** de `cronica.md`, deduplicando los ítems repetidos entre entradas. Los módulos ya entregados figuran como 🟢 Hecho —`data_generation` (29/05), `mlp` (01/06), el forward SDE `sde` (04/06), el loop de entrenamiento `training` (04/06) y los samplers `samplers` (23/06)— para dar el panorama completo. El orden sigue la secuencia implícita de `ejes.md`: forward SDE → entrenamiento → samplers, más las tareas transversales.
 
 | Fecha | Categoría | Tarea | Estado |
 |-------|-----------|-------|--------|
@@ -12,8 +12,10 @@ La tabla de abajo consolida los **"Próximos Pasos" / Follow-ups** de `cronica.m
 | 04/06 | Desarrollo | Para CLD, instanciar `ScoreMLP(data_dim=4)` (estado aumentado posición–momento). | 🟢 Hecho (seam `sde × mlp` verificado en tests) |
 | 04/06 | Desarrollo | Módulo `training`: loop de entrenamiento por denoising score matching (helper `dsm_loss`, `train`, `TrainConfig`, checkpoints, corridas por config YAML + CLI `scripts/train.py`, 20 tests). VP/VE/sub-VP convergen. | 🟢 Hecho |
 | 04/06 | Desarrollo | Pesado de HSM para CLD en el loop (hoy `sde.score_target` devuelve `weight=1`; sin él CLD no converge —el target del momento explota con `t→0`). Decidir la **fórmula del peso** y **dónde vive** (`training` vs `sde`); luego ejercitar las celdas de CLD. | 🔴 Pendiente |
-| 01/06 | Desarrollo | Implementar los samplers del reverso: Euler–Maruyama, PF-ODE, Heun y predictor–corrector. | 🔴 Pendiente |
+| 23/06 | Desarrollo | Módulo `samplers`: los 4 samplers del reverso (Euler–Maruyama, PF-ODE, Heun, predictor–corrector) + registry/factory + generación checkpoint-driven y CLI. Validados sobre VP/VE/sub-VP (correctitud con score analítico); CLD con guarda (fuera de alcance). | 🟢 Hecho |
+| 23/06 | Desarrollo | Dinámica reversa de CLD en los samplers (hoy la guarda rechaza SDEs aumentadas). Atada al pesado de HSM de arriba. | 🔴 Pendiente |
+| 23/06 | Desarrollo | Módulo de evaluación / visualización de Fase 1: campos de score, trayectorias de partículas, reconstrucción de densidad y comparación contra el score analítico de la mezcla (FID / IS en Fase 2). Los samplers ya exponen `return_trajectory`. | 🔴 Pendiente |
 | 29/05 | Diseño | Definir el dataset final de imágenes (gatos / CIFAR-10 / FashionMNIST). | 🔴 Pendiente |
-| 29/05 | Infraestructura | Iniciar git (`git init` en `tp-final/`) y aplicar el `.gitignore`. | 🔴 Pendiente |
+| 29/05 | Infraestructura | Iniciar git (`git init` en `tp-final/`) y aplicar el `.gitignore`. | 🟢 Hecho |
 
 > Esta tabla se deriva de `cronica.md`. Al agregar nuevas entradas con "Próximos pasos", conviene regenerarla o actualizar los estados de las tareas existentes.
