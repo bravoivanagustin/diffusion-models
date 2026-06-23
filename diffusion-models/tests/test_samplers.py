@@ -148,3 +148,108 @@ def test_pfode_is_half_reverse_relative_to_drift():
     pf = s._pfode_drift(x, t)
     # rev = f - g^2 s ; pf = f - 0.5 g^2 s  =>  f - pf = 0.5 (f - rev)
     assert torch.allclose(f - pf, 0.5 * (f - rev), atol=1e-5)
+
+
+# --------------------------------------------------------------- driver sample()
+
+
+class _PFODESampler(ReverseSampler):
+    """Sampler determinístico mínimo: paso de Euler sobre el drift de PF-ODE.
+
+    Sirve para ejercitar el driver ``sample()`` sin depender de los samplers
+    concretos (tasks 2.x). Ignora ``generator`` (es determinístico).
+    """
+
+    name = "pfode_test"
+
+    def step(self, x, t, dt, *, generator):
+        return x + self._pfode_drift(x, t) * dt
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "ve", "sub_vp"])
+def test_sample_shape_dtype_finite(sde_name):
+    # 1.1, 1.4, 8.3: x_0 de shape (N, data_dim), float32 y finito.
+    sde = make_sde(sde_name)
+    s = _PFODESampler(sde, _zero_score, n_steps=20)
+    n = 32
+    x0 = s.sample(n)
+    assert x0.shape == (n, sde.data_dim)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_sample_returns_trajectory_with_correct_shape():
+    # 1.5: con return_trajectory devuelve (n_steps+1, N, data_dim) y x_0 aparte.
+    sde = make_sde("vp")
+    n_steps = 15
+    s = _PFODESampler(sde, _zero_score, n_steps=n_steps)
+    n = 8
+    x0, traj = s.sample(n, return_trajectory=True)
+    assert x0.shape == (n, sde.data_dim)
+    assert traj.shape == (n_steps + 1, n, sde.data_dim)
+    assert traj.dtype == torch.float32
+    # El último estado de la trayectoria es x_0.
+    assert torch.equal(traj[-1], x0)
+
+
+def test_trajectory_first_slice_is_start_state():
+    # 1.2 / 1.5: la trayectoria incluye el estado inicial x_T como primera capa.
+    sde = make_sde("vp")
+    s = _PFODESampler(sde, _zero_score, n_steps=10)
+    n = 8
+    gen = torch.Generator().manual_seed(0)
+    x_T = sde.prior_sampling((n, sde.data_dim), generator=gen)
+    gen2 = torch.Generator().manual_seed(0)
+    _, traj = s.sample(n, generator=gen2, return_trajectory=True)
+    assert torch.equal(traj[0], x_T)
+
+
+def test_sample_uses_init_as_start_state():
+    # init provisto se usa como x_T (no se sortea el prior).
+    sde = make_sde("vp")
+    s = _PFODESampler(sde, _zero_score, n_steps=10)
+    n = 8
+    init = torch.full((n, sde.data_dim), 3.0)
+    x0, traj = s.sample(n, init=init, return_trajectory=True)
+    assert torch.equal(traj[0], init)
+    # Con score nulo y drift de VP el estado evoluciona, pero arranca en init.
+    assert x0.shape == (n, sde.data_dim)
+
+
+def test_sample_does_not_mutate_network_params():
+    # 3.3: los parámetros de una ScoreMLP no cambian tras sample().
+    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    sde = make_sde("vp", data_dim=2)
+    net = ScoreMLP(data_dim=2)
+    net.eval()
+    before = [p.detach().clone() for p in net.parameters()]
+
+    def score_fn(x, t):
+        return net(x, t)
+
+    s = _PFODESampler(sde, score_fn, n_steps=10)
+    s.sample(16)
+    after = list(net.parameters())
+    assert len(before) == len(after)
+    for b, a in zip(before, after):
+        assert torch.equal(b, a)
+
+
+def test_sample_t_eps_floor_respected():
+    # 8.2: la integración nunca llega a t = 0 exacto (piso t_eps > 0).
+    sde = make_sde("vp")
+    t_eps = 5e-3
+    s = _PFODESampler(sde, _zero_score, n_steps=20, t_eps=t_eps)
+    grid = s._time_grid()
+    assert grid[-1].item() == pytest.approx(t_eps)
+    assert torch.all(grid > 0.0)
+
+
+def test_sample_determinism_with_fixed_init():
+    # Integrador determinístico con init fijo -> salida idéntica (aísla del prior).
+    sde = make_sde("vp")
+    s = _PFODESampler(sde, _zero_score, n_steps=20)
+    init = torch.randn(16, sde.data_dim)
+    a = s.sample(16, init=init)
+    b = s.sample(16, init=init)
+    assert torch.equal(a, b)

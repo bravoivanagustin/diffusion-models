@@ -10,7 +10,7 @@
   - _Requirements: 3.2, 3.3, 8.1, 8.2, 8.4_
   - _Boundary: ReverseSampler base_
 
-- [ ] 1.2 Implementar el driver `sample()`
+- [x] 1.2 Implementar el driver `sample()`
   - Arrancar de `prior_sampling` (o del `init` provisto), integrar hacia atrás (`dt<0`) recorriendo la grilla y llamando a `step()`; capturar la trayectoria cuando se solicita.
   - Ejecutar bajo `no_grad`, en `float32`, sin tocar los parámetros de la red.
   - Observable: `sample(N)` devuelve `x_0` de shape `(N, data_dim)` en `float32` y finito; con `return_trajectory=True` devuelve además la trayectoria `(n_steps+1, N, data_dim)`.

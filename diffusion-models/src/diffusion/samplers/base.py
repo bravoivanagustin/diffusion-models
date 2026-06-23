@@ -116,6 +116,64 @@ class ReverseSampler(abc.ABC):
         """
         raise NotImplementedError
 
+    # ------------------------------------------------------------------- driver
+
+    @torch.no_grad()
+    def sample(
+        self,
+        n_samples: int,
+        *,
+        init: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        return_trajectory: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Integra el proceso reverso de ``T`` a ``t_eps`` y devuelve las muestras ``x_0``.
+
+        Driver compartido (Template Method): arranca del prior ``p_T`` —o del ``init``
+        provisto— y recorre la grilla temporal en tiempo **decreciente** (``dt < 0``),
+        delegando cada paso en :meth:`step`. Corre bajo ``torch.no_grad()`` y en
+        ``float32``, sin tocar los parámetros de la red (el score se consume como función
+        pura), de modo que cambiar de sampler nunca reentrena (Eje 2).
+
+        Args:
+            n_samples: Número de muestras a generar (``N``).
+            init: Estado inicial ``x_T`` de shape ``(n_samples, sde.data_dim)``. Si es
+                ``None`` se sortea de ``sde.prior_sampling``; pasarlo aísla el determinismo
+                del integrador del muestreo del prior.
+            generator: Generador de torch para reproducibilidad; alimenta tanto el muestreo
+                del prior como los pasos estocásticos (EM/PC). Los samplers determinísticos
+                (PF-ODE/Heun) lo ignoran en :meth:`step`.
+            return_trajectory: Si es ``True``, devuelve además la trayectoria completa.
+
+        Returns:
+            El estado final ``x_0`` de shape ``(n_samples, sde.data_dim)`` en ``float32``.
+            Si ``return_trajectory`` es ``True``, una tupla ``(x_0, trayectoria)`` donde la
+            trayectoria tiene shape ``(n_steps + 1, n_samples, sde.data_dim)`` e incluye el
+            estado inicial ``x_T`` (capa ``0``) y cada estado intermedio.
+        """
+        if init is None:
+            x = self.sde.prior_sampling(
+                (n_samples, self.sde.data_dim), generator=generator, dtype=torch.float32
+            )
+        else:
+            x = init.to(dtype=torch.float32)
+
+        grid = self._time_grid()
+        trajectory: list[torch.Tensor] = [x.clone()] if return_trajectory else []
+
+        for i in range(self.n_steps):
+            t_cur = grid[i]
+            t_next = grid[i + 1]
+            dt = (t_next - t_cur).item()  # negativo: tiempo decreciente
+            t_batch = t_cur.expand(n_samples, 1)
+            x = self.step(x, t_batch, dt, generator=generator)
+            if return_trajectory:
+                trajectory.append(x.clone())
+
+        if return_trajectory:
+            return x, torch.stack(trajectory, dim=0)
+        return x
+
     # ----------------------------------------------------------- helpers compartidos
 
     def _time_grid(self) -> torch.Tensor:
