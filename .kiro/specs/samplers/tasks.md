@@ -53,7 +53,7 @@
   - _Requirements: 2.1, 3.1, 4.1, 4.2, 4.3, 4.4_
   - _Boundary: samplers __init___
 
-- [ ] 3.2 Generación desde checkpoint
+- [x] 3.2 Generación desde checkpoint
   - `generate_from_checkpoint`: cargar el checkpoint, reconstruir la SDE desde su `meta` (`sde_name`, `data_dim`) y la red (en `eval`), armar el sampler con la factory, generar y guardar `.npz` (con trayectoria opcional).
   - Errores claros si la ruta/checkpoint no existe o es inválido.
   - Observable: a partir de un checkpoint genera y persiste un `.npz` con las muestras; con `seed` el resultado es reproducible; ruta inexistente produce un error explícito.

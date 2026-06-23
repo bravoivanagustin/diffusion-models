@@ -776,3 +776,129 @@ def test_make_sampler_passes_common_kwargs():
     s = make_sampler("euler", sde, _zero_score, n_steps=33, t_eps=5e-3)
     assert s.n_steps == 33
     assert s.t_eps == pytest.approx(5e-3)
+
+
+# --------------------------------------- task 3.2: generate_from_checkpoint
+
+
+def _make_checkpoint(tmp_path, sde_name="vp", data_dim=2):
+    """Arma un checkpoint válido SIN entrenar: red sin entrenar -> save_checkpoint.
+
+    Reusa el contrato real de :mod:`diffusion.training` (``TrainResult`` +
+    ``save_checkpoint``), de modo que ``load_checkpoint`` lo reconstruya idéntico a uno
+    producido por una corrida real. Devuelve la ruta del ``.pt`` guardado.
+    """
+    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    from diffusion.training import TrainConfig, TrainResult, save_checkpoint
+
+    net = ScoreMLP(data_dim=data_dim)
+    result = TrainResult(
+        net=net, history=[1.0, 0.5], config=TrainConfig(), sde_name=sde_name
+    )
+    path = tmp_path / "ckpt.pt"
+    save_checkpoint(result, path)
+    return path
+
+
+def test_generate_from_checkpoint_returns_samples(tmp_path):
+    # 6.1: a partir de un checkpoint reconstruye SDE+red y genera (N, data_dim) float32.
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint(tmp_path, sde_name="vp", data_dim=2)
+    x0 = generate_from_checkpoint(ckpt, "pf_ode", n_samples=8, n_steps=5, seed=0)
+    assert x0.shape == (8, 2)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_generate_from_checkpoint_writes_npz(tmp_path):
+    # 6.2: con `out` persiste un .npz con la clave `samples`.
+    pytest.importorskip("numpy")
+    import numpy as np
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint(tmp_path)
+    out = tmp_path / "gen" / "out.npz"  # subdir inexistente: debe crearse
+    x0 = generate_from_checkpoint(
+        ckpt, "pf_ode", n_samples=8, n_steps=5, seed=0, out=out
+    )
+    assert out.exists()
+    with np.load(out) as data:
+        assert "samples" in data
+        assert data["samples"].shape == (8, 2)
+        assert np.allclose(data["samples"], x0.cpu().numpy())
+
+
+def test_generate_from_checkpoint_saves_trajectory(tmp_path):
+    # 6.3: con save_trajectory el .npz también guarda la trayectoria.
+    pytest.importorskip("numpy")
+    import numpy as np
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint(tmp_path)
+    out = tmp_path / "out.npz"
+    n_steps = 5
+    generate_from_checkpoint(
+        ckpt, "pf_ode", n_samples=8, n_steps=n_steps, seed=0, out=out,
+        save_trajectory=True,
+    )
+    with np.load(out) as data:
+        assert "samples" in data
+        assert "trajectory" in data
+        # (n_steps + 1, N, data_dim): incluye el estado inicial x_T.
+        assert data["trajectory"].shape == (n_steps + 1, 8, 2)
+
+
+def test_generate_from_checkpoint_no_trajectory_key_when_disabled(tmp_path):
+    # 6.3: sin save_trajectory el .npz NO contiene la clave `trajectory`.
+    pytest.importorskip("numpy")
+    import numpy as np
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint(tmp_path)
+    out = tmp_path / "out.npz"
+    generate_from_checkpoint(ckpt, "pf_ode", n_samples=8, n_steps=5, seed=0, out=out)
+    with np.load(out) as data:
+        assert "trajectory" not in data
+
+
+def test_generate_from_checkpoint_reproducible_with_seed(tmp_path):
+    # 6.1/6.2: misma seed -> resultado reproducible (incluso para un sampler estocástico).
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint(tmp_path)
+    a = generate_from_checkpoint(ckpt, "euler", n_samples=8, n_steps=5, seed=42)
+    b = generate_from_checkpoint(ckpt, "euler", n_samples=8, n_steps=5, seed=42)
+    assert torch.equal(a, b)
+
+
+def test_generate_from_checkpoint_reconstructs_sde_from_meta(tmp_path):
+    # 6.1: la SDE se reconstruye desde meta["sde_name"] (no se pasa por argumento).
+    # Un checkpoint con sde_name="ve" debe generar con la SDE VE sin pedir el nombre.
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint(tmp_path, sde_name="ve", data_dim=2)
+    x0 = generate_from_checkpoint(ckpt, "pf_ode", n_samples=8, n_steps=5, seed=0)
+    assert x0.shape == (8, 2)
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_generate_from_checkpoint_missing_path_raises(tmp_path):
+    # 6.4: ruta inexistente -> error claro que menciona la ruta.
+    from diffusion.samplers import generate_from_checkpoint
+
+    missing = tmp_path / "no_existe.pt"
+    with pytest.raises((FileNotFoundError, ValueError)) as excinfo:
+        generate_from_checkpoint(missing, "pf_ode", n_samples=4, n_steps=3)
+    assert "no_existe.pt" in str(excinfo.value)
+
+
+def test_generate_from_checkpoint_invalid_meta_raises(tmp_path):
+    # 6.4: checkpoint sin las claves de meta esperadas -> error claro.
+    torch_mod = pytest.importorskip("torch")
+    from diffusion.samplers import generate_from_checkpoint
+
+    bad = tmp_path / "bad.pt"
+    torch_mod.save({"not": "a checkpoint"}, bad)
+    with pytest.raises((KeyError, ValueError)):
+        generate_from_checkpoint(bad, "pf_ode", n_samples=4, n_steps=3)

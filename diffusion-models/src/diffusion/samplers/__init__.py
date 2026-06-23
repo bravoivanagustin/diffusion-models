@@ -74,12 +74,17 @@ def make_sampler(
     return cls(sde, score_fn, **clean)
 
 
+# Importado al final: ``generate`` depende de ``make_sampler`` (definido arriba) y de los
+# módulos upstream (``training``/``sde``), que no importan ``samplers`` (sin ciclo).
+from .generate import generate_from_checkpoint
+
 __all__ = [
     "ReverseSampler",
     "ScoreFn",
     "REGISTRY",
     "available_samplers",
     "make_sampler",
+    "generate_from_checkpoint",
     "EulerMaruyama",
     "ProbabilityFlowODE",
     "HeunODE",
