@@ -93,7 +93,7 @@
   - Observable: el test de recuperación gaussiana pasa dentro de la tolerancia para los cuatro samplers.
   - _Requirements: 7.1, 7.2, 7.3_
 
-- [ ] 4.4 Tests de generación checkpoint-driven
+- [x] 4.4 Tests de generación checkpoint-driven
   - Construir un checkpoint con `save_checkpoint` sobre una `ScoreMLP` sin entrenar; generar vía `generate_from_checkpoint`; verificar shape y archivo `.npz`; ruta inexistente → error.
   - Observable: el test de generación desde checkpoint pasa en verde y produce el `.npz` esperado.
   - _Requirements: 6.1, 6.2, 6.3, 6.4_

@@ -904,6 +904,81 @@ def test_generate_from_checkpoint_invalid_meta_raises(tmp_path):
         generate_from_checkpoint(bad, "pf_ode", n_samples=4, n_steps=3)
 
 
+# --------------------------------------- task 4.4: huecos de generación checkpoint-driven
+
+
+def _make_checkpoint_blob_missing_meta_key(tmp_path, missing_key, data_dim=2):
+    """Arma a mano un blob que SOBREVIVE ``load_checkpoint`` pero le falta ``missing_key``.
+
+    Aísla la guarda propia de ``generate.py`` (líneas 88–95): ``load_checkpoint`` sólo
+    consume ``blob["model_state"]``, ``meta["model"]`` y ``meta["data_dim"]`` —NO toca
+    ``meta["sde_name"]``—, así que un ``meta`` con ``model``/``data_dim``/``model_state``
+    válidos pero sin ``sde_name`` carga bien y recién falla cuando ``generate_from_checkpoint``
+    lee ``meta["sde_name"]``. Esto discrimina del test ``_invalid_meta_raises`` (que ni
+    siquiera tiene la clave ``meta`` y dispara el ``KeyError("meta")`` de ``load_checkpoint``).
+
+    El ``state_dict`` proviene de una ``ScoreMLP`` real (sin entrenar) con los mismos
+    hiperparámetros que el ``meta["model"]``, de modo que ``load_checkpoint`` reconstruya la
+    red sin error de claves de pesos.
+    """
+    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+
+    model_hp = {"embed_dim": 128, "hidden_dim": 256, "num_blocks": 4, "activation": "silu"}
+    net = ScoreMLP(data_dim=data_dim, **model_hp)
+    meta = {
+        "sde_name": "vp",
+        "data_dim": data_dim,
+        "model": model_hp,
+        "history": [1.0, 0.5],
+    }
+    del meta[missing_key]  # quita SOLO la clave bajo prueba; el resto queda válido
+    blob = {"model_state": net.state_dict(), "meta": meta}
+    path = tmp_path / "incomplete_meta.pt"
+    torch.save(blob, path)
+    return path
+
+
+def test_generate_from_checkpoint_meta_missing_sde_name_raises_clear_error(tmp_path):
+    # 6.4: aísla la guarda PROPIA de generate.py. El checkpoint tiene un `meta` válido
+    # salvo por `sde_name`: sobrevive load_checkpoint y falla recién al reconstruir la SDE.
+    # El error debe identificar claramente la clave faltante (no un KeyError("meta") opaco).
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint_blob_missing_meta_key(tmp_path, "sde_name")
+    with pytest.raises(KeyError) as excinfo:
+        generate_from_checkpoint(ckpt, "pf_ode", n_samples=4, n_steps=3)
+    # Mensaje claro y atribuible a la(s) clave(s) de meta esperada(s) por generate.py.
+    msg = str(excinfo.value)
+    assert "sde_name" in msg
+    assert "data_dim" in msg
+
+
+def test_generate_from_checkpoint_end_to_end_npz_roundtrip_seeded(tmp_path):
+    # 6.1+6.2+6.4 consolidado y discriminante con un sampler ESTOCÁSTICO (euler):
+    # checkpoint -> generate -> .npz, el contenido releído con np.load coincide con el
+    # tensor devuelto, y dos corridas con la misma seed reproducen byte a byte. Cierra el
+    # round-trip completo del seam ejercitando el camino estocástico (no sólo pf_ode det.).
+    pytest.importorskip("numpy")
+    import numpy as np
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_checkpoint(tmp_path, sde_name="vp", data_dim=2)
+    out = tmp_path / "roundtrip" / "euler.npz"  # subdir inexistente: debe crearse
+    x0 = generate_from_checkpoint(
+        ckpt, "euler", n_samples=8, n_steps=5, seed=7, out=out
+    )
+    assert out.exists()
+    with np.load(out) as data:
+        assert set(data.files) == {"samples"}  # sin trajectory cuando no se pide
+        assert data["samples"].shape == (8, 2)
+        assert data["samples"].dtype == np.float32
+        # El .npz persiste EXACTAMENTE el tensor devuelto.
+        assert np.array_equal(data["samples"], x0.cpu().numpy())
+    # Reproducibilidad por seed del camino estocástico vía el checkpoint.
+    x0_again = generate_from_checkpoint(ckpt, "euler", n_samples=8, n_steps=5, seed=7)
+    assert torch.equal(x0, x0_again)
+
+
 # ------------------------------------------------- task 3.3: smoke entrypoint
 
 
