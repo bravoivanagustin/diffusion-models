@@ -82,7 +82,7 @@
   - Observable: `python -m pytest` corre estos tests en verde.
   - _Requirements: 1.1, 1.3, 1.4, 1.5, 2.1, 4.1, 4.2, 4.3, 4.4, 8.1, 8.3, 8.4, 3.3_
 
-- [ ] 4.2 Tests de determinismo y reproducibilidad
+- [x] 4.2 Tests de determinismo y reproducibilidad
   - PF-ODE y Heun con el mismo `init` → `torch.equal`; EM y PC con el mismo `generator` sembrado → idénticos, con semillas distintas → distintos.
   - Observable: los tests de determinismo/reproducibilidad pasan en verde.
   - _Requirements: 2.2, 2.3, 5.1, 5.2, 5.3_

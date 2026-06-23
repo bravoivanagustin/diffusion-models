@@ -1118,3 +1118,78 @@ def test_contract_net_params_unchanged_after_sample_via_factory(sampler_name):
     assert len(before) == len(after)
     for b, a in zip(before, after):
         assert torch.equal(b, a)
+
+
+# ================================================================================
+# Task 4.2: matriz consolidada de determinismo / reproducibilidad por la factory.
+#
+# Las tasks 2.x ya cubrieron cada propiedad con tests focalizados construyendo las
+# clases concretas directamente (test_pf_ode_deterministic_same_init,
+# test_pf_ode_ignores_generator, test_heun_deterministic_same_init,
+# test_heun_ignores_generator, test_euler_reproducible_same_seed,
+# test_euler_differs_with_different_seed, test_pc_reproducible_same_seed,
+# test_pc_differs_with_different_seed). Acá se consolida la CLASE de propiedad por
+# el camino real del estudio (``make_sampler``), afirmándola de modo uniforme:
+#  - determinísticos (pf_ode, heun): mismo init -> idénticos; e idénticos aun con
+#    semillas distintas (prueba que ignoran la aleatoriedad del generator).
+#  - estocásticos (euler, pc): mismo generator sembrado -> idénticos; semillas
+#    distintas -> distintos.
+# ================================================================================
+
+_DETERMINISTIC_SAMPLERS = ["pf_ode", "heun"]
+_STOCHASTIC_SAMPLERS = ["euler", "pc"]
+
+
+@pytest.mark.parametrize("sampler_name", _DETERMINISTIC_SAMPLERS)
+def test_deterministic_same_init_identical_via_factory(sampler_name):
+    # 5.1, 2.3, 4.1: sampler determinístico (vía factory) dos veces con el MISMO init
+    # -> resultados idénticos (torch.equal). Aísla el integrador del muestreo del prior.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=20)
+    init = torch.randn(16, sde.data_dim)
+    a = s.sample(16, init=init)
+    b = s.sample(16, init=init)
+    assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("sampler_name", _DETERMINISTIC_SAMPLERS)
+def test_deterministic_ignores_generator_seed_via_factory(sampler_name):
+    # 5.1, 2.3, 4.1: con el MISMO init, dos semillas DISTINTAS del generator dan el
+    # mismo resultado -> el sampler determinístico ignora la aleatoriedad inyectada.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=20)
+    init = torch.randn(16, sde.data_dim)
+    a = s.sample(16, init=init, generator=torch.Generator().manual_seed(1))
+    b = s.sample(16, init=init, generator=torch.Generator().manual_seed(2))
+    assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("sampler_name", _STOCHASTIC_SAMPLERS)
+def test_stochastic_same_seed_reproducible_via_factory(sampler_name):
+    # 5.2, 2.2, 4.1: sampler estocástico (vía factory) dos veces con generadores del
+    # MISMO seed -> resultados idénticos (un generator FRESCO por llamada reproduce el
+    # sorteo del prior y de cada inyección de ruido).
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=20)
+    a = s.sample(16, generator=torch.Generator().manual_seed(123))
+    b = s.sample(16, generator=torch.Generator().manual_seed(123))
+    assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("sampler_name", _STOCHASTIC_SAMPLERS)
+def test_stochastic_different_seed_differs_via_factory(sampler_name):
+    # 5.3, 2.2, 4.1: sampler estocástico (vía factory) con semillas DISTINTAS -> las
+    # muestras difieren (la estocasticidad del sampler es real, no un no-op).
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=20)
+    a = s.sample(16, generator=torch.Generator().manual_seed(1))
+    b = s.sample(16, generator=torch.Generator().manual_seed(2))
+    assert not torch.equal(a, b)
