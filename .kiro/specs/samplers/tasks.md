@@ -25,7 +25,7 @@
   - _Requirements: 2.2, 5.2, 5.3, 1.4_
   - _Boundary: EulerMaruyama_
 
-- [ ] 2.2 (P) Sampler Probability-Flow ODE
+- [x] 2.2 (P) Sampler Probability-Flow ODE
   - Paso determinístico de la ODE de flujo: `x + (f - ½g²s)·dt`; ignora `generator`.
   - Observable: dos corridas con el mismo `init` producen resultados idénticos; muestras finitas.
   - _Depends: 1.2_

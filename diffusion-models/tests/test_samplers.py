@@ -327,3 +327,83 @@ def test_euler_step_accepts_t_as_B_and_B1():
     out_flat = s.step(x, t, dt=-0.05, generator=torch.Generator().manual_seed(7))
     out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=torch.Generator().manual_seed(7))
     assert torch.equal(out_flat, out_col)
+
+
+# --------------------------------------------- task 2.2: Probability-Flow ODE
+
+
+def test_pf_ode_name():
+    # 2.3: la clave del registry queda fijada en la clase (factory llega en 3.1).
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+
+    assert ProbabilityFlowODE.name == "pf_ode"
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "ve", "sub_vp"])
+def test_pf_ode_sample_shape_dtype_finite(sde_name):
+    # 1.1, 1.4, 8.3: x_0 de shape (N, data_dim), float32 y finito sobre las 3 SDEs escalares.
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+
+    sde = make_sde(sde_name)
+    s = ProbabilityFlowODE(sde, _zero_score, n_steps=20)
+    n = 32
+    x0 = s.sample(n, init=torch.randn(n, sde.data_dim))
+    assert x0.shape == (n, sde.data_dim)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_pf_ode_deterministic_same_init():
+    # 5.1: dos corridas con el MISMO init producen resultados idénticos.
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+
+    sde = make_sde("vp")
+    s = ProbabilityFlowODE(sde, _zero_score, n_steps=20)
+    init = torch.randn(16, sde.data_dim)
+    a = s.sample(16, init=init)
+    b = s.sample(16, init=init)
+    assert torch.equal(a, b)
+
+
+def test_pf_ode_ignores_generator():
+    # 5.1 / 2.3: determinístico — con el mismo init, semillas distintas dan el MISMO
+    # resultado (prueba que el sampler ignora la aleatoriedad del generator).
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+
+    sde = make_sde("vp")
+    s = ProbabilityFlowODE(sde, _zero_score, n_steps=20)
+    init = torch.randn(16, sde.data_dim)
+    a = s.sample(16, init=init, generator=torch.Generator().manual_seed(1))
+    b = s.sample(16, init=init, generator=torch.Generator().manual_seed(2))
+    assert torch.equal(a, b)
+
+
+def test_pf_ode_step_is_pfode_drift_euler():
+    # 2.3: el paso es exactamente x + (f - ½ g² s)·dt (Euler sobre el drift de PF-ODE).
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+
+    def score_fn(x, t):
+        return torch.ones_like(x)
+
+    sde = make_sde("vp")
+    s = ProbabilityFlowODE(sde, score_fn, n_steps=20)
+    x = torch.randn(8, sde.data_dim)
+    t = torch.full((8, 1), 0.5)
+    dt = -0.05
+    expected = x + s._pfode_drift(x, t) * dt
+    out = s.step(x, t, dt, generator=None)
+    assert torch.equal(out, expected)
+    assert torch.all(torch.isfinite(out))
+
+
+def test_pf_ode_step_accepts_t_as_B_and_B1():
+    # 8.1: t como (B,) y (B,1) dan el mismo resultado (determinístico).
+    from diffusion.samplers.pf_ode import ProbabilityFlowODE
+
+    sde = make_sde("vp")
+    s = ProbabilityFlowODE(sde, _zero_score, n_steps=20)
+    x = torch.randn(8, 2)
+    t = torch.full((8,), 0.5)
+    out_flat = s.step(x, t, dt=-0.05, generator=None)
+    out_col = s.step(x, t.reshape(8, 1), dt=-0.05, generator=None)
+    assert torch.equal(out_flat, out_col)
