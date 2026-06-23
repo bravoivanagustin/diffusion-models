@@ -902,3 +902,20 @@ def test_generate_from_checkpoint_invalid_meta_raises(tmp_path):
     torch_mod.save({"not": "a checkpoint"}, bad)
     with pytest.raises((KeyError, ValueError)):
         generate_from_checkpoint(bad, "pf_ode", n_samples=4, n_steps=3)
+
+
+# ------------------------------------------------- task 3.3: smoke entrypoint
+
+
+def test_main_smoke_runs_all_samplers():
+    # 2.1: el smoke entrypoint recorre el registry, corre cada sampler sobre una ScoreMLP
+    # sin entrenar y reporta salidas finitas. main() devuelve un resumen assertable
+    # {name: is_finite} con los cuatro samplers, todos finitos.
+    pytest.importorskip("diffusion.mlp")
+    from diffusion.samplers.__main__ import main
+    from diffusion.samplers import available_samplers
+
+    summary = main()
+    assert set(summary) == set(available_samplers())
+    assert len(summary) == 4
+    assert all(summary.values())

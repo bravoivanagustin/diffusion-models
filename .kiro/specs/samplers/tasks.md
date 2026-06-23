@@ -61,7 +61,7 @@
   - _Requirements: 6.1, 6.2, 6.3, 6.4_
   - _Boundary: generate_
 
-- [ ] 3.3 Smoke entrypoint del módulo
+- [x] 3.3 Smoke entrypoint del módulo
   - `__main__` que recorre el registry y corre cada sampler sobre una `ScoreMLP` sin entrenar, reportando shape y estadísticas finitas.
   - Observable: `python -m diffusion.samplers` corre los cuatro samplers sin error e imprime salidas finitas.
   - _Depends: 3.1_
