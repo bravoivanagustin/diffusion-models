@@ -108,4 +108,22 @@ Este documento contiene el historial del projecto. Aca se suben creaciones, modi
 - **Pesado de HSM para CLD** sigue pendiente; recién después, la dinámica reversa de CLD (hoy la guarda la rechaza). Nota validada: con score exacto, VE + samplers determinísticos dejan un offset de media residual — es correcto (prior `N(0,σ_max²)` vs marginal `N(μ,σ₀²+σ_max²)`), no un bug.
 - Módulo de **evaluación / visualización** de Fase 1 (campos de score, trayectorias, densidad, comparación con el score analítico de la mezcla; FID/IS en Fase 2). Los samplers ya exponen `return_trajectory` para alimentarlo.
 - La **matriz 4×4 escalar** ya es ejecutable (VP/VE/sub-VP × los 4 samplers, reusando checkpoints).
-- Sigue pendiente el dataset final de imágenes (gatos / CIFAR-10 / FashionMNIST), de `proyecto.md`.
+
+### 05/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** CLD ya converge. Se pasó el objetivo de entrenamiento a **Hybrid Score Matching (HSM)** —la red aprende solo el score del momento— y con eso la pérdida dejó de explotar (de miles a unidades). Se cableó el loop al nuevo contrato y se actualizaron tests y docs.
+
+**Contexto:** El loop de entrenamiento (entrada del 04/06) dejaba CLD sin converger: `sde.score_target` devolvía el score **conjunto** `(B, 4)` con `weight=1`, y el término de posición `-n_x/L₁₁` explotaba cuando `t→0`. El target de HSM figuraba como pendiente. Se cambió una línea en `sde/cld.py` para que `score_target` devuelva **solo** la componente de momento `∇_v log p_t(v|x) = -n_v/L₂₂`, shape `(B, spatial_dim)` —el target de HSM—. Eso rompía el contrato con los consumidores (9 tests en rojo por el cambio de shape), así que se completó el cableado.
+
+**Acciones realizadas:**
+- **Diagnóstico:** el cambio de contrato `(B, 4) → (B, 2)` dejaba 9 tests en rojo — `dsm_loss` fallaba con mismatch de shape (la red predice 4, el target pasó a 2) y 6 tests de `sde` asumían el score conjunto. Los samplers **no** se ven afectados (no usan `score_target`; además ya rechazan CLD con guarda).
+- **Loop (`training/losses.py`):** `dsm_loss`, para SDEs aumentadas (`sde.is_augmented`), ahora compara solo la mitad de momento de la red (`net(x_t, t)[:, spatial_dim:]`) contra el target `(B, spatial_dim)`. Es la única ramificación del loop.
+- **Por qué converge:** aprender solo el momento —lo que HSM pide— descarta el término de posición, cuya entrada de Cholesky `L₁₁ → 0` con `t→0` era la fuente de la explosión. La del momento `L₂₂` se mantiene `O(1)` (el momento conserva su varianza de equilibrio `M`), así que el target queda **acotado**. Verificado: la pérdida de CLD pasó de ~8k–33k (oscilando) a ~7 → 4.7 (acotada y decreciente).
+- **Tests:** actualizados los 6 tests de CLD de `test_sde.py` al nuevo contrato `(B, spatial_dim)`; agregado un test en `test_training.py` que fija el comportamiento HSM (la pérdida usa solo el momento). Suite completa en verde (256 con `pyyaml` presente).
+- **Docs:** `training.md` (nueva sección «CLD: objetivo de HSM» + el seam), `sde.md` (contrato de `score_target`), `to-do.md` (HSM de CLD → hecho). Corregido el cuerpo del docstring de `score_target` en `cld.py`.
+
+**Follow-ups:**
+- (Opcional) Pesado `λ(t)` tipo-verosimilitud para CLD (hoy `weight=1`): afinaría la convergencia, no es bloqueante.
+- **Muestreo de CLD**: los samplers siguen con la guarda que rechaza SDEs aumentadas; falta la dinámica reversa aumentada del Eje 2 para cerrar la fila CLD de la matriz.
