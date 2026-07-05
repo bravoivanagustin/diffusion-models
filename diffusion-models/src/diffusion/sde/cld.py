@@ -213,8 +213,9 @@ class CLDSDE(ForwardSDE):
 
         Como ``u_t - mean = L n`` (por dimensión), el score conjunto es
         ``∇_u log p_t(u_t|x_0) = -(Lᵀ)^{-1} n``. La componente de momento
-        (``score_v = -n_v / L22``) es el target de HSM ``∇_v log p_t(v|x)`` que aprende la
-        red; se devuelve el vector completo de shape ``(B, data_dim)``.
+        (``score_v = -n_v / L22``) es el target de **HSM** ``∇_v log p_t(v|x)`` que aprende la
+        red; se devuelve **solo esa componente**, de shape ``(B, spatial_dim)`` (la posición no
+        aporta ruido, así que no hay target que aprender ahí).
 
         Args:
             x0: Posición limpia de shape ``(B, spatial_dim)``.
@@ -222,18 +223,16 @@ class CLDSDE(ForwardSDE):
             eps: Ruido estándar devuelto por :meth:`perturb`, shape ``(B, data_dim)``.
 
         Returns:
-            ``(score_real, weight)`` con ``score_real`` de shape ``(B, data_dim)`` y ``weight`` de
+            ``(score_v, weight)`` con ``score_v`` de shape ``(B, spatial_dim)`` y ``weight`` de
             shape ``(B, 1)`` (pesado de HSM diferido al loop de entrenamiento → ``1``).
         """
         tt = self._expand_t(t)
         l11, l21, l22 = self._cholesky(tt)
         d = self.spatial_dim
-        n_x, n_v = eps[:, :d], eps[:, d:]
-        score_x = -(n_x / l11 - l21 * n_v / (l11 * l22))
+        n_v = eps[:, d:]
         score_v = -(n_v / l22)
-        score_real = torch.cat([score_x, score_v], dim=-1)
         weight = torch.ones(eps.shape[0], 1, dtype=eps.dtype, device=eps.device)
-        return score_real, weight
+        return score_v, weight
 
     def prior_sampling(
         self,

@@ -242,7 +242,8 @@ def test_cld_basics_and_shapes():
     u_t, n = sde.perturb(x0, t, generator=torch.Generator().manual_seed(0))
     assert u_t.shape == (B, 4) and n.shape == (B, 4)
     score, weight = sde.score_target(x0, t, n)
-    assert score.shape == (B, 4) and weight.shape == (B, 1)
+    # HSM: el target es solo el score del momento (spatial_dim componentes), no el conjunto.
+    assert score.shape == (B, 2) and weight.shape == (B, 1)
     z = sde.prior_sampling((10, 4), generator=torch.Generator().manual_seed(0))
     assert z.shape == (10, 4)
 
@@ -256,7 +257,8 @@ def test_cld_t_shapes():
 
 
 def test_cld_score_matches_inverse_covariance():
-    # Chequeo independiente: score_target debe ser -Σ^{-1}(u_t - mean) por dimensión.
+    # Chequeo independiente: el target de HSM es la componente de momento del score conjunto,
+    # que para el gaussiano conjunto es la coordenada v de -Σ^{-1}(u_t - mean).
     sde = make_sde("cld")
     x0 = torch.randn(B, 2)
     t = torch.rand(B) * 0.8 + 0.1
@@ -268,11 +270,10 @@ def test_cld_score_matches_inverse_covariance():
     det = sxx * svv - sxv ** 2
     dx = u_t[:, :2] - mean[:, :2]
     dv = u_t[:, 2:] - mean[:, 2:]
-    score_x = -(svv * dx - sxv * dv) / det
-    score_v = -(sxx * dv - sxv * dx) / det
-    expected = torch.cat([score_x, score_v], dim=-1)
+    score_v = -(sxx * dv - sxv * dx) / det   # coordenada v de -Σ^{-1}(u - mean)
     got, _ = sde.score_target(x0, t, n)
-    assert torch.allclose(got, expected, atol=1e-4, rtol=1e-3)
+    assert got.shape == (B, 2)
+    assert torch.allclose(got, score_v, atol=1e-4, rtol=1e-3)
 
 
 def test_cld_kernel_matches_monte_carlo():
@@ -319,7 +320,11 @@ def test_cld_seam_with_scoremlp():
     u_t, n = sde.perturb(x0, t, generator=torch.Generator().manual_seed(1))
     pred = net(u_t, t)
     target, _ = sde.score_target(x0, t, n)
-    assert pred.shape == target.shape == (B, 4)
+    # HSM: la red predice el estado aumentado completo (B, 4), pero el target es solo el score
+    # del momento (B, 2); el loop compara esa mitad (pred[:, spatial_dim:]) contra el target.
+    assert pred.shape == (B, 4)
+    assert target.shape == (B, 2)
+    assert pred[:, sde.spatial_dim:].shape == target.shape
     assert torch.all(torch.isfinite(pred))
 
 
@@ -368,5 +373,5 @@ def test_cld_arbitrary_spatial_dim(spatial):
     mean, L = sde.marginal_prob(x0, t)
     assert mean.shape == (B, 2 * spatial) and L.shape == (B, 2, 2)
     score, _ = sde.score_target(x0, t, n)
-    assert score.shape == (B, 2 * spatial)
+    assert score.shape == (B, spatial)   # HSM: target = score del momento (spatial componentes)
     assert sde.prior_sampling((10, 2 * spatial)).shape == (10, 2 * spatial)

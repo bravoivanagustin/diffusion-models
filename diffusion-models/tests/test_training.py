@@ -79,6 +79,26 @@ def test_dsm_loss_reproducible_con_generator():
     )
 
 
+def test_dsm_loss_cld_solo_compara_el_momento():
+    """HSM: en CLD la red predice (B,4) pero la pérdida usa solo la mitad de momento (B,2)."""
+    sde = make_sde("cld")
+    net = _small_net(sde)  # data_dim=4
+    x0 = torch.randn(16, 2)
+    t = torch.rand(16) * sde.T
+
+    loss = dsm_loss(net, sde, x0, t, generator=torch.Generator().manual_seed(0))
+
+    # Recalcular a mano con el mismo ruido: target de momento (B, spatial_dim) contra la
+    # mitad de momento de la predicción.
+    x_t, eps = sde.perturb(x0, t, generator=torch.Generator().manual_seed(0))
+    target, weight = sde.score_target(x0, t, eps)
+    pred_v = net(x_t, t)[:, sde.spatial_dim:]
+    expected = (weight * (pred_v - target).pow(2)).mean()
+
+    assert target.shape == (16, sde.spatial_dim)
+    assert torch.allclose(loss, expected)
+
+
 # ------------------------------------------------------------ sample_timesteps
 
 

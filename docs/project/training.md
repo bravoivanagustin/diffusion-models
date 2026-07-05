@@ -34,22 +34,27 @@ El loop **no inventa** este peso: lo toma tal cual lo devuelve `sde.score_target
 
 ## El seam agnóstico a la SDE
 
-El mismo `train()` corre las cuatro SDEs **sin ramificar** por tipo. El batch de puntos 2D que entrega `data_generation` se pasa **crudo** a `sde.perturb`/`sde.score_target`, que ya devuelven las shapes correctas:
+El mismo `train()` corre las cuatro SDEs **casi sin ramificar** por tipo. El batch de puntos 2D que entrega `data_generation` se pasa **crudo** a `sde.perturb`/`sde.score_target`, que ya devuelven las shapes correctas:
 
-- **VP/VE/sub-VP:** estado escalar, red `data_dim=2`. $x_0$ es el punto $(x, y)$.
-- **CLD:** estado aumentado posición–momento, red `data_dim=4`. $x_0$ es la **posición** 2D; la SDE agrega el momento internamente y `perturb` devuelve el estado completo $u_t=(x_t, v_t)$.
+- **VP/VE/sub-VP:** estado escalar, red `data_dim=2`. $x_0$ es el punto $(x, y)$; el target es el score completo $(B, 2)$.
+- **CLD:** estado aumentado posición–momento, red `data_dim=4`. $x_0$ es la **posición** 2D; la SDE agrega el momento y `perturb` devuelve el estado completo $u_t=(x_t, v_t)$. Por **HSM**, el target es solo el score del momento, shape $(B, \text{spatial\_dim})$, así que la pérdida compara únicamente esa mitad de la salida de la red — la **única ramificación** del loop, señalada por `sde.is_augmented` (ver «CLD: objetivo de HSM» más abajo).
 
-La red se instancia con `ScoreMLP(data_dim=sde.data_dim)` — 2 o 4 según la variante — y todo lo demás es idéntico. Es la materialización en código de "la red es la variable de control": misma arquitectura, mismos hiperparámetros, solo cambia la SDE.
+La red se instancia con `ScoreMLP(data_dim=sde.data_dim)` — 2 o 4 según la variante — y el resto es idéntico. Es la materialización en código de "la red es la variable de control": misma arquitectura, mismos hiperparámetros, solo cambia la SDE.
 
 ## Regla del Eje 1: un entrenamiento por variante
 
 Cambiar el forward SDE cambia $p_t(x)$ y por lo tanto el score a aprender → **hay que reentrenar**. Cada llamada a `train()` instancia una red nueva desde cero, así que entrenar VP, VE, sub-VP y CLD son cuatro corridas independientes. Los samplers del **Eje 2** (a futuro) reusan la red entrenada **sin** reentrenar. Por eso conviene una corrida = un archivo de config versionable (ver abajo), una por celda del estudio.
 
-## Estado de CLD ⚠️
+## CLD: objetivo de HSM
 
-El loop soporta CLD **mecánicamente** (el seam funciona: `data_dim=4`, pérdida finita, checkpoint ida y vuelta — todo testeado), **pero CLD todavía no converge.** Su `score_target` devuelve `weight = 1` a propósito: el módulo `sde` **difiere** el pesado de HSM (Hybrid Score Matching) al loop de entrenamiento. Sin ese peso, el target del score del momento $-n_v/L_{22}$ explota cuando $t \to 0$ (porque $L_{22} \to 0$) y la pérdida queda dominada por los tiempos chicos, sin converger.
+CLD entrena con **Hybrid Score Matching (HSM)**: la red aprende solo el score del **momento** $\nabla_v \log p_t(v\mid x)$ (el ruido entra solo por $v$, así que la posición no aporta target). En código:
 
-Esto es exactamente lo que `ejes.md`, `sde.md` y `to-do.md` marcan como pendiente ("el pesado de HSM para CLD"). **No se implementó acá** porque la fórmula del peso es una elección de modelado que decide el autor (ver `to-do.md`). Hasta entonces, las celdas de CLD del estudio quedan a la espera; VP/VE/sub-VP —el núcleo de la Fase 1— entrenan y convergen.
+- `sde.score_target` de CLD devuelve **solo la componente de momento** $-n_v/L_{22}$, de shape $(B, \text{spatial\_dim})$ (no el score conjunto $(B, 4)$).
+- La red `ScoreMLP(data_dim=4)` predice el estado aumentado completo, así que `dsm_loss` compara **solo la mitad de momento** de su salida (`net(...)[:, spatial_dim:]`) contra el target. El hook `sde.is_augmented` señala el caso (única ramificación del loop).
+
+Aprender solo el momento —lo que HSM pide— además **estabiliza** el entrenamiento. La entrada de Cholesky de la posición $L_{11} \to 0$ cuando $t \to 0$ (esa era la fuente de la explosión del objetivo conjunto), pero la del momento $L_{22}$ se mantiene $O(1)$ porque el momento conserva su varianza de equilibrio $M$. Con el target acotado, CLD entrena en un régimen estable (pérdida en el orden de unidades, decreciente), a diferencia del objetivo conjunto que explotaba a miles.
+
+> El peso sigue siendo $\lambda(t) = 1$. Un pesado $\lambda(t)$ tipo-verosimilitud podría **afinar** la convergencia (queda como refinamiento opcional en `to-do.md`), pero ya no es un bloqueante. El muestreo de CLD queda para más adelante: los samplers del Eje 2 rechazan las SDEs aumentadas por ahora (solo VP/VE/sub-VP).
 
 ## API
 
@@ -139,12 +144,12 @@ Torch es **dependencia dura** del módulo (como `mlp` y `sde`): importa `torch` 
 
 ## Tests
 
-`diffusion-models/tests/test_training.py` (20 tests, en verde; suite completa sin regresiones):
+`diffusion-models/tests/test_training.py` (21 tests, en verde; suite completa sin regresiones):
 
-- `dsm_loss` para las **4 SDEs**: escalar finito, diferenciable, gradientes finitos en la red (cubre el seam de CLD `data_dim=4`); reproducible con `generator`.
+- `dsm_loss` para las **4 SDEs**: escalar finito, diferenciable, gradientes finitos en la red (cubre el seam de CLD `data_dim=4`); reproducible con `generator`; y un test específico de que en **CLD** la pérdida compara solo la mitad de momento (`net(...)[:, spatial_dim:]`) contra el target $(B, \text{spatial\_dim})$.
 - `sample_timesteps`: shape, rango $[t_\text{eps}, T]$, reproducibilidad, horizonte $T$ distinto.
 - `train`: `data_dim` correcto por SDE (2/4) y traza finita (las 4 variantes); la **pérdida baja** en VP sobre la mezcla de gaussianas; reproducibilidad con misma `seed`; camino `grad_clip`.
 - `save_checkpoint`/`load_checkpoint`: ida y vuelta reconstruye la red (incl. CLD `data_dim=4`) con los mismos pesos.
 - `build_run`/`load_config`: ensamblado desde `dict` y desde YAML; CLD arma `data_dim=4`; falla ante claves faltantes (`sde.name`, `data.shape`) o desconocidas.
 
-> La convergencia solo se asserta para la familia escalar (VP); de CLD se testea la **mecánica** (finitud, shapes, checkpoint), no la convergencia — coherente con el estado ⚠️ de arriba.
+> La convergencia se asserta para la familia escalar (VP); de CLD se testea la **mecánica** del target de HSM (shapes, la mitad de momento, checkpoint). El contrato de `score_target` de CLD —target de momento $(B, \text{spatial\_dim})$— se verifica en `tests/test_sde.py`.

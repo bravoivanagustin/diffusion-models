@@ -10,10 +10,13 @@ un único batch:
    ``λ(t)`` de la pérdida.
 
 La red (:class:`diffusion.mlp.ScoreMLP`) predice ``s_θ(x_t, t)`` y se minimiza el error
-pesado ``λ(t) · ||s_θ - score_real||²``. Esta función es **agnóstica a la SDE**: el mismo
-código corre VP/VE/sub-VP (estado escalar) y CLD (estado aumentado) porque ``perturb`` y
-``score_target`` ya devuelven las shapes correctas y el peso adecuado (``σ_t²`` en la familia
-escalar, ``1`` en CLD —el pesado de HSM queda diferido acá—).
+pesado ``λ(t) · ||s_θ - score_real||²``. Es **casi agnóstica a la SDE**: el mismo código corre
+VP/VE/sub-VP (estado escalar) y CLD (estado aumentado) porque ``perturb`` y ``score_target`` ya
+devuelven las shapes y el peso correctos (``σ_t²`` en la familia escalar, ``1`` en CLD). La
+única ramificación es el **HSM** de CLD: la red solo aprende el score del **momento**
+(``∇_v log p_t(v|x)``), así que ``score_target`` devuelve solo esa componente
+(``(B, spatial_dim)``) y la pérdida compara únicamente la mitad de momento de la red —el hook
+``sde.is_augmented`` señala el caso—.
 
 Es la única pieza donde no hay I/O ni estado: dados ``(net, sde, x_0, t)`` devuelve un escalar
 diferenciable, así que se testea directamente sin loop ni archivos.
@@ -50,11 +53,20 @@ def dsm_loss(
 
     Returns:
         Escalar (tensor 0-dim) diferenciable con la pérdida media del batch.
+
+    Note:
+        Para SDEs aumentadas (CLD, ``sde.is_augmented``) el objetivo es HSM: la red aprende
+        solo el score del momento, así que ``score_target`` devuelve ``(B, spatial_dim)`` y se
+        compara únicamente la mitad de momento de la predicción de la red.
     """
     x_t, eps = sde.perturb(x0, t, generator=generator)
     score_real, weight = sde.score_target(x0, t, eps)
     score_pred = net(x_t, t)
-    # weight es (B, 1) y broadcastea sobre las D componentes del score.
+    if getattr(sde, "is_augmented", False):
+        # HSM: la red predice el estado aumentado completo, pero solo aprende el score del
+        # momento (las últimas spatial_dim componentes); ahí comparamos contra el target.
+        score_pred = score_pred[:, sde.spatial_dim :]
+    # weight es (B, 1) y broadcastea sobre las componentes comparadas del score.
     return (weight * (score_pred - score_real).pow(2)).mean()
 
 
