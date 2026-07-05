@@ -25,7 +25,7 @@ train:
   t_eps: 1.0e-3
   grad_clip: 1.0
   seed: 0
-  device: cpu
+  device: gpu
 
 out:
   checkpoint: models/cld_mixture.pt
