@@ -6,7 +6,7 @@ Cada corrida (una celda del estudio de ablación) se describe en un ``.yaml`` co
 Ejemplos (correr desde ``diffusion-models/``)::
 
     python scripts/train.py --config config/vp_mixture.yaml
-    python scripts/train.py --config config/cld_mixture.yaml --epochs 50 --device cpu
+    python scripts/train.py --config config/vp_mixture.yaml --epochs 50 --device cpu
 
 Guarda los pesos entrenados (``.pt`` con ``state_dict`` + metadata) y una curva de pérdida
 (``.png``) en las rutas de la sección ``out`` del config (relativas al cwd).

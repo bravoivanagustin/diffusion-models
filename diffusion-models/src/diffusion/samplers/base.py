@@ -41,9 +41,7 @@ class ReverseSampler(abc.ABC):
     drifts reversos compartidos (:meth:`_reverse_drift` para la SDE y :meth:`_pfode_drift`
     para el flujo de probabilidad) y la normalización temporal.
 
-    La red se consume como función pura :attr:`score_fn` y **nunca** se muta. Solo se
-    soportan SDEs escalares (VP/VE/sub-VP); las SDEs aumentadas (CLD) se rechazan en el
-    constructor porque su difusión estructurada queda fuera de alcance de esta iteración.
+    La red se consume como función pura :attr:`score_fn` y **nunca** se muta.
     """
 
     #: Clave del registry/factory, p. ej. ``"euler"``. Sobreescribir en cada subclase.
@@ -61,7 +59,7 @@ class ReverseSampler(abc.ABC):
 
         Args:
             sde: Proceso forward (Eje 1) del que se derivan los coeficientes ``(f, g)`` y
-                el prior ``p_T``. Debe ser escalar (no aumentado).
+                el prior ``p_T``.
             score_fn: Función pura ``(x, t) -> score`` que aproxima ``∇_x log p_t(x)``.
             n_steps: Número de pasos (intervalos) de integración; ``>= 1``.
             t_eps: Tiempo terminal de la integración, un piso ``> 0`` que evita integrar
@@ -69,14 +67,7 @@ class ReverseSampler(abc.ABC):
 
         Raises:
             ValueError: Si ``n_steps < 1`` o ``t_eps`` cae fuera de ``(0, sde.T)``.
-            NotImplementedError: Si ``sde`` es aumentada (CLD): fuera de alcance.
         """
-        if getattr(sde, "is_augmented", False):
-            raise NotImplementedError(
-                f"SDE aumentada '{getattr(sde, 'name', type(sde).__name__)}' "
-                "(CLD) fuera de alcance: los samplers solo soportan SDEs escalares "
-                "(VP/VE/sub-VP) en esta iteración."
-            )
         if n_steps < 1:
             raise ValueError(f"n_steps debe ser >= 1; recibí n_steps={n_steps}")
         if not (0.0 < t_eps < sde.T):

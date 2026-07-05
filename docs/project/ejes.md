@@ -195,7 +195,6 @@ For example, at some intermediate $t$:
 
 - Under **VP-SDE**, the data has been shrunk toward zero *and* noise has been added — $p_t$ is concentrated, roughly Gaussian, moderate variance.
 - Under **VE-SDE**, the data hasn't been shrunk at all, just buried under growing noise — $p_t$ is much wider, with a different shape.
-- Under **CLD**, the distribution lives in the *joint* $(x, v)$ space and has correlations between position and momentum that don't exist in the other SDEs.
 
 Since the score $\nabla_x \log p_t(x)$ is the gradient of a *different* density in each case, a network trained for one SDE has learned the wrong function for any other SDE. The weights are not transferable.
 
@@ -248,19 +247,9 @@ $$dX_t = -\tfrac{1}{2}\beta(t)\,X_t\,dt + \sqrt{\beta(t)(1 - e^{-2\int_0^t \beta
 - **Terminal distribution:** The variance of $X_t$ is always bounded *below* the VP variance, hence "sub-VP."
 - **Character:** Tighter concentration around the ODE trajectory; often yields better log-likelihoods. Theoretically interesting because it interpolates between the deterministic (ODE) and fully stochastic (VP) regimes.
 
-### 1.4 CLD — Critically-Damped Langevin Diffusion
-
-$$\begin{cases} dX_t = M^{-1}V_t\,dt \\ dV_t = -\left(\Gamma M^{-1} V_t + \beta(t) X_t\right)dt + \sqrt{2\Gamma}\,dW_t \end{cases}$$
-
-- **Origin:** Dockhorn, Vahdat & Kreis (ICLR 2022).
-- **Behavior:** The data $X_t$ is augmented with an auxiliary *momentum* variable $V_t$. Noise enters **only through $V_t$**; the data evolves deterministically conditioned on the momentum. The "critical damping" condition ($\Gamma = 2\sqrt{M\beta}$) produces the smoothest possible trajectories for $X_t$ — borrowed from classical control theory.
-- **Score target:** Instead of $\nabla_x \log p_t(x)$, the network learns $\nabla_v \log p_t(v \mid x)$ — a fundamentally different object.
-- **Reverse SDE:** Anderson's theorem must be applied to the *joint* $(X_t, V_t)$ system; the corresponding Fokker–Planck equation becomes a **Kramers equation**.
-- **Character:** The richest theoretical variant. The second-order structure, Hamiltonian connection, and modified score target give substantial material for derivations.
-
 ### What Axis 1 demonstrates
 
-By comparing these four on the same architecture and dataset, you directly show how the choice of $f(x,t)$ (drift) and $g(t)$ (diffusion coefficient) in the forward Itô SDE propagates through Anderson's reversal formula into the generative model. Each variant requires re-deriving the reverse SDE, the score-matching loss, and the probability-flow ODE — so the theory section of the monograph writes itself naturally from the experiments.
+By comparing these three on the same architecture and dataset, you directly show how the choice of $f(x,t)$ (drift) and $g(t)$ (diffusion coefficient) in the forward Itô SDE propagates through Anderson's reversal formula into the generative model. Each variant requires re-deriving the reverse SDE, the score-matching loss, and the probability-flow ODE — so the theory section of the monograph writes itself naturally from the experiments.
 
 ---
 
@@ -339,9 +328,8 @@ This axis is a direct study of **numerical methods for SDEs and ODEs** — conve
 | **VP-SDE** | ✓ | ✓ | ✓ | ✓ |
 | **VE-SDE** | ✓ | ✓ | ✓ | ✓ |
 | **sub-VP** | ✓ | ✓ | ✓ | ✓ |
-| **CLD** | ✓ | ✓ | ✓ | ✓ |
 
-16 cells total. Each cell is evaluated across both phases:
+12 cells total. Each cell is evaluated across both phases:
 
 - **Phase 1 (2D):** visualize score fields, particle trajectories, and density reconstruction. For the Gaussian mixture, compare against the analytical true score.
 - **Phase 2 (images):** measure FID and IS at matched NFE budgets (e.g., 50, 100, 250, 1000 function evaluations) and produce qualitative sample grids.
@@ -355,9 +343,9 @@ The poster gets the 2D trajectory visualizations and a FID heatmap; the monograp
 | Week | Milestone |
 |---|---|
 | 1–2 | Build the MLP, training loop, and VP-SDE forward/reverse pipeline for 2D data. Get end-to-end generation working on Swiss roll. |
-| 3–4 | Add VE-SDE, sub-VP, and CLD variants. Implement all four samplers. Run the full 4×4 matrix on all three 2D datasets. Produce score-field and trajectory visualizations. |
+| 3–4 | Add VE-SDE, sub-VP variants. Implement all four samplers. Run the full 4×3 matrix on all three 2D datasets. Produce score-field and trajectory visualizations. |
 | 5 | Set up the U-Net (from library) and train VP-SDE on CIFAR-10 or FashionMNIST. Verify image generation works. |
-| 6 | Train VE-SDE, sub-VP, and CLD on images. Run sampler ablation. Compute FID/IS. |
+| 6 | Train VE-SDE and sub-VP on images. Run sampler ablation. Compute FID/IS. |
 | 7–8 | Write monograph and design poster. Buffer for re-runs or debugging. |
 
 ---
@@ -367,7 +355,6 @@ The poster gets the 2D trajectory visualizations and a FID heatmap; the monograp
 | Variant | Primary paper |
 |---|---|
 | VP-SDE / VE-SDE / sub-VP | Song et al., "Score-Based Generative Modeling through SDEs," ICLR 2021 |
-| CLD | Dockhorn et al., "Score-Based Generative Modeling with CLD," ICLR 2022 |
 | DDIM / PF-ODE | Song, Meng & Ermon, "Denoising Diffusion Implicit Models," ICLR 2021 |
 | Heun sampler | Karras et al., "Elucidating the Design Space (EDM)," NeurIPS 2022 |
 | Predictor–Corrector | Song et al. (ICLR 2021), §4 |

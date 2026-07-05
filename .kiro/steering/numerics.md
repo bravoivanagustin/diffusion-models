@@ -1,6 +1,6 @@
 # Estándares Numéricos (SDEs y samplers)
 
-Convenciones de cómputo tensorial compartidas por `sde`, `training` y los futuros samplers. Mantienen
+Convenciones de cómputo tensorial compartidas por `sde`, `training` y `samplers`. Mantienen
 las piezas intercambiables (todas las SDEs cumplen el mismo contrato) y estables cerca de los bordes
 temporales.
 
@@ -10,9 +10,6 @@ temporales.
 - **Tiempo**: `t` aceptado como `(B,)` **o** `(B, 1)`; se normaliza a `(B, 1)` con un helper
   (`_expand_t` → `t.reshape(-1, 1)`) para broadcastear sobre las dimensiones.
 - **Escalares por muestra** (`std`, `diffusion`): shape `(B, 1)`, se broadcastean sobre `data_dim`.
-- **CLD** rompe la forma escalar-gaussiana: `marginal_prob` devuelve `mean (B, 2·spatial)` y un
-  **Cholesky** `L (B, 2, 2)` (triangular inferior, diagonal positiva) del kernel conjunto
-  posición–momento.
 
 ## dtype y device
 
@@ -42,16 +39,6 @@ Base abstracta con tres métodos a implementar — `sde(x,t) → (drift, diffusi
 - `score_target(x0, t, eps) → (score_real, weight)`: para la familia escalar-gaussiana
   `score_real = -eps/std` y `weight = std²` (pesado tipo verosimilitud → pérdida equivalente a
   `‖std·s_θ + eps‖²`).
-
-CLD **sobreescribe** `perturb`/`score_target`/`marginal_prob` (kernel conjunto, target sobre el
-momento `∇_v log p_t(v|x)`). Flag `is_augmented` para que los consumidores ramifiquen sin inspeccionar
-el tipo.
-
-## Pendiente conocido: pesado HSM de CLD
-
-Hoy `score_target` de CLD devuelve `weight = 1`; sin un pesado adecuado **CLD no converge** (el target
-del momento explota con `t → 0`). Decisión abierta: la fórmula del peso y dónde vive (`training` vs
-`sde`). Tenerlo presente al tocar la pérdida o agregar samplers que usen CLD.
 
 ## Validación numérica
 

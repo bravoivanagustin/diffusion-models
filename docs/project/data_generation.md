@@ -131,4 +131,4 @@ El próximo paso es la **red que aprende el score** `s_θ(x,t) ≈ ∇_x log p_t
 - Mantener la salida en `float32` y, para entrenar, usar `standardize=True` (escala sana ≈ N(0,1)), guardando `mean_`/`std_` para des-estandarizar las muestras generadas.
 - El `DataLoader` de este módulo alimenta directamente el loop de entrenamiento.
 
-**Próximos archivos** (a definir por el autor, sin implementar todavía): por ejemplo `models/` (el MLP con embedding de `t`), y después `sde/` (VP/VE/sub-VP/CLD) + el loop de entrenamiento. El diseño completo está en `ejes.md`.
+**Próximos archivos** (a definir por el autor, sin implementar todavía): por ejemplo `models/` (el MLP con embedding de `t`), y después `sde/` (VP/VE/sub-VP) + el loop de entrenamiento. El diseño completo está en `ejes.md`.

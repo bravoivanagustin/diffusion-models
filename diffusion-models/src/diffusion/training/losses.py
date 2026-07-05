@@ -3,20 +3,14 @@
 El corazón del módulo es :func:`dsm_loss`, que combina las tres piezas ya entregadas para
 un único batch:
 
-1. ``data_generation`` aporta el dato limpio ``x_0`` (para la familia escalar es el estado
-   completo; para CLD es la **posición**, que la SDE aumenta internamente con el momento).
+1. ``data_generation`` aporta el dato limpio ``x_0``.
 2. ``sde.perturb`` lo ruidea hasta ``x_t`` y devuelve el ruido estándar ``eps`` usado.
 3. ``sde.score_target`` da el score real del kernel ``∇_{x_t} log p_t(x_t | x_0)`` y el peso
    ``λ(t)`` de la pérdida.
 
 La red (:class:`diffusion.mlp.ScoreMLP`) predice ``s_θ(x_t, t)`` y se minimiza el error
-pesado ``λ(t) · ||s_θ - score_real||²``. Es **casi agnóstica a la SDE**: el mismo código corre
-VP/VE/sub-VP (estado escalar) y CLD (estado aumentado) porque ``perturb`` y ``score_target`` ya
-devuelven las shapes y el peso correctos (``σ_t²`` en la familia escalar, ``1`` en CLD). La
-única ramificación es el **HSM** de CLD: la red solo aprende el score del **momento**
-(``∇_v log p_t(v|x)``), así que ``score_target`` devuelve solo esa componente
-(``(B, spatial_dim)``) y la pérdida compara únicamente la mitad de momento de la red —el hook
-``sde.is_augmented`` señala el caso—.
+pesado ``λ(t) · ||s_θ - score_real||²``. Esta función es **agnóstica a la SDE**: ``perturb``
+y ``score_target`` ya devuelven las shapes correctas y el peso adecuado (``λ(t) = σ_t²``).
 
 Es la única pieza donde no hay I/O ni estado: dados ``(net, sde, x_0, t)`` devuelve un escalar
 diferenciable, así que se testea directamente sin loop ni archivos.
@@ -46,27 +40,17 @@ def dsm_loss(
         net: Red de score ``s_θ`` (típicamente :class:`diffusion.mlp.ScoreMLP`); recibe
             ``(x_t, t)`` y devuelve un tensor de la misma shape que ``x_t``.
         sde: Proceso forward que define el kernel de perturbación y el target del score.
-        x0: Dato limpio de shape ``(B, D)`` —``D = sde.data_dim`` para la familia escalar;
-            ``D = sde.spatial_dim`` (la posición) para CLD—.
+        x0: Dato limpio de shape ``(B, D)`` con ``D = sde.data_dim``.
         t: Tiempo de shape ``(B,)`` o ``(B, 1)``, normalmente en ``[t_eps, T]``.
         generator: Generador opcional de torch para el ruido del kernel (reproducibilidad).
 
     Returns:
         Escalar (tensor 0-dim) diferenciable con la pérdida media del batch.
-
-    Note:
-        Para SDEs aumentadas (CLD, ``sde.is_augmented``) el objetivo es HSM: la red aprende
-        solo el score del momento, así que ``score_target`` devuelve ``(B, spatial_dim)`` y se
-        compara únicamente la mitad de momento de la predicción de la red.
     """
     x_t, eps = sde.perturb(x0, t, generator=generator)
     score_real, weight = sde.score_target(x0, t, eps)
     score_pred = net(x_t, t)
-    if getattr(sde, "is_augmented", False):
-        # HSM: la red predice el estado aumentado completo, pero solo aprende el score del
-        # momento (las últimas spatial_dim componentes); ahí comparamos contra el target.
-        score_pred = score_pred[:, sde.spatial_dim :]
-    # weight es (B, 1) y broadcastea sobre las componentes comparadas del score.
+    # weight es (B, 1) y broadcastea sobre las D componentes del score.
     return (weight * (score_pred - score_real).pow(2)).mean()
 
 

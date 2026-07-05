@@ -28,7 +28,7 @@ from diffusion.training import (
     train,
 )
 
-SDE_NAMES = ["vp", "ve", "sub_vp", "cld"]
+SDE_NAMES = ["vp", "ve", "sub_vp"]
 
 
 def _small_net(sde) -> ScoreMLP:
@@ -48,12 +48,11 @@ def _tiny_config(**overrides) -> TrainConfig:
 def test_dsm_loss_escalar_finito_con_gradiente(name):
     """La pérdida es un escalar finito y diferenciable, con gradientes finitos en la red.
 
-    Parametrizado por las 4 SDEs; cubre el seam de CLD (x0 es la posición 2D y la red es
-    data_dim=4) sin que el loop tenga que ramificar.
+    Parametrizado por las 3 SDEs.
     """
     sde = make_sde(name)
     net = _small_net(sde)
-    x0 = torch.randn(32, 2)  # posición 2D: sirve para la familia escalar y para CLD
+    x0 = torch.randn(32, 2)
     t = torch.rand(32) * sde.T
 
     loss = dsm_loss(net, sde, x0, t)
@@ -77,26 +76,6 @@ def test_dsm_loss_reproducible_con_generator():
         dsm_loss(net, sde, x0, t, generator=g1),
         dsm_loss(net, sde, x0, t, generator=g2),
     )
-
-
-def test_dsm_loss_cld_solo_compara_el_momento():
-    """HSM: en CLD la red predice (B,4) pero la pérdida usa solo la mitad de momento (B,2)."""
-    sde = make_sde("cld")
-    net = _small_net(sde)  # data_dim=4
-    x0 = torch.randn(16, 2)
-    t = torch.rand(16) * sde.T
-
-    loss = dsm_loss(net, sde, x0, t, generator=torch.Generator().manual_seed(0))
-
-    # Recalcular a mano con el mismo ruido: target de momento (B, spatial_dim) contra la
-    # mitad de momento de la predicción.
-    x_t, eps = sde.perturb(x0, t, generator=torch.Generator().manual_seed(0))
-    target, weight = sde.score_target(x0, t, eps)
-    pred_v = net(x_t, t)[:, sde.spatial_dim:]
-    expected = (weight * (pred_v - target).pow(2)).mean()
-
-    assert target.shape == (16, sde.spatial_dim)
-    assert torch.allclose(loss, expected)
 
 
 # ------------------------------------------------------------ sample_timesteps
@@ -126,7 +105,7 @@ def test_sample_timesteps_respeta_horizonte_distinto():
 
 @pytest.mark.parametrize("name", SDE_NAMES)
 def test_train_devuelve_red_con_data_dim_correcto(name):
-    """train() instancia la red con el data_dim de la SDE (2 escalar / 4 CLD) y traza finita."""
+    """train() instancia la red con el data_dim de la SDE y traza finita."""
     sde = make_sde(name)
     dist = make_distribution("gaussian", 2, seed=0)
     result = train(sde, dist, _tiny_config(epochs=1))
@@ -169,9 +148,9 @@ def test_train_con_grad_clip_corre():
 # -------------------------------------------------------------- checkpoints
 
 
-def test_checkpoint_roundtrip_cld(tmp_path):
-    """Guardar y recargar reconstruye la red (incl. data_dim=4 de CLD) con los mismos pesos."""
-    sde = make_sde("cld")
+def test_checkpoint_roundtrip(tmp_path):
+    """Guardar y recargar reconstruye la red con los mismos pesos y la misma meta."""
+    sde = make_sde("vp")
     dist = make_distribution("gaussian", 2, seed=0)
     result = train(sde, dist, _tiny_config(epochs=1))
 
@@ -179,11 +158,11 @@ def test_checkpoint_roundtrip_cld(tmp_path):
     save_checkpoint(result, path)
     net2, meta = load_checkpoint(path)
 
-    assert net2.data_dim == sde.data_dim == 4
-    assert meta["sde_name"] == "cld"
+    assert net2.data_dim == sde.data_dim == 2
+    assert meta["sde_name"] == "vp"
     assert meta["history"] == pytest.approx(result.history)
 
-    x = torch.randn(8, 4)
+    x = torch.randn(8, 2)
     t = torch.rand(8)
     result.net.eval()
     with torch.no_grad():
@@ -209,13 +188,6 @@ def test_build_run_desde_dict():
     assert spec.config.n_samples == 512  # n_samples viaja de 'data' a TrainConfig
     assert spec.checkpoint.name == "x.pt"
     assert spec.loss_curve.name == "x.png"
-
-
-def test_build_run_cld_arma_data_dim_4():
-    raw = {"sde": {"name": "cld"}, "data": {"shape": "gaussian", "dim": 2, "n_samples": 64}}
-    spec = build_run(raw)
-    assert spec.sde.data_dim == 4
-    assert spec.distribution.dim == 2  # la posición es 2D; la SDE agrega el momento
 
 
 def test_build_run_falla_sin_claves_obligatorias():

@@ -74,7 +74,7 @@ def train(
 
     Args:
         sde: Proceso forward (define el kernel y el target del score). Su ``data_dim`` fija la
-            dimensión de la red (2 para VP/VE/sub-VP, 4 para CLD).
+            dimensión de la red (2 para VP/VE/sub-VP).
         distribution: Fuente de datos ``p_data(x_0)`` (una ``PointDistribution`` de
             :mod:`diffusion.data_generation`); se le pide un ``DataLoader``.
         config: Hiperparámetros de la corrida.

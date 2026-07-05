@@ -5,8 +5,7 @@ con ``alpha_t``/``sigma_t`` escalares por muestra, así que :meth:`perturb` y
 :meth:`score_target` se heredan tal cual de :class:`~diffusion.sde.base.ForwardSDE`. Cada
 clase solo aporta :meth:`sde`, :meth:`marginal_prob` y :meth:`prior_sampling`.
 
-Marco unificado de Song et al. (ICLR 2021). CLD (estado aumentado) vive aparte en
-:mod:`diffusion.sde.cld` porque no entra en esta familia.
+Marco unificado de Song et al. (ICLR 2021).
 """
 
 from __future__ import annotations

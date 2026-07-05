@@ -71,7 +71,7 @@ class PredictorCorrector(ReverseSampler):
 
         Args:
             sde: Proceso forward (Eje 1) del que se derivan los coeficientes ``(f, g)`` y el
-                prior ``p_T``. Debe ser escalar (no aumentado).
+                prior ``p_T``.
             score_fn: Función pura ``(x, t) -> score`` que aproxima ``∇_x log p_t(x)``.
             n_steps: Número de pasos (intervalos) de integración; ``>= 1``.
             t_eps: Tiempo terminal de la integración, un piso ``> 0`` con ``0 < t_eps < sde.T``.
@@ -83,7 +83,6 @@ class PredictorCorrector(ReverseSampler):
         Raises:
             ValueError: Si ``n_steps < 1``, ``t_eps`` cae fuera de ``(0, sde.T)`` o
                 ``n_corrector < 0``.
-            NotImplementedError: Si ``sde`` es aumentada (CLD): fuera de alcance.
         """
         super().__init__(sde, score_fn, n_steps=n_steps, t_eps=t_eps)
         if n_corrector < 0:

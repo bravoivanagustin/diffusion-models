@@ -69,7 +69,7 @@ Hiperparámetros (todos argumentos del constructor, sin números mágicos en el 
 
 | Param | Default | Qué controla |
 |---|---|---|
-| `data_dim` | `2` | dim del dato = dim de la salida. `2` para VP/VE/sub-VP `(x, y)`; `4` para **CLD** (estado aumentado posición-momento `(x, y, v_x, v_y)`). |
+| `data_dim` | `2` | dim del dato = dim de la salida. `2` para VP/VE/sub-VP `(x, y)`. |
 | `embed_dim` | `128` | dim del embedding de tiempo (debe ser par). |
 | `hidden_dim` | `256` | ancho de las capas ocultas en todos los bloques. |
 | `num_blocks` | `4` | cantidad de bloques residuales. |
@@ -99,11 +99,11 @@ python -m pytest -q diffusion-models/tests/test_score_mlp.py   # solo este módu
 ```python
 from diffusion.mlp import ScoreMLP
 
-net = ScoreMLP(data_dim=2)        # VP / VE / sub-VP   (data_dim=4 para CLD)
+net = ScoreMLP(data_dim=2)        # VP / VE / sub-VP
 score = net(x, t)                 # x: (B, 2), t: (B,) o (B, 1)  ->  score: (B, 2)
 ```
 
-El propio `score_mlp.py` trae un bloque `__main__` de smoke test: instancia la red por defecto, corre un forward sobre un batch dummy, imprime la shape de salida y el conteo de parámetros, y verifica el caso CLD (`data_dim=4`, entrada y salida 4D). Correr: `python diffusion-models/src/diffusion/mlp/score_mlp.py`.
+El propio `score_mlp.py` trae un bloque `__main__` de smoke test: instancia la red por defecto, corre un forward sobre un batch dummy, imprime la shape de salida y el conteo de parámetros. Correr: `python diffusion-models/src/diffusion/mlp/score_mlp.py`.
 
 ---
 
@@ -111,13 +111,12 @@ El propio `score_mlp.py` trae un bloque `__main__` de smoke test: instancia la r
 
 La red ya sabe mapear `(x_t, t) -> score`, pero **todavía no aprende nada**: falta el **target** que la entrene. Eso lo aporta el **forward SDE** (Eje 1):
 
-- Dado un `x_0` de `data_generation`, samplea un tiempo `t` y ruido `ε` y construye `x_t = α_t·x_0 + σ_t·ε`. Los `α_t`, `σ_t` (y el target del score) los fija cada SDE: **VP**, **VE**, **sub-VP**, **CLD**.
+- Dado un `x_0` de `data_generation`, samplea un tiempo `t` y ruido `ε` y construye `x_t = α_t·x_0 + σ_t·ε`. Los `α_t`, `σ_t` (y el target del score) los fija cada SDE: **VP**, **VE**, **sub-VP**.
 - El loop de entrenamiento minimiza un **denoising score matching**: empuja `s_θ(x_t, t)` hacia el score real de `p_t` (equivalente, según la parametrización, a predecir `ε` o `x_0`).
 
 **Cómo engancha con este módulo sin fricción:**
 
 - La red queda **fija** entre variantes (variable de control); sólo se **reentrena** cuando cambia el forward SDE (Eje 1), nunca cuando cambia el sampler (Eje 2).
 - `data_generation` alimenta los `x_0` (vía `sample_torch` / `dataloader`); se recomienda `standardize=True` (escala ≈ N(0,1)) y guardar `mean_`/`std_` para des-estandarizar las muestras generadas.
-- Para **CLD** habrá que instanciar `ScoreMLP(data_dim=4)` (estado aumentado con momento).
 
-**Próximos archivos** (a definir por el autor, sin implementar todavía): `sde/` (VP/VE/sub-VP/CLD + el target del score), el loop de entrenamiento, y luego `samplers/` (Euler–Maruyama, PF-ODE, Heun, predictor–corrector). El diseño completo está en `ejes.md`.
+**Próximos archivos** (a definir por el autor, sin implementar todavía): `sde/` (VP/VE/sub-VP + el target del score), el loop de entrenamiento, y luego `samplers/` (Euler–Maruyama, PF-ODE, Heun, predictor–corrector). El diseño completo está en `ejes.md`.

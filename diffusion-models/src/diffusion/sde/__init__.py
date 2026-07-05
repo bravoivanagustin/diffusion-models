@@ -14,11 +14,10 @@ from __future__ import annotations
 import inspect
 
 from .base import ForwardSDE
-from .cld import CLDSDE
 from .variants import SubVPSDE, VESDE, VPSDE
 
 REGISTRY: dict[str, type[ForwardSDE]] = {
-    cls.name: cls for cls in (VPSDE, VESDE, SubVPSDE, CLDSDE)
+    cls.name: cls for cls in (VPSDE, VESDE, SubVPSDE)
 }
 
 
@@ -33,7 +32,7 @@ def make_sde(name: str, **kwargs) -> ForwardSDE:
     Los ``kwargs`` que no aplican a la variante elegida se descartan (se filtran según la
     firma del constructor), así un caller genérico puede pasar siempre el mismo conjunto
     de parámetros. A diferencia de ``data_generation.make_distribution``, no toma ``dim``:
-    el ``data_dim`` es fijo por variante (2 para VP/VE/sub-VP, 4 para CLD).
+    el ``data_dim`` va como kwarg del constructor (2 por defecto en todas las variantes).
     """
     try:
         cls = REGISTRY[name]
@@ -54,5 +53,4 @@ __all__ = [
     "VPSDE",
     "VESDE",
     "SubVPSDE",
-    "CLDSDE",
 ]

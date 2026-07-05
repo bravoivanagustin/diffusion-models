@@ -87,7 +87,7 @@ def build_run(raw: dict) -> RunSpec:
     # --- SDE ---
     sde_raw = dict(raw.get("sde") or {})
     if "name" not in sde_raw:
-        raise ValueError("config: falta 'sde.name' (p. ej. vp / ve / sub_vp / cld).")
+        raise ValueError("config: falta 'sde.name' (p. ej. vp / ve / sub_vp).")
     sde = make_sde(**sde_raw)
 
     # --- datos ---

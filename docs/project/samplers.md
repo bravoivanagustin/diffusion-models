@@ -57,7 +57,6 @@ ABC con un atributo de clase `name` (clave del registry) y un constructor `__ini
 - **La grilla temporal** uniforme de `T` a `t_eps` (`n_steps+1` puntos), integrada en tiempo **decreciente** (`dt<0`). El piso `t_eps` (default `1e-3`) evita `t=0`, donde el score diverge.
 - **Los drifts reversos compartidos**, derivados de `sde.sde(x,t)` y `score_fn(x,t)`: `_reverse_drift = f − g²·s` (SDE) y `_pfode_drift = f − ½g²·s` (ODE).
 - **El driver `sample(n_samples, *, init=None, generator=None, return_trajectory=False)`**: arranca de `sde.prior_sampling` (o del `init` provisto), recorre la grilla llamando al `step()` abstracto, corre bajo `torch.no_grad()` en `float32` y **no toca los parámetros de la red**. Devuelve `x_0`; con `return_trajectory=True`, también la trayectoria `(n_steps+1, n_samples, data_dim)`.
-- **Una guarda explícita**: rechaza SDEs aumentadas (`sde.is_augmented`, es decir CLD) con un error claro. CLD queda fuera del alcance validado de esta iteración (ver §3).
 
 `step(self, x, t, dt, *, generator)` es **abstracto**: lo único que cambia entre samplers.
 
@@ -130,8 +129,7 @@ El módulo trae un smoke (`__main__.py`): corre los cuatro samplers sobre una re
 
 ## 3. Estado y qué sigue
 
-Con los samplers entregados, la **matriz 4×4 del estudio** ya es ejecutable para las celdas escalares: 4 SDEs (VP/VE/sub-VP convergen) × 4 samplers, todas reusando el score sin reentrenar. Pendientes, en orden:
+Con los samplers entregados, la **matriz 3×4 del estudio** ya es ejecutable: 3 SDEs (VP/VE/sub-VP, las tres convergen) × 4 samplers, todas reusando el score sin reentrenar. Pendientes, en orden:
 
-- **CLD en el reverso** ⚠️ — la base **rechaza** SDEs aumentadas con una guarda explícita; el seam queda documentado pero **sin validar**. Su dinámica reversa (estado aumentado `(x,v)`, ruido solo por `v`, difusión estructurada) está atada al **pesado HSM** todavía pendiente en `training`/`sde` (sin él, CLD no converge; ver `training.md` y `to-do.md`).
 - **Evaluación / visualización** — campos de score, trayectorias de partículas, reconstrucción de densidad y la comparación contra el score analítico de la mezcla. Los samplers ya exponen `return_trajectory` para alimentarlo; el ploteo y las métricas (FID/IS en Fase 2) van en un módulo aparte.
 - **Fase 2 (imágenes + U-Net)** — el mismo marco escala reusando una U-Net de librería; los samplers son agnósticos a `data_dim`, así que no requieren cambios estructurales. El diseño completo está en `ejes.md`.

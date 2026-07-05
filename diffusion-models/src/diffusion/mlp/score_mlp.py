@@ -154,7 +154,6 @@ class ScoreMLP(nn.Module):
     :math:`\\nabla_x \\log p_t(x)` vive en el mismo espacio que ``x``.
 
     ``data_dim=2`` para VP-SDE, VE-SDE y sub-VP (el punto es ``(x, y)``).
-    ``data_dim=4`` para CLD (estado posición-momento ``(x, y, v_x, v_y)``).
     """
 
     def __init__(
@@ -216,10 +215,3 @@ if __name__ == "__main__":
 
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Parámetros entrenables: {n_params:,}")
-
-    # CLD usa data_dim=4 (estado aumentado posición-momento).
-    net_cld = ScoreMLP(data_dim=4)
-    x4 = torch.randn(16, 4)
-    out4 = net_cld(x4, t)
-    assert out4.shape == (16, 4), out4.shape
-    print(f"ScoreMLP(data_dim=4): entrada {tuple(x4.shape)} -> salida {tuple(out4.shape)}")

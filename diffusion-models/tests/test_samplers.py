@@ -1,8 +1,8 @@
 """Tests del proceso reverso (`diffusion.samplers`).
 
 Task 1.1: paquete importable + esqueleto del ABC ``ReverseSampler`` (grilla temporal,
-drifts reversos compartidos, guarda contra SDEs aumentadas). El driver ``sample()`` y los
-samplers concretos llegan en tasks posteriores; acá solo se valida el contrato base.
+drifts reversos compartidos). El driver ``sample()`` y los samplers concretos llegan en
+tasks posteriores; acá solo se valida el contrato base.
 """
 
 from __future__ import annotations
@@ -47,13 +47,6 @@ def test_instantiate_with_scalar_sde():
     s = _NoOpSampler(sde, _zero_score)
     assert s.sde is sde
     assert s.score_fn is _zero_score
-
-
-def test_augmented_sde_rejected():
-    # CLD (estado aumentado) está fuera de alcance de esta iteración.
-    sde = make_sde("cld")
-    with pytest.raises((ValueError, NotImplementedError)):
-        _NoOpSampler(sde, _zero_score)
 
 
 def test_n_steps_must_be_positive():

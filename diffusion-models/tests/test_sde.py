@@ -7,7 +7,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from diffusion.sde import (
-    CLDSDE,
     SubVPSDE,
     VESDE,
     VPSDE,
@@ -30,14 +29,13 @@ def _x0_t(n=B, dim=2, seed=0):
 
 
 def test_available_sdes():
-    assert set(available_sdes()) == {"vp", "ve", "sub_vp", "cld"}
+    assert set(available_sdes()) == {"vp", "ve", "sub_vp"}
 
 
 def test_factory_returns_right_type():
     assert isinstance(make_sde("vp"), VPSDE)
     assert isinstance(make_sde("ve"), VESDE)
     assert isinstance(make_sde("sub_vp"), SubVPSDE)
-    assert isinstance(make_sde("cld"), CLDSDE)
 
 
 def test_unknown_sde_raises():
@@ -226,108 +224,6 @@ def test_seam_with_scoremlp(name):
     assert torch.all(torch.isfinite(pred))
 
 
-# ===================================================================== CLD
-
-
-def test_cld_basics_and_shapes():
-    sde = make_sde("cld")
-    assert sde.data_dim == 4 and sde.is_augmented is True
-    x0 = torch.randn(B, 2)                      # x0 es la posición (B, 2)
-    t = torch.rand(B)
-    mean, L = sde.marginal_prob(x0, t)
-    assert mean.shape == (B, 4) and L.shape == (B, 2, 2)
-    # L es triangular inferior con diagonal positiva (Cholesky válido).
-    assert torch.allclose(L[:, 0, 1], torch.zeros(B))
-    assert torch.all(L[:, 0, 0] > 0) and torch.all(L[:, 1, 1] > 0)
-    u_t, n = sde.perturb(x0, t, generator=torch.Generator().manual_seed(0))
-    assert u_t.shape == (B, 4) and n.shape == (B, 4)
-    score, weight = sde.score_target(x0, t, n)
-    # HSM: el target es solo el score del momento (spatial_dim componentes), no el conjunto.
-    assert score.shape == (B, 2) and weight.shape == (B, 1)
-    z = sde.prior_sampling((10, 4), generator=torch.Generator().manual_seed(0))
-    assert z.shape == (10, 4)
-
-
-def test_cld_t_shapes():
-    sde = make_sde("cld")
-    x0, t = torch.randn(B, 2), torch.rand(B)
-    m1, L1 = sde.marginal_prob(x0, t)
-    m2, L2 = sde.marginal_prob(x0, t.reshape(B, 1))
-    assert torch.equal(m1, m2) and torch.equal(L1, L2)
-
-
-def test_cld_score_matches_inverse_covariance():
-    # Chequeo independiente: el target de HSM es la componente de momento del score conjunto,
-    # que para el gaussiano conjunto es la coordenada v de -Σ^{-1}(u_t - mean).
-    sde = make_sde("cld")
-    x0 = torch.randn(B, 2)
-    t = torch.rand(B) * 0.8 + 0.1
-    u_t, n = sde.perturb(x0, t, generator=torch.Generator().manual_seed(5))
-    mean, L = sde.marginal_prob(x0, t)
-    sxx = L[:, 0, 0:1] ** 2
-    sxv = (L[:, 0, 0:1] * L[:, 1, 0:1])
-    svv = L[:, 1, 0:1] ** 2 + L[:, 1, 1:2] ** 2
-    det = sxx * svv - sxv ** 2
-    dx = u_t[:, :2] - mean[:, :2]
-    dv = u_t[:, 2:] - mean[:, 2:]
-    score_v = -(sxx * dv - sxv * dx) / det   # coordenada v de -Σ^{-1}(u - mean)
-    got, _ = sde.score_target(x0, t, n)
-    assert got.shape == (B, 2)
-    assert torch.allclose(got, score_v, atol=1e-4, rtol=1e-3)
-
-
-def test_cld_kernel_matches_monte_carlo():
-    # Valida la forma cerrada (mean/cov) contra una simulación Euler-Maruyama del
-    # forward. Dimensiones espaciales independientes e isótropas -> simulo el OU 1D.
-    sde = make_sde("cld")
-    beta, m_inv, gamma, mass = sde.beta, sde.m_inv, sde.gamma, sde.mass
-    n, steps, t_end = 40000, 800, 0.4
-    dt = t_end / steps
-    g = torch.Generator().manual_seed(0)
-
-    x0_val = 1.5
-    x = torch.full((n,), x0_val)
-    v = torch.randn(n, generator=g) * (mass ** 0.5)   # v0 ~ N(0, M)
-    sqrt_2g_dt = (2.0 * gamma * dt) ** 0.5
-    for _ in range(steps):
-        dw = torch.randn(n, generator=g) * sqrt_2g_dt
-        x_new = x + m_inv * v * dt
-        v_new = v - (gamma * m_inv * v + beta * x) * dt + dw
-        x, v = x_new, v_new
-
-    # Forma cerrada en t_end para x0 = x0_val.
-    x0 = torch.full((1, 2), x0_val)
-    mean, L = sde.marginal_prob(x0, torch.full((1,), t_end))
-    mean_x, mean_v = mean[0, 0].item(), mean[0, 2].item()
-    sxx = (L[0, 0, 0] ** 2).item()
-    sxv = (L[0, 0, 0] * L[0, 1, 0]).item()
-    svv = (L[0, 1, 0] ** 2 + L[0, 1, 1] ** 2).item()
-
-    assert abs(x.mean().item() - mean_x) < 0.02
-    assert abs(v.mean().item() - mean_v) < 0.02
-    assert abs(x.var().item() - sxx) < max(0.02, 0.05 * sxx)
-    assert abs(v.var().item() - svv) < max(0.02, 0.05 * svv)
-    cov_emp = ((x - x.mean()) * (v - v.mean())).mean().item()
-    assert abs(cov_emp - sxv) < max(0.02, 0.05 * abs(sxv))
-
-
-def test_cld_seam_with_scoremlp():
-    from diffusion.mlp import ScoreMLP
-
-    sde = make_sde("cld")
-    net = ScoreMLP(data_dim=4)                  # estado aumentado posición-momento
-    x0, t = torch.randn(B, 2), torch.rand(B)
-    u_t, n = sde.perturb(x0, t, generator=torch.Generator().manual_seed(1))
-    pred = net(u_t, t)
-    target, _ = sde.score_target(x0, t, n)
-    # HSM: la red predice el estado aumentado completo (B, 4), pero el target es solo el score
-    # del momento (B, 2); el loop compara esa mitad (pred[:, spatial_dim:]) contra el target.
-    assert pred.shape == (B, 4)
-    assert target.shape == (B, 2)
-    assert pred[:, sde.spatial_dim:].shape == target.shape
-    assert torch.all(torch.isfinite(pred))
-
-
 # ============================================================ dimensión arbitraria
 
 
@@ -338,7 +234,6 @@ def test_data_dim_must_be_positive():
 
 def test_factory_passes_data_dim():
     assert make_sde("vp", data_dim=7).data_dim == 7
-    assert make_sde("cld", data_dim=6).data_dim == 6
 
 
 @pytest.mark.parametrize("name", SCALAR)
@@ -356,22 +251,3 @@ def test_scalar_arbitrary_dim(name, dim):
     drift, diffusion = sde.sde(x0, t)
     assert drift.shape == (B, dim) and diffusion.shape == (B, 1)
     assert sde.prior_sampling((5, dim)).shape == (5, dim)
-
-
-def test_cld_odd_data_dim_raises():
-    with pytest.raises(ValueError):
-        make_sde("cld", data_dim=3)
-
-
-@pytest.mark.parametrize("spatial", [1, 3, 5])
-def test_cld_arbitrary_spatial_dim(spatial):
-    sde = make_sde("cld", data_dim=2 * spatial)
-    assert sde.data_dim == 2 * spatial and sde.spatial_dim == spatial
-    x0, t = torch.randn(B, spatial), torch.rand(B)   # x0 es la posición (B, spatial)
-    u_t, n = sde.perturb(x0, t, generator=torch.Generator().manual_seed(0))
-    assert u_t.shape == (B, 2 * spatial) and n.shape == (B, 2 * spatial)
-    mean, L = sde.marginal_prob(x0, t)
-    assert mean.shape == (B, 2 * spatial) and L.shape == (B, 2, 2)
-    score, _ = sde.score_target(x0, t, n)
-    assert score.shape == (B, spatial)   # HSM: target = score del momento (spatial componentes)
-    assert sde.prior_sampling((10, 2 * spatial)).shape == (10, 2 * spatial)

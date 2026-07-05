@@ -2,7 +2,7 @@
 
 `pytest` es parte del entregable, no un extra. Cada módulo se entrega con su suite **en verde** antes
 de avanzar al siguiente (desarrollo incremental). Suites actuales: `data_generation`, `mlp`, `sde`
-(56 tests, CLD validado por Monte Carlo), `training` (20 tests).
+(47 tests), `training` (17 tests), `samplers` (134 tests).
 
 ## Organización
 
@@ -35,11 +35,11 @@ ScoreMLP`) para no acoplar la colección del archivo.
 - **Validación matemática independiente** (no solo "no crashea):
   - **Forma cerrada vs diferencias finitas**: p. ej. la ODE de la varianza
     `dΣ/dt == 2·f·Σ + g²` chequeada con diferencias finitas (`rtol≈1e-2`).
-  - **Score analítico**: comparar `score_target` contra la fórmula cerrada (`-eps/std`, o `-Σ⁻¹Δ`
-    para CLD), no contra sí mismo.
-  - **Monte Carlo**: validar el kernel de perturbación simulando el forward por Euler–Maruyama
-    (`n≈40000`) y comparando media/varianza/covarianza empíricas contra la forma cerrada
-    (tolerancia relativa ~5%). Así se validó CLD.
+  - **Score analítico**: comparar `score_target` contra la fórmula cerrada (`-eps/std`), no contra
+    sí mismo.
+  - **Monte Carlo**: validar un kernel de perturbación nuevo simulando el forward por
+    Euler–Maruyama (`n≈40000`) y comparando media/varianza/covarianza empíricas contra la forma
+    cerrada (tolerancia relativa ~5%).
 - **Seams entre módulos**: un test mínimo que conecta las piezas reales (p. ej. `sde.perturb` →
   `ScoreMLP(data_dim)` → `sde.score_target`) y verifica que las shapes encajan.
 - **Límites y casos borde**: `t→0` y `t→T` (medias/desvíos esperados), `data_dim` arbitrario
@@ -48,7 +48,7 @@ ScoreMLP`) para no acoplar la colección del archivo.
 ## Estilo
 
 - `@pytest.mark.parametrize` sobre nombres de variante (`SCALAR = ["vp","ve","sub_vp"]`) y sobre
-  dimensiones (`[1,3,7]`); CLD suele tener su propio bloque por el estado aumentado.
+  dimensiones (`[1,3,7]`).
 - Helpers chicos para fixtures de datos (`_x0_t(n, dim, seed)`), no fixtures globales pesadas.
 - Tolerancias **explícitas y justificadas** por el método (`atol`/`rtol`); más laxas para Monte
   Carlo, ajustadas para forma cerrada.

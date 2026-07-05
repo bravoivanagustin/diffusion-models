@@ -14,7 +14,7 @@ la sigue.
 **Ubicación**: `diffusion-models/src/diffusion/<módulo>/`
 **Patrón**: cada módulo es un paquete con `base.py` (clase base abstracta), implementaciones
 concretas y un `__init__.py` que expone el **registry + factory** y el `__all__` público.
-**Ejemplo**: `sde/` → `base.ForwardSDE`, `variants.py` (VP/VE/sub-VP), `cld.py`, y
+**Ejemplo**: `sde/` → `base.ForwardSDE`, `variants.py` (VP/VE/sub-VP), y
 `__init__` con `make_sde` / `available_sdes` / `REGISTRY`.
 
 ### Documentación
@@ -61,8 +61,8 @@ from .variants import VPSDE, VESDE, SubVPSDE
   en el `REGISTRY` del `__init__`; ningún caller debería cambiar.
 - **Regla de reentrenamiento**: tocar el **forward SDE (Eje 1)** obliga a reentrenar; cambiar el
   **sampler (Eje 2)** no.
-- **`data_dim` por variante**: 2 para VP/VE/sub-VP, 4 para CLD (estado aumentado posición–momento);
-  la `ScoreMLP` se instancia acorde.
+- **`data_dim` por variante**: la `ScoreMLP` se instancia con `data_dim=sde.data_dim` (2 en la
+  Fase 1 toy 2D).
 
 ---
 _Documentar patrones, no árboles de archivos. Un archivo nuevo que sigue el patrón no debería exigir

@@ -4,10 +4,10 @@ Orientación para Claude Code (y cualquier sesión futura) sobre este proyecto. 
 **TP Final de Cálculo Estocástico — 1er cuatrimestre 2026**.
 
 > **Importante:** el proyecto ya **dejó de ser solo documentación**: hay un paquete Python
-> (`diffusion-models/`) con cuatro módulos terminados y testeados (`data_generation`, `mlp`, `sde` y
-> `training`). Pero el **resto de la arquitectura todavía no existe y la decide el autor**: no
-> inventes ni armes por tu cuenta los módulos que faltan (los **samplers** del reverso y la **U-Net**
-> de Fase 2; más el **pesado HSM de CLD**, pendiente dentro del loop). Si se pide implementar algo,
+> (`diffusion-models/`) con cinco módulos terminados y testeados (`data_generation`, `mlp`, `sde`,
+> `training` y `samplers`). Pero el **resto de la arquitectura todavía no existe y la decide el
+> autor**: no inventes ni armes por tu cuenta los módulos que faltan (la **evaluación /
+> visualización** de Fase 1 y la **U-Net** de Fase 2). Si se pide implementar algo,
 > **primero acordá el alcance y el lugar**, y construí **de a poco, con la suite de pytest en verde en
 > cada paso** (ver Convenciones).
 
@@ -53,8 +53,6 @@ debe aprender (la densidad $p_t(x)$ es distinta para cada SDE) → **un entrenam
 - **VP-SDE** (*Variance Preserving*) — límite continuo de DDPM.
 - **VE-SDE** (*Variance Exploding*) — límite continuo de NCSN.
 - **sub-VP SDE** — mismo drift que VP, pero con varianza acotada por debajo de la de VP.
-- **CLD** (*Critically-Damped Langevin*) — aumenta el estado con un momento $v_t$; el ruido entra
-  **solo por $v_t$** y la red aprende $\nabla_v \log p_t(v\mid x)$.
 
 ### Eje 2 — *Sampler* del proceso reverso · **no requiere reentrenar**
 
@@ -66,7 +64,7 @@ distintas formas (todos los samplers comparten el mismo score).
 - **Heun** — ODE de 2º orden; sampler por defecto de EDM (mejor precisión por NFE).
 - **Predictor–Corrector** — paso de SDE + correcciones de Langevin (mayor techo de calidad).
 
-La matriz combinada es **4 × 4 = 16 celdas**. Cada celda se evalúa en ambas fases: en **Fase 1 (2D)**
+La matriz combinada es **3 × 4 = 12 celdas**. Cada celda se evalúa en ambas fases: en **Fase 1 (2D)**
 con campos de score, trayectorias de partículas y reconstrucción de densidad (más el score analítico
 para la mezcla de gaussianas); en **Fase 2 (imágenes)** con FID / IS a presupuestos de NFE igualados
 y una grilla cualitativa de muestras. El detalle completo (ecuaciones, tabla de reentrenamiento,
@@ -100,8 +98,9 @@ tp-final/
     ├── src/diffusion/
     │   ├── data_generation/   # PointDistribution (ABC) + 5 formas + registry/factory
     │   ├── mlp/               # ScoreMLP (red de score) + SinusoidalEmbedding + ResidualBlock
-    │   ├── sde/               # ForwardSDE (ABC) + VP/VE/sub-VP/CLD + score_target + make_sde
-    │   └── training/          # loop de DSM: train/TrainConfig, dsm_loss, checkpoints, configs YAML
+    │   ├── sde/               # ForwardSDE (ABC) + VP/VE/sub-VP + score_target + make_sde
+    │   ├── training/          # loop de DSM: train/TrainConfig, dsm_loss, checkpoints, configs YAML
+    │   └── samplers/          # ReverseSampler (ABC) + EM/PF-ODE/Heun/PC + make_sampler
     ├── tests/                 # pytest (una suite por módulo)
     └── data/                  # datasets generados (gitignored; reproducibles desde --seed)
 ```
@@ -113,22 +112,26 @@ tp-final/
   torch (import diferido), y un CLI que guarda `.npz` + preview. Ver `docs/project/data_generation.md`.
 - `diffusion.mlp` — la **red de score** $s_\theta(x,t)\approx\nabla_x\log p_t(x)$ para datos 2D:
   `ScoreMLP` (embedding sinusoidal de $t$ + bloques residuales), **enteramente determinística** (sin
-  dropout ni batchnorm). `data_dim=2` para VP/VE/sub-VP, `data_dim=4` para CLD. Ver
-  `docs/project/mlp.md`.
-- `diffusion.sde` — el **Eje 1**: procesos *forward* `dx=f\,dt+g\,dW` (`VPSDE`, `VESDE`, `SubVPSDE`,
-  `CLDSDE`) sobre la base abstracta `ForwardSDE`, con `make_sde`/`available_sdes`. Producen el par de
+  dropout ni batchnorm). `data_dim=2` para VP/VE/sub-VP. Ver `docs/project/mlp.md`.
+- `diffusion.sde` — el **Eje 1**: procesos *forward* `dx=f\,dt+g\,dW` (`VPSDE`, `VESDE`, `SubVPSDE`)
+  sobre la base abstracta `ForwardSDE`, con `make_sde`/`available_sdes`. Producen el par de
   entrenamiento (`perturb`) y el **target del score** (`score_target`); `data_dim` configurable en
-  cualquier dimensión. CLD usa estado aumentado (kernel conjunto, Cholesky) y está validado por Monte
-  Carlo. Ver `docs/project/sde.md`.
+  cualquier dimensión. Ver `docs/project/sde.md`.
 - `diffusion.training` — el **loop de entrenamiento** por *denoising score matching* que une los tres
   anteriores: `train`/`TrainConfig`, helper `dsm_loss`, checkpoints (`save/load_checkpoint`) y
   corridas config-driven por YAML (`load_config`→`build_run`) + CLI `scripts/train.py`. VP/VE/sub-VP
   convergen. Ver `docs/project/training.md`.
+- `diffusion.samplers` — el **Eje 2**: los 4 samplers del reverso (Euler–Maruyama, PF-ODE, Heun,
+  predictor–corrector) sobre la base abstracta `ReverseSampler` (score inyectable, driver `sample`,
+  `return_trajectory`), con registry/factory y CLI `scripts/sample.py`. Validados con score analítico
+  sobre VP/VE/sub-VP. Ver `docs/project/samplers.md`.
 
-**Todavía no implementado** (lo decide el autor, módulo a módulo): los **samplers** del reverso —Eje
-2— (Euler–Maruyama, PF-ODE, Heun, predictor–corrector), la **U-Net** de Fase 2, y —pendiente dentro
-de `training`— el **pesado HSM de CLD** (hoy `score_target` de CLD devuelve `weight=1` y sin él el
-target del momento explota con $t\to0$, así que las celdas de CLD no convergen todavía).
+**Todavía no implementado** (lo decide el autor, módulo a módulo): la **evaluación / visualización**
+de Fase 1 (campos de score, trayectorias, densidad) y la **U-Net** de Fase 2.
+
+> **Nota (05/07/2026):** **CLD se eliminó del alcance del proyecto** (existió como cuarta SDE, con
+> HSM pendiente, y se descartó). El Eje 1 queda con VP/VE/sub-VP; no lo reintroduzcas sin pedido
+> explícito del autor.
 
 **Stack:** Python 3.14 (Windows); `torch 2.12.0+cpu` (anda en 3.14), numpy, scikit-learn, matplotlib,
 pytest. Entorno gestionado con `uv`.
@@ -168,6 +171,7 @@ correspondiente en `docs/project/`:
 - `docs/project/mlp.md` — doc del módulo `mlp` (la red de score).
 - `docs/project/sde.md` — doc del módulo `sde` (los procesos forward, Eje 1).
 - `docs/project/training.md` — doc del módulo `training` (el loop de DSM).
+- `docs/project/samplers.md` — doc del módulo `samplers` (el reverso, Eje 2).
 - `docs/project/referencias.md` — mapa de literatura del área (capa teórica SDE/ODE, capa de
   samplers, y procesos estocásticos exóticos) con el set mínimo de citas esperable.
 - `docs/knowledge/ddpm.md` — notas propias sobre DDPM (Ho et al., 2020).
@@ -179,7 +183,6 @@ correspondiente en `docs/project/`:
   predictor–corrector). El paper central del trabajo.
 - **Ho et al., NeurIPS 2020** — DDPM.
 - **Anderson, 1982** — teorema de reversión temporal de SDEs.
-- **Dockhorn et al., ICLR 2022** — CLD.
 - **Song, Meng & Ermon, ICLR 2021** — DDIM / PF-ODE.
 - **Karras et al., NeurIPS 2022** — EDM (sampler de Heun, *design space*).
 

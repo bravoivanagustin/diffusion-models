@@ -15,7 +15,7 @@ importa **torch directamente**: opera sobre tensores, produce los pares de entre
 alimenta los samplers, así que torch es dependencia dura (igual que ``mlp``).
 
 Clase base abstracta acá; las variantes escalar-gaussianas (VP/VE/sub-VP) viven en
-:mod:`variants` y CLD en :mod:`cld`; el registry/factory en :mod:`__init__`.
+:mod:`variants`; el registry/factory en :mod:`__init__`.
 """
 
 from __future__ import annotations
@@ -29,23 +29,17 @@ class ForwardSDE(ABC):
     """Base de todos los procesos forward.
 
     Una SDE concreta fija :attr:`name` (clave del registry), recibe :attr:`data_dim` en el
-    constructor (anda en cualquier dimensión; 2 por defecto, ``2 * spatial_dim`` para CLD)
-    e implementa los tres métodos abstractos :meth:`sde`,
-    :meth:`marginal_prob` y :meth:`prior_sampling`.
+    constructor (anda en cualquier dimensión; 2 por defecto) e implementa los tres métodos
+    abstractos :meth:`sde`, :meth:`marginal_prob` y :meth:`prior_sampling`.
 
     Para la **familia escalar-gaussiana** (VP/VE/sub-VP) el kernel de perturbación es
     ``p_t(x_t | x_0) = N(mean, std^2 I)`` con ``std`` escalar por muestra; por eso
     :meth:`perturb` y :meth:`score_target` son **concretos** acá y se derivan enteramente
-    de :meth:`marginal_prob`. CLD rompe ese contrato (kernel conjunto en el espacio de
-    fase) y **sobreescribe** esos métodos.
+    de :meth:`marginal_prob`.
     """
 
     #: Clave usada en el registry y la factory. Sobreescribir en cada subclase.
     name: str = ""
-
-    #: ``True`` solo para SDEs con estado aumentado (CLD). Hook para que los
-    #: consumidores (samplers, futuros loops) ramifiquen sin inspeccionar el tipo.
-    is_augmented: bool = False
 
     #: Piso para ``std`` antes de dividir (evita división por cero en ``t -> 0``).
     _std_eps: float = 1e-5
@@ -55,8 +49,7 @@ class ForwardSDE(ABC):
 
         Args:
             data_dim: Dimensión del estado (= la que aprende la red). Configurable y anda
-                en cualquier dimensión: ``2`` por defecto para datos 2D con VP/VE/sub-VP;
-                para CLD es la del estado aumentado ``2 * spatial_dim`` (``4`` para 2D).
+                en cualquier dimensión: ``2`` por defecto para datos 2D.
             T: Horizonte temporal. El proceso corre en ``t in [0, T]``.
 
         Raises:
@@ -131,7 +124,7 @@ class ForwardSDE(ABC):
         """Muestrea ``x_t`` del kernel de perturbación y devuelve el ruido usado.
 
         Implementación para la familia escalar-gaussiana:
-        ``x_t = mean + std * eps`` con ``eps ~ N(0, I)``. CLD la sobreescribe.
+        ``x_t = mean + std * eps`` con ``eps ~ N(0, I)``.
 
         Args:
             x0: Dato limpio de shape ``(B, data_dim)``.
@@ -158,8 +151,7 @@ class ForwardSDE(ABC):
             ∇_{x_t} log p_t(x_t | x_0) = -(x_t - mean) / std^2 = -eps / std
 
         y el peso recomendado es ``lambda(t) = std^2`` (pesado tipo verosimilitud, que
-        vuelve la pérdida equivalente a ``|| std * s_theta + eps ||^2``). CLD lo
-        sobreescribe (target sobre el momento ``∇_v log p_t(v | x)``).
+        vuelve la pérdida equivalente a ``|| std * s_theta + eps ||^2``).
 
         Args:
             x0: Dato limpio de shape ``(B, data_dim)``.

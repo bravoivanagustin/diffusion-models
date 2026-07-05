@@ -3,7 +3,7 @@
 # Las rutas de 'out' son relativas al cwd (diffusion-models/).
 
 sde:                      # -> make_sde(name, **resto). Eje 1: cambiar la SDE exige reentrenar.
-  name: vp                # vp | ve | sub_vp | cld
+  name: vp                # vp | ve | sub_vp
   beta_min: 0.1
   beta_max: 20.0
 
@@ -22,7 +22,7 @@ train:                    # hiperparámetros de optimización (-> TrainConfig)
   t_eps: 1.0e-3           # piso del muestreo de t (evita t=0, sigma->0)
   grad_clip: 1.0          # opcional; quitar para no recortar gradientes
   seed: 0
-  device: gpu
+  device: cpu
 
 # model:                  # opcional: la red es la variable de control (fija entre celdas).
 #   embed_dim: 128        # Descomentar solo para experimentos de arquitectura, no de ablación.
