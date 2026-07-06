@@ -1,0 +1,66 @@
+# Implementation Plan
+
+- [ ] 1. Fundaciones: los bloques internos de la red
+- [ ] 1.1 Crear la proyección temporal del condicionamiento
+  - Nuevo archivo de la red en el módulo de redes, con la pieza que embebe `t` (reusando el embedding sinusoidal compartido y el registry de activaciones de `layers`) y lo proyecta al vector de condicionamiento de dimensión `time_embed_dim`
+  - Acepta `t` como `(B,)` o `(B, 1)` (lo normaliza el embedding reusado); salidas finitas para escalas `[0, 1]`, `[0, T]` y pasos enteros
+  - Observable: ejecutar la pieza con 8 tiempos devuelve un tensor `(8, time_embed_dim)` finito
+  - _Requirements: 1.2, 1.3_
+- [ ] 1.2 Crear el bloque residual convolucional con inyección de tiempo
+  - Dos etapas de normalización por grupos + activación + convolución 3×3; el vector temporal se proyecta a los canales de salida y se suma tras la primera convolución (broadcast espacial)
+  - Skip identidad si los canales coinciden, proyección 1×1 si no; sin dropout ni batchnorm
+  - Observable: forward `(B, C_in, H, W)` + vector temporal → `(B, C_out, H, W)`, y dos tiempos distintos producen salidas distintas
+  - _Requirements: 1.4, 3.2, 3.3_
+- [ ] 1.3 Crear la atención espacial y los cambios de resolución
+  - Atención single-head: normalización por grupos, proyecciones QKV por convolución 1×1, `scaled_dot_product_attention` sobre los H·W tokens, proyección de salida + residual
+  - Reducción por convolución 3×3 stride 2; ampliación por nearest ×2 + convolución 3×3
+  - Observable: la atención preserva la shape de entrada; la reducción divide H y W por 2 y la ampliación los duplica
+  - _Requirements: 2.2, 3.1_
+
+- [ ] 2. Núcleo: la red de score completa
+- [ ] 2.1 Ensamblar encoder–bottleneck–decoder con skips
+  - Constructor con los hiperparámetros y defaults de referencia del diseño (canales de entrada, resolución de trabajo, canales base, multiplicadores, bloques por nivel, dimensiones de embedding, resoluciones de atención, grupos, activación)
+  - La atención se coloca en construcción: niveles cuya resolución (derivada de la resolución de trabajo) pertenece a las resoluciones de atención, más el bottleneck
+  - Decoder espejo con skips concatenados por canales; salida final normalización + activación + convolución a los canales de entrada, sin activación final
+  - Observable: forward `(2, 3, 64, 64)` + `(2,)` con defaults devuelve `(2, 3, 64, 64)` en float32 con valores finitos y de ambos signos
+  - _Requirements: 1.1, 1.5, 2.1, 2.2, 4.1, 4.2_
+- [ ] 2.2 Implementar las validaciones fail-fast
+  - En construcción: resolución de trabajo divisible por el factor total de reducción; grupos dividen a todos los anchos de canal; activación conocida y dimensión de embedding par (reusando los errores de las piezas compartidas)
+  - En forward: alto y ancho iguales a la resolución de trabajo; canales de entrada correctos
+  - Observable: cada condición inválida levanta `ValueError` con mensaje que nombra la restricción y el valor recibido (esperado vs recibido)
+  - _Requirements: 2.3, 4.3_
+
+- [ ] 3. Integración: smoke ejecutable y export público
+  - Bloque de smoke manual: instancia la red con defaults, corre un forward con `(2, 3, 64, 64)`, reporta la shape de salida y el conteo de parámetros entrenables
+  - Re-export de la red en el paquete de redes (docstring y `__all__` actualizados); la red satisface el contrato estructural del módulo sin heredar de él
+  - Observable: `python -m diffusion.models.unet` imprime shape `(2, 3, 64, 64)` y el conteo; `from diffusion.models import ScoreUNet` funciona
+  - _Requirements: 5.1, 1.6_
+
+- [ ] 4. Verificación: la suite de la red en CPU
+- [ ] 4.1 Tests de contrato: shapes, tiempo y Protocol
+  - Sección nueva en la suite del módulo de redes, bajo la convención `importorskip` existente; config tiny del diseño (una instancia por resolución de trabajo)
+  - Shape `(B, C, H, W) → (B, C, H, W)` float32 parametrizado C ∈ {1, 3} × resolución ∈ {32, 64}; `t` en `(B,)` y `(B, 1)` → resultados idénticos; escalas de `t` → salidas finitas; dos `t` distintos → salidas distintas; valores de ambos signos; `isinstance` contra el Protocol
+  - Observable: los tests nuevos pasan en CPU
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 2.1, 2.2, 5.3_
+- [ ] 4.2 Tests de determinismo y gradientes
+  - Mismo `(x, t)` dos veces en eval → salidas bitwise idénticas; recorrido de submódulos sin dropout/batchnorm; muestra sola vs en batch → equivalencia con `allclose(atol=1e-6)`; backward → gradientes finitos en todos los parámetros
+  - Observable: los tests nuevos pasan en CPU
+  - _Requirements: 3.1, 3.2, 3.3, 3.4_
+- [ ] 4.3 Tests de configuración, errores y arquitectura de referencia
+  - Dos instancias con mismos argumentos → mismo conteo de parámetros; `ValueError` para activación desconocida, grupos incompatibles, resolución de trabajo no divisible y entrada con tamaño distinto al de trabajo
+  - Test único con defaults: construcción + forward `(1, 3, 64, 64)` + shape (cubre la arquitectura de referencia bajo pytest)
+  - Observable: suite completa del repo en verde (los 242 tests existentes + los nuevos), sin regresiones
+  - _Requirements: 2.3, 4.1, 4.2, 4.3, 5.2, 5.4_
+
+- [ ] 5. Documentación del módulo y del alcance
+- [ ] 5.1 (P) Actualizar los documentos de alcance por la decisión de U-Net propia
+  - `docs/project/ejes.md`, `.claude/CLAUDE.md` y `.kiro/steering/product.md`: la Fase 2 construye la U-Net a mano (decisión 05/07/2026) en lugar de reusar una de librería
+  - Observable: no queda ninguna mención viva a "U-Net de librería" en esos documentos (las menciones históricas de crónica/specs cerradas no se tocan)
+  - _Requirements: 6.2_
+  - _Boundary: docs de alcance (ejes.md, CLAUDE.md, product.md)_
+- [ ] 5.2 (P) Documentar la red en la doc del módulo
+  - Sección de la U-Net en `docs/project/models.md`: contrato, piezas, arquitectura de referencia (defaults), cómo correr el smoke, y la nota explícita de que la mitigación de memorización (flip horizontal + EMA) vive fuera de la red, en el entrenamiento futuro de Fase 2
+  - Observable: `models.md` describe la red entregada y el árbol de archivos ya no la lista como pendiente
+  - _Requirements: 6.1, 6.3_
+  - _Boundary: docs/project/models.md_
+  - _Depends: 2.1, 3_
