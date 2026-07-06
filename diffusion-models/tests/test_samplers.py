@@ -211,7 +211,7 @@ def test_sample_uses_init_as_start_state():
 
 def test_sample_does_not_mutate_network_params():
     # 3.3: los parámetros de una ScoreMLP no cambian tras sample().
-    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
     sde = make_sde("vp", data_dim=2)
     net = ScoreMLP(data_dim=2)
     net.eval()
@@ -577,7 +577,7 @@ def test_pc_sample_shape_dtype_finite(sde_name):
 
 def test_pc_sample_finite_with_real_mlp():
     # 1.4: con una ScoreMLP real (sin entrenar) el corrector se ejercita y produce finito.
-    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
     from diffusion.samplers.predictor_corrector import PredictorCorrector
 
     sde = make_sde("vp", data_dim=2)
@@ -781,7 +781,7 @@ def _make_checkpoint(tmp_path, sde_name="vp", data_dim=2):
     ``save_checkpoint``), de modo que ``load_checkpoint`` lo reconstruya idéntico a uno
     producido por una corrida real. Devuelve la ruta del ``.pt`` guardado.
     """
-    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
     from diffusion.training import TrainConfig, TrainResult, save_checkpoint
 
     net = ScoreMLP(data_dim=data_dim)
@@ -914,7 +914,7 @@ def _make_checkpoint_blob_missing_meta_key(tmp_path, missing_key, data_dim=2):
     hiperparámetros que el ``meta["model"]``, de modo que ``load_checkpoint`` reconstruya la
     red sin error de claves de pesos.
     """
-    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
 
     model_hp = {"embed_dim": 128, "hidden_dim": 256, "num_blocks": 4, "activation": "silu"}
     net = ScoreMLP(data_dim=data_dim, **model_hp)
@@ -979,7 +979,7 @@ def test_main_smoke_runs_all_samplers():
     # 2.1: el smoke entrypoint recorre el registry, corre cada sampler sobre una ScoreMLP
     # sin entrenar y reporta salidas finitas. main() devuelve un resumen assertable
     # {name: is_finite} con los cuatro samplers, todos finitos.
-    pytest.importorskip("diffusion.mlp")
+    pytest.importorskip("diffusion.models")
     from diffusion.samplers.__main__ import main
     from diffusion.samplers import available_samplers
 
@@ -1008,7 +1008,7 @@ def _load_sample_cli():
 
 def test_cli_sample_writes_npz(tmp_path):
     # 6.1/6.2: la CLI genera un .npz con `samples` (N, data_dim) desde un checkpoint.
-    pytest.importorskip("diffusion.mlp")
+    pytest.importorskip("diffusion.models")
     pytest.importorskip("numpy")
     import numpy as np
 
@@ -1035,7 +1035,7 @@ def test_cli_sample_writes_npz(tmp_path):
 
 def test_cli_sample_trajectory_flag(tmp_path):
     # 6.3: con --trajectory el .npz también guarda la trayectoria.
-    pytest.importorskip("diffusion.mlp")
+    pytest.importorskip("diffusion.models")
     pytest.importorskip("numpy")
     import numpy as np
 
@@ -1169,7 +1169,7 @@ def test_contract_grid_starts_at_T_ends_at_t_eps_via_factory(sampler_name):
 def test_contract_net_params_unchanged_after_sample_via_factory(sampler_name):
     # 3.3, 3.2: con una ScoreMLP real inyectada como score_fn, ningún sampler (vía
     # factory) altera los parámetros de la red durante sample().
-    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
     from diffusion.samplers import make_sampler
 
     sde = make_sde("vp", data_dim=2)
@@ -1347,7 +1347,7 @@ def test_recovers_gaussian_with_analytic_score(sampler_name, sde_name):
 def test_seam_make_sde_scoremlp_make_sampler_shapes():
     # 7.3: la cadena make_sde + ScoreMLP (red real) + make_sampler encaja en shapes de
     # punta a punta: sample(N) -> (N, data_dim) float32 finito en la dimensión por defecto.
-    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
     from diffusion.samplers import make_sampler
 
     sde = make_sde("vp")  # data_dim=2 por defecto
@@ -1368,7 +1368,7 @@ def test_seam_make_sde_scoremlp_make_sampler_shapes():
 def test_seam_dimension_agnostic_non_default_dim():
     # 7.3: la cadena es agnóstica de la dimensión — con data_dim=3 (no el default 2) en
     # SDE y red, make_sampler genera salida (N, 3). Confirma que data_dim fluye coherente.
-    ScoreMLP = pytest.importorskip("diffusion.mlp").ScoreMLP
+    ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
     from diffusion.samplers import make_sampler
 
     sde = make_sde("vp", data_dim=3)

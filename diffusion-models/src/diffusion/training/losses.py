@@ -8,7 +8,7 @@ un único batch:
 3. ``sde.score_target`` da el score real del kernel ``∇_{x_t} log p_t(x_t | x_0)`` y el peso
    ``λ(t)`` de la pérdida.
 
-La red (:class:`diffusion.mlp.ScoreMLP`) predice ``s_θ(x_t, t)`` y se minimiza el error
+La red (:class:`diffusion.models.ScoreMLP`) predice ``s_θ(x_t, t)`` y se minimiza el error
 pesado ``λ(t) · ||s_θ - score_real||²``. Esta función es **agnóstica a la SDE**: ``perturb``
 y ``score_target`` ya devuelven las shapes correctas y el peso adecuado (``λ(t) = σ_t²``).
 
@@ -37,7 +37,7 @@ def dsm_loss(
     único ``x_t`` por dato (estimador de un punto del DSM, suficiente para batches grandes).
 
     Args:
-        net: Red de score ``s_θ`` (típicamente :class:`diffusion.mlp.ScoreMLP`); recibe
+        net: Red de score ``s_θ`` (típicamente :class:`diffusion.models.ScoreMLP`); recibe
             ``(x_t, t)`` y devuelve un tensor de la misma shape que ``x_t``.
         sde: Proceso forward que define el kernel de perturbación y el target del score.
         x0: Dato limpio de shape ``(B, D)`` con ``D = sde.data_dim``.

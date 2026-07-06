@@ -1,4 +1,4 @@
-"""Tests de la red de score (MLP) (`diffusion.mlp`)."""
+"""Tests de las redes de score (`diffusion.models`): piezas compartidas + ScoreMLP."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from diffusion.mlp import ResidualBlock, ScoreMLP, SinusoidalEmbedding
+from diffusion.models import ResidualBlock, ScoreMLP, SinusoidalEmbedding
 
 
 # --------------------------------------------------------- SinusoidalEmbedding

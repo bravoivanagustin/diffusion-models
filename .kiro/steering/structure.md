@@ -3,8 +3,8 @@
 ## Filosofía de organización
 
 **Layered por concepto del pipeline de difusión.** El código bajo `src/diffusion/` se divide en un
-módulo por etapa (`data_generation` → `mlp` → `sde` → `training` → samplers). Las dependencias fluyen
-hacia adelante: `training` combina `data_generation` (los `x_0`), `mlp` (la red) y `sde` (el forward),
+módulo por etapa (`data_generation` → `models` → `sde` → `training` → samplers). Las dependencias fluyen
+hacia adelante: `training` combina `data_generation` (los `x_0`), `models` (la red) y `sde` (el forward),
 sin ciclos. La **documentación en `docs/` es la fuente de verdad** del alcance y la teoría; el código
 la sigue.
 
@@ -36,7 +36,7 @@ también ofrecen `python -m diffusion.<módulo>` vía `__main__.py`.
 
 ## Convenciones de nombres
 
-- **Módulos / archivos**: `snake_case` (`score_mlp.py`, `data_generation/`).
+- **Módulos / archivos**: `snake_case` (`losses.py`, `data_generation/`).
 - **Clases**: `PascalCase` (`ScoreMLP`, `ForwardSDE`, `VPSDE`, `TrainConfig`).
 - **Factories**: `make_<cosa>(name, **kwargs)`; introspección por nombre con `available_<cosas>()`.
 - **Idioma**: docstrings y docs en **español** (voz del autor); términos técnicos en su forma
@@ -46,7 +46,7 @@ también ofrecen `python -m diffusion.<módulo>` vía `__main__.py`.
 
 ```python
 # Import público SIN prefijo `src.` (lo resuelve el pythonpath del pyproject):
-from diffusion.mlp import ScoreMLP
+from diffusion.models import ScoreMLP
 from diffusion.sde import make_sde, available_sdes
 from diffusion.training import TrainConfig, train
 

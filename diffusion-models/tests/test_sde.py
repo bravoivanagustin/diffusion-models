@@ -212,7 +212,7 @@ def test_prior_variance():
 
 @pytest.mark.parametrize("name", SCALAR)
 def test_seam_with_scoremlp(name):
-    from diffusion.mlp import ScoreMLP
+    from diffusion.models import ScoreMLP
 
     sde = make_sde(name)
     net = ScoreMLP(data_dim=2)

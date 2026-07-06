@@ -1,7 +1,7 @@
 """Loop de entrenamiento por denoising score matching (DSM).
 
-El cuarto módulo del TP: el eslabón que une ``data_generation`` (los ``x_0``), ``mlp`` (la
-red de score) y ``sde`` (el proceso forward). Enseña a :class:`diffusion.mlp.ScoreMLP` a
+El cuarto módulo del TP: el eslabón que une ``data_generation`` (los ``x_0``), ``models`` (la
+red de score) y ``sde`` (el proceso forward). Enseña a :class:`diffusion.models.ScoreMLP` a
 aproximar ``s_θ(x, t) ≈ ∇_x log p_t(x)`` para una SDE dada, minimizando la pérdida de DSM.
 
 Uso típico (a mano)::

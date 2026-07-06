@@ -21,7 +21,7 @@ torch = pytest.importorskip("torch")   # skipea la suite entera si no hay torch
 from diffusion.sde import make_sde      # imports del paquete DESPUÉS del importorskip
 ```
 
-Para un test puntual que cruza submódulos, importar adentro de la función (`from diffusion.mlp import
+Para un test puntual que cruza submódulos, importar adentro de la función (`from diffusion.models import
 ScoreMLP`) para no acoplar la colección del archivo.
 
 ## Qué se testea (patrones recurrentes)

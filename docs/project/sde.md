@@ -91,7 +91,7 @@ python -m pytest -q diffusion-models/tests/test_sde.py   # solo este módulo
 
 ```python
 from diffusion.sde import make_sde
-from diffusion.mlp import ScoreMLP
+from diffusion.models import ScoreMLP
 
 sde = make_sde("vp")                       # "ve" / "sub_vp"
 net = ScoreMLP(data_dim=sde.data_dim)      # cualquier dim; 2 por defecto

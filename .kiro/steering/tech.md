@@ -3,7 +3,7 @@
 ## Arquitectura
 
 Paquete Python `diffusion` con layout `src/`. Un **módulo por concepto** del pipeline de difusión
-(`data_generation`, `mlp`, `sde`, `training`, …). La estocasticidad vive **alrededor** de la red —en
+(`data_generation`, `models`, `sde`, `training`, …). La estocasticidad vive **alrededor** de la red —en
 el dato, en el forward SDE y en el sampler—, nunca dentro de ella. Cada familia de variantes
 (formas de puntos, SDEs) se expone por un par **registry + factory** (`make_distribution`,
 `make_sde`) sobre una clase base abstracta (`PointDistribution`, `ForwardSDE`).

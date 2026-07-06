@@ -13,7 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from diffusion.data_generation import make_distribution
-from diffusion.mlp import ScoreMLP
+from diffusion.models import ScoreMLP
 from diffusion.sde import make_sde
 from diffusion.training import (
     RunSpec,

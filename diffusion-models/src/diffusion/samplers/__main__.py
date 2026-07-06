@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from diffusion.mlp import ScoreMLP
+from diffusion.models import ScoreMLP
 from diffusion.samplers import available_samplers, make_sampler
 from diffusion.sde import make_sde
 

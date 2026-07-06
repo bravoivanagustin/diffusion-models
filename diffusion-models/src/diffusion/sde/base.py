@@ -3,7 +3,7 @@
 Cada SDE define ``dx = f(x, t) dt + g(t) dW`` —el proceso que ruidea un ``x_0`` de
 ``data_generation`` para fabricar el par de entrenamiento ``x_t``— y, sobre todo, el
 **target del score** :math:`\\nabla_x \\log p_t(x_t \\mid x_0)` que la red
-(:class:`diffusion.mlp.ScoreMLP`) debe aprender. Es el **Eje 1** del estudio de ablación
+(:class:`diffusion.models.ScoreMLP`) debe aprender. Es el **Eje 1** del estudio de ablación
 (ver ``docs/project/ejes.md``): cambiar la SDE cambia ``p_t`` y por lo tanto exige
 reentrenar; cambiar el sampler (Eje 2) reusa el mismo score.
 
@@ -12,7 +12,7 @@ dato y el sampler reverso), por contraste con la red, que es determinística.
 
 A diferencia de ``data_generation`` —cuyo core es numpy con torch diferido—, este módulo
 importa **torch directamente**: opera sobre tensores, produce los pares de entrenamiento y
-alimenta los samplers, así que torch es dependencia dura (igual que ``mlp``).
+alimenta los samplers, así que torch es dependencia dura (igual que ``models``).
 
 Clase base abstracta acá; las variantes escalar-gaussianas (VP/VE/sub-VP) viven en
 :mod:`variants`; el registry/factory en :mod:`__init__`.

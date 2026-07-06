@@ -1,7 +1,7 @@
 """Loop de entrenamiento por denoising score matching y persistencia de la red.
 
 Reúne el muestreo de pares de entrenamiento (:mod:`losses`), la red de score
-(:class:`diffusion.mlp.ScoreMLP`) y un proceso forward (:class:`diffusion.sde.ForwardSDE`)
+(:class:`diffusion.models.ScoreMLP`) y un proceso forward (:class:`diffusion.sde.ForwardSDE`)
 en un :func:`train` que devuelve la red entrenada y la historia de pérdida.
 
 La red es la **variable de control** del estudio de ablación: sus hiperparámetros viven en
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from ..mlp import ScoreMLP
+from ..models import ScoreMLP
 from ..sde import ForwardSDE
 from .losses import dsm_loss, sample_timesteps
 

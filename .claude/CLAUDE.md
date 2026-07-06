@@ -4,7 +4,7 @@ Orientación para Claude Code (y cualquier sesión futura) sobre este proyecto. 
 **TP Final de Cálculo Estocástico — 1er cuatrimestre 2026**.
 
 > **Importante:** el proyecto ya **dejó de ser solo documentación**: hay un paquete Python
-> (`diffusion-models/`) con cinco módulos terminados y testeados (`data_generation`, `mlp`, `sde`,
+> (`diffusion-models/`) con cinco módulos terminados y testeados (`data_generation`, `models`, `sde`,
 > `training` y `samplers`). Pero el **resto de la arquitectura todavía no existe y la decide el
 > autor**: no inventes ni armes por tu cuenta los módulos que faltan (la **evaluación /
 > visualización** de Fase 1 y la **U-Net** de Fase 2). Si se pide implementar algo,
@@ -97,7 +97,7 @@ tp-final/
     ├── scripts/              # CLIs: data_generation.py (datasets + preview), train.py (corrida YAML)
     ├── src/diffusion/
     │   ├── data_generation/   # PointDistribution (ABC) + 5 formas + registry/factory
-    │   ├── mlp/               # ScoreMLP (red de score) + SinusoidalEmbedding + ResidualBlock
+    │   ├── models/            # redes de score: layers.py (compartido) + mlp.py (ScoreMLP) + base.py (ScoreModel); unet.py pendiente (Fase 2)
     │   ├── sde/               # ForwardSDE (ABC) + VP/VE/sub-VP + score_target + make_sde
     │   ├── training/          # loop de DSM: train/TrainConfig, dsm_loss, checkpoints, configs YAML
     │   └── samplers/          # ReverseSampler (ABC) + EM/PF-ODE/Heun/PC + make_sampler
@@ -110,9 +110,12 @@ tp-final/
 - `diffusion.data_generation` — produce la fuente de datos $p_\text{data}(x_0)$: 5 formas de puntos de
   juguete (`gaussian`, `mixture`, `two_moons`, `spiral`, `swiss_roll`), salida `float32` + helpers
   torch (import diferido), y un CLI que guarda `.npz` + preview. Ver `docs/project/data_generation.md`.
-- `diffusion.mlp` — la **red de score** $s_\theta(x,t)\approx\nabla_x\log p_t(x)$ para datos 2D:
-  `ScoreMLP` (embedding sinusoidal de $t$ + bloques residuales), **enteramente determinística** (sin
-  dropout ni batchnorm). `data_dim=2` para VP/VE/sub-VP. Ver `docs/project/mlp.md`.
+- `diffusion.models` — las **redes de score** $s_\theta(x,t)\approx\nabla_x\log p_t(x)$ (antes
+  `diffusion.mlp`, reestructurado 05/07/2026): `layers.py` con las piezas compartidas entre redes
+  (`SinusoidalEmbedding`, activaciones), `mlp.py` con `ScoreMLP` para datos 2D (**enteramente
+  determinística**, sin dropout ni batchnorm, `data_dim=2` para VP/VE/sub-VP), y `base.py` con el
+  Protocol `ScoreModel` (contrato `(x, t) -> score`). La U-Net de Fase 2 se sumará como `unet.py`
+  (spec en `.kiro/specs/score-unet/`). Ver `docs/project/models.md`.
 - `diffusion.sde` — el **Eje 1**: procesos *forward* `dx=f\,dt+g\,dW` (`VPSDE`, `VESDE`, `SubVPSDE`)
   sobre la base abstracta `ForwardSDE`, con `make_sde`/`available_sdes`. Producen el par de
   entrenamiento (`perturb`) y el **target del score** (`score_target`); `data_dim` configurable en
@@ -148,7 +151,7 @@ python scripts/data_generation.py --shape two_moons --dim 2 --n-samples 2000 --s
 python scripts/train.py config/vp_mixture.yaml      # una celda del estudio = un YAML
 ```
 
-Import público sin prefijo `src.`: `from diffusion.mlp import ScoreMLP`,
+Import público sin prefijo `src.`: `from diffusion.models import ScoreMLP`,
 `from diffusion.data_generation import make_distribution`, `from diffusion.sde import make_sde`,
 `from diffusion.training import TrainConfig, train`. No hace falta `pip install -e .` (lo resuelve el
 `pythonpath` del pyproject).
@@ -163,12 +166,12 @@ Toda la información de alcance y teoría vive en `docs/`. Cada módulo de códi
 correspondiente en `docs/project/`:
 
 - `docs/project/proyecto.md` — overview y objetivo, en español, con la voz del autor.
-- `docs/project/ejes.md` — diseño experimental completo: las dos fases, los dos ejes, la matriz 4×4,
+- `docs/project/ejes.md` — diseño experimental completo: las dos fases, los dos ejes, la matriz 3×4,
   la red como variable de control y los requisitos de reentrenamiento.
 - `docs/project/cronica.md` — bitácora fechada de avances (decisiones y entregas, módulo a módulo).
 - `docs/project/to-do.md` — tareas pendientes, derivadas de los "Próximos pasos" de `cronica.md`.
 - `docs/project/data_generation.md` — doc del módulo `data_generation`.
-- `docs/project/mlp.md` — doc del módulo `mlp` (la red de score).
+- `docs/project/models.md` — doc del módulo `models` (las redes de score: layers compartidas + MLP; U-Net pendiente).
 - `docs/project/sde.md` — doc del módulo `sde` (los procesos forward, Eje 1).
 - `docs/project/training.md` — doc del módulo `training` (el loop de DSM).
 - `docs/project/samplers.md` — doc del módulo `samplers` (el reverso, Eje 2).

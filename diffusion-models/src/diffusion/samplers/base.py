@@ -28,7 +28,7 @@ import torch
 from diffusion.sde import ForwardSDE
 
 #: Contrato de inyección del score: ``(x: (B, data_dim), t: (B,) | (B,1)) -> (B, data_dim)``.
-#: Tanto una :class:`diffusion.mlp.ScoreMLP` entrenada como un score analítico en forma
+#: Tanto una :class:`diffusion.models.ScoreMLP` entrenada como un score analítico en forma
 #: cerrada encajan sin cambios en el sampler.
 ScoreFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
