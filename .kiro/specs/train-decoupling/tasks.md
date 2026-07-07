@@ -1,0 +1,52 @@
+# Implementation Plan
+
+- [x] 1. Fundaciones: utilidades independientes (additivas, paralelizables)
+- [x] 1.1 (P) Registry de construcción de redes por nombre
+  - `make_model(name, **kwargs)` + `available_models()`/`REGISTRY` en el paquete de redes, espejando `make_sde`/`make_distribution`; registra `mlp`→ScoreMLP y `unet`→ScoreUNet; nombre desconocido → `ValueError`. Additivo: no modifica las redes existentes.
+  - Test: `make_model("mlp")`/`make_model("unet")` devuelven el tipo correcto y una red usable; `available_models()` == conjunto esperado; nombre desconocido levanta `ValueError`.
+  - Observable: `from diffusion.models import make_model; make_model("mlp", data_dim=2)` devuelve un ScoreMLP; la suite del módulo pasa.
+  - _Requirements: 5.3, 6.1_
+  - _Boundary: models (models/__init__.py)_
+- [x] 1.2 (P) Adaptador de datos infinito
+  - `infinite_bare(loader)` en el paquete de datos: recorre un `DataLoader` finito en bucle y yield-ea el tensor crudo, desempaquetando la 1-tupla `(x0,)` que produce el dataloader de puntos.
+  - Test: sobre un loader finito, consumir más batches que su largo sigue entregando tensores crudos con la shape correcta; el test existente del dataloader (1-tuplas) sigue verde.
+  - Observable: iterar `infinite_bare(dist.dataloader(128, 64))` N+1 veces no se agota y cada batch es un tensor `(B, 2)`.
+  - _Requirements: 4.1, 4.2, 4.3_
+  - _Boundary: data_generation_
+
+- [x] 2. Flip del API de entrenamiento (refactor cross-boundary; unidad atómica que deja la suite verde)
+- [x] 2.1 Reescribir `train` + `TrainConfig`/`TrainResult` y actualizar TODOS sus consumidores de firma
+  - `train(sde, model, data, config, *, generator=None)`: usa la `model` recibida (`.to(device)` idempotente + `.train()`), sin construir red ni ramificar por tipo, sin importar `ScoreMLP`/`ScoreUNet`; loop `for step in range(config.num_steps)` consumiendo `next(data_iter)` (tensor crudo); `history` a cadencia fija incluyendo siempre el último paso, con `log_every` gobernando solo el print; `sample_timesteps`/`dsm_loss`/optim/grad-clip/seed-generator idénticos.
+  - `TrainConfig`: agrega `num_steps`, conserva `lr/grad_clip/t_eps/device/seed/log_every`, quita `epochs/n_samples/batch_size/embed_dim/hidden_dim/num_blocks/activation`. `TrainResult`: `net: ScoreModel` y nuevo campo `data_dim` (= `sde.data_dim`).
+  - Actualizar los consumidores de la firma para que la suite quede verde en este mismo paso: `build_run`/`RunSpec` construyen `model` (vía `make_model`; bloque `model:` del YAML o default `{name:"mlp"}` dimensionado desde el dato/SDE) + `data` (`infinite_bare`) y recalibran la validación de claves contra el `TrainConfig` acotado; `scripts/train.py` y `training/__main__.py` construyen model+data y llaman la firma nueva (`num_steps` en overrides/print); `training/__init__.py` exports si cambia la superficie.
+  - Migrar el config de ejemplo `config/vp_mixture.yaml`: `epochs`→`num_steps`, y mover `n_samples`/`batch_size` a la sección de datos (fuente del dataloader), no a `train:` — si no, la validación estricta de `build_run` lo rechazaría y el CLI fallaría.
+  - `save_checkpoint` queda TRANSITORIAMENTE compatible: lee los hiperparámetros de red y el `data_dim` **desde el modelo entrenado** (`result.net.data_dim`/`.embed_dim`/`.hidden_dim`/`.num_blocks`, y `activation` con default `"silu"`), **no** desde `result.data_dim` ni desde `TrainConfig`, preservando el formato de checkpoint viejo intacto, de modo que `load_checkpoint` y `samplers/generate.py` (y sus tests, incl. `_make_checkpoint` que arma `TrainResult` sin `data_dim`) siguen funcionando sin tocarse todavía (su flip a R5-c es la tarea 3.1).
+  - Adaptar en `test_training.py` los tests de `train` (data_dim correcto, reproducibilidad con misma seed, grad_clip, y caída de pérdida del MLP sobre swiss roll con `num_steps` comparable → `history[-1] < history[0]`, usando una red chica construida en el test + `infinite_bare`) y los de `build_run`/`load_config` al esquema nuevo (incluye un config sin bloque `model:` que sigue funcionando con el default).
+  - Observable: `python -m pytest -q` VERDE; `TrainConfig(**campos_removidos)` ya no es válido; una corrida con `log_every=0` devuelve `history` NO vacío; `python scripts/train.py --config config/vp_mixture.yaml` entrena de punta a punta y guarda checkpoint + curva.
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 2.1, 2.2, 2.3, 2.4, 2.5, 3.1, 3.2, 6.1, 6.2, 6.3, 6.4, 7.2, 7.3_
+  - _Depends: 1.1, 1.2_
+  - _Boundary: training/trainer.py, training/config.py, training/__init__.py, scripts/train.py, training/__main__.py, config/vp_mixture.yaml, tests/test_training.py_
+
+- [x] 3. Contrato de checkpoint model-agnóstico (R5-c), end-to-end
+- [x] 3.1 Flip del checkpoint a model-agnóstico + generación con samplers
+  - `save_checkpoint(result, path, *, model_spec=None)`: `state_dict` + `meta{sde_name, data_dim (de result.data_dim), model: receta {name, kwargs} opcional, history}`, sin campos ScoreMLP-hardcodeados; reemplaza el lector transitorio de 2.1. `load_checkpoint(path) -> (state_dict, meta)` sin reconstruir red.
+  - Threading de la receta: `build_run` arma `model_spec` desde el bloque `model:` (o el default) y `scripts/train.py` lo pasa a `save_checkpoint`.
+  - `samplers/generate.py`: `state_dict, meta = load_checkpoint(...)`; reconstruye la red vía `make_model(meta["model"]["name"], **meta["model"]["kwargs"])` (o un `model=` explícito pasado por el caller) + `load_state_dict`; conserva la lectura de `sde_name`/`data_dim` y el error claro ante metadata faltante. Confirmar que `scripts/sample.py` no requiere cambios (solo llama `generate_from_checkpoint`).
+  - Adaptar `test_training.py` (round-trip: `save_checkpoint(..., model_spec={"name":"mlp","kwargs":{...}})` → `state_dict, meta = load_checkpoint(...)` → `make_model(meta["model"]["name"], **meta["model"]["kwargs"])` + `load_state_dict` → misma salida) y `test_samplers.py` (helpers de checkpoint al `meta` nuevo, incl. que `TrainResult` traiga `data_dim`; generación produce muestras finitas; metadata faltante → error claro; corregir referencias a números de línea de `generate.py` si cambiaron).
+  - Observable: `python -m pytest -q` VERDE (train + samplers); el round-trip reconstruye una red con los mismos pesos; `generate_from_checkpoint` genera muestras finitas desde un checkpoint nuevo.
+  - _Requirements: 5.1, 5.2, 5.3, 5.4_
+  - _Depends: 2.1, 1.1_
+  - _Boundary: training/trainer.py (save/load_checkpoint), training/config.py (model_spec), scripts/train.py, samplers/generate.py, tests/test_training.py, tests/test_samplers.py_
+
+- [x] 4. Validación y documentación
+- [x] 4.1 Regresión completa y verificación de la refactorización
+  - Correr la suite completa del repo en verde sin regresiones; confirmar el smoke `python -m diffusion.training`; confirmar que `dsm_loss`/`sample_timesteps`/optim/grad-clip quedaron sin cambios de comportamiento; confirmar que no quedan referencias vivas al API viejo (`epochs`/`distribution`/`n_samples`) en el código de producción (`src/`) ni en los CLIs.
+  - Observable: `python -m pytest -q` en verde; el smoke del módulo corre; grep del API viejo sin hits en `src/` ni `scripts/`.
+  - _Requirements: 7.1, 7.4_
+  - _Depends: 2.1, 3.1_
+- [x] 4.2 Actualizar la doc del módulo `training.md` y el notebook de ejemplo
+  - Documentar en `docs/project/training.md` el loop por pasos, `TrainConfig` acotado, `infinite_bare`, `make_model` y el contrato de checkpoint R5-c; actualizar el ejemplo de uso y el YAML de ejemplo. Actualizar `notebooks/02_train_and_sample.ipynb` (consumidor vivo stale) a la firma nueva (`make_model`/`infinite_bare`/`num_steps`/`train(sde, model, data, config)`).
+  - Observable: `docs/project/training.md` describe la firma y el flujo nuevos; ni la doc ni el notebook tienen menciones vivas al API viejo (`epochs`/`distribution`).
+  - _Requirements: 1.1, 2.1, 3.1, 5.1, 6.1_
+  - _Depends: 4.1_
+  - _Boundary: docs/project/training.md, notebooks/02_train_and_sample.ipynb_

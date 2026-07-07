@@ -1,0 +1,22 @@
+{
+  "feature_name": "train-decoupling",
+  "created_at": "2026-07-07T19:18:26Z",
+  "updated_at": "2026-07-07T19:58:15Z",
+  "language": "es",
+  "phase": "tasks-generated",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  },
+  "ready_for_implementation": true
+}
