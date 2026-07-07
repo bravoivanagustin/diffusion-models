@@ -37,7 +37,7 @@
   - _Requirements: 5.1, 1.6_
 
 - [ ] 4. Verificación: la suite de la red en CPU
-- [ ] 4.1 Tests de contrato: shapes, tiempo y Protocol
+- [x] 4.1 Tests de contrato: shapes, tiempo y Protocol
   - Sección nueva en la suite del módulo de redes, bajo la convención `importorskip` existente; config tiny del diseño (una instancia por resolución de trabajo)
   - Shape `(B, C, H, W) → (B, C, H, W)` float32 parametrizado C ∈ {1, 3} × resolución ∈ {32, 64}; `t` en `(B,)` y `(B, 1)` → resultados idénticos; escalas de `t` → salidas finitas; dos `t` distintos → salidas distintas; valores de ambos signos; `isinstance` contra el Protocol
   - Observable: los tests nuevos pasan en CPU

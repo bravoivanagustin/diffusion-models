@@ -1,4 +1,4 @@
-"""Tests de las redes de score (`diffusion.models`): piezas compartidas + ScoreMLP."""
+"""Tests de las redes de score (`diffusion.models`): piezas compartidas + ScoreMLP + ScoreUNet."""
 
 from __future__ import annotations
 
@@ -6,7 +6,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from diffusion.models import ResidualBlock, ScoreMLP, SinusoidalEmbedding
+from diffusion.models import (
+    ResidualBlock,
+    ScoreMLP,
+    ScoreModel,
+    ScoreUNet,
+    SinusoidalEmbedding,
+)
 
 
 # --------------------------------------------------------- SinusoidalEmbedding
@@ -146,3 +152,96 @@ def test_scoremlp_gradients_flow():
     net(x, t).pow(2).sum().backward()
     grads = [p.grad for p in net.parameters()]
     assert all(g is not None and torch.all(torch.isfinite(g)) for g in grads)
+
+
+# ----------------------------------------------------------------- ScoreUNet
+# Config tiny del diseño (Testing Strategy): una instancia por resolución de
+# trabajo (image_size 32 o 64) con los mismos anchos reducidos, para mantener el
+# tiempo de la suite en el orden del resto del repo. El nivel 16×16 ejercita la
+# atención. Estos tests fijan el CONTRATO de la red (shape, tiempo, Protocol);
+# determinismo, configuración y errores se cubren en su propia sección.
+
+
+def _tiny_unet(in_channels: int = 3, image_size: int = 32) -> ScoreUNet:
+    """Construye una ScoreUNet con la config tiny del diseño para la resolución dada."""
+    return ScoreUNet(
+        in_channels=in_channels,
+        image_size=image_size,
+        base_channels=8,
+        channel_mults=(1, 2),
+        num_res_blocks=1,
+        embed_dim=8,
+        time_embed_dim=16,
+        groups=4,
+        attn_resolutions=(16,),
+    )
+
+
+@pytest.mark.parametrize("in_channels", [1, 3])
+@pytest.mark.parametrize("image_size", [32, 64])
+def test_scoreunet_output_shape(in_channels, image_size):
+    # Contrato 1.1 / 2.1 / 2.2: (B, C, H, W) -> (B, C, H, W) en float32 para los
+    # canales candidatos (grises y RGB) y las resoluciones de referencia.
+    net = _tiny_unet(in_channels=in_channels, image_size=image_size)
+    x = torch.randn(2, in_channels, image_size, image_size)
+    out = net(x, torch.rand(2))
+    assert out.shape == (2, in_channels, image_size, image_size)
+    assert out.dtype == torch.float32
+
+
+def test_scoreunet_accepts_both_t_shapes():
+    # Contrato 1.2: t como (B,) o (B, 1) -> el mismo resultado (lo normaliza el
+    # embedding reusado).
+    net = _tiny_unet().eval()
+    x = torch.randn(2, 3, 32, 32)
+    t = torch.rand(2)
+    with torch.no_grad():
+        a = net(x, t)                 # t de shape (B,)
+        b = net(x, t.reshape(2, 1))   # t de shape (B, 1)
+    assert a.shape == b.shape == (2, 3, 32, 32)
+    assert torch.equal(a, b)          # ambas formas dan el mismo resultado
+
+
+@pytest.mark.parametrize(
+    "t",
+    [
+        torch.linspace(0.0, 1.0, 2),       # rango [0, 1]
+        torch.linspace(0.0, 1000.0, 2),    # rango [0, T]
+        torch.arange(2).float(),           # pasos enteros
+    ],
+)
+def test_scoreunet_any_t_scale_finite(t):
+    # Contrato 1.3: salidas finitas para las escalas de tiempo usadas por las SDEs.
+    net = _tiny_unet().eval()
+    x = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        out = net(x, t)
+    assert out.shape == (2, 3, 32, 32)
+    assert torch.all(torch.isfinite(out))
+
+
+def test_scoreunet_time_conditioning_effective():
+    # Contrato 1.4: mismo x, dos tiempos distintos -> salidas distintas (el
+    # condicionamiento temporal es efectivo).
+    net = _tiny_unet().eval()
+    x = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        a = net(x, torch.zeros(2))
+        b = net(x, torch.ones(2))
+    assert not torch.allclose(a, b)
+
+
+def test_scoreunet_output_unbounded_both_signs():
+    # Contrato 1.5: salida no acotada -> valores positivos y negativos (ninguna
+    # activación final la restringe).
+    net = _tiny_unet().eval()
+    x = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        out = net(x, torch.rand(2))
+    assert (out > 0).any() and (out < 0).any()
+
+
+def test_scoreunet_satisfies_scoremodel_protocol():
+    # Contrato 1.6: satisface el Protocol ScoreModel estructuralmente (sin herencia).
+    net = _tiny_unet()
+    assert isinstance(net, ScoreModel)
