@@ -295,3 +295,94 @@ def test_scoreunet_gradients_flow():
     net(x, t).pow(2).sum().backward()
     grads = [p.grad for p in net.parameters()]
     assert all(g is not None and torch.all(torch.isfinite(g)) for g in grads)
+
+
+# Configuración y errores (Req 4 + 2.3): defaults como arquitectura de referencia,
+# conteo de parámetros reproducible y validaciones fail-fast con ValueError.
+
+
+def test_scoreunet_param_count_reproducible():
+    # Contrato 4.1 / 4.2: dos instancias con los MISMOS argumentos tienen exactamente
+    # el mismo conteo de parámetros entrenables (la arquitectura es reproducible, sin
+    # números mágicos escondidos que varíen entre construcciones).
+    a = _tiny_unet()
+    b = _tiny_unet()
+    n_a = sum(p.numel() for p in a.parameters())
+    n_b = sum(p.numel() for p in b.parameters())
+    assert n_a == n_b
+    assert n_a > 0
+
+
+def test_scoreunet_unknown_activation_raises():
+    # Contrato 4.3: activación con nombre desconocido -> ValueError (mismo registry de
+    # activaciones que el resto del módulo, vía _make_activation). _tiny_unet no expone
+    # activation, así que se construye ScoreUNet directo con anchos tiny + config válida.
+    with pytest.raises(ValueError):
+        ScoreUNet(
+            in_channels=3,
+            image_size=32,
+            base_channels=8,
+            channel_mults=(1, 2),
+            num_res_blocks=1,
+            embed_dim=8,
+            time_embed_dim=16,
+            groups=4,
+            attn_resolutions=(16,),
+            activation="no_existe",
+        )
+
+
+def test_scoreunet_incompatible_groups_raises():
+    # Contrato 2.3 / 4.3: groups debe dividir a todos los anchos de canal; groups=3
+    # contra el nivel base de 8 (8 % 3 != 0) -> ValueError en construcción. image_size
+    # y embed_dim se dejan válidos para aislar la infracción de grupos.
+    with pytest.raises(ValueError):
+        ScoreUNet(
+            in_channels=3,
+            image_size=32,
+            base_channels=8,
+            channel_mults=(1, 2),
+            num_res_blocks=1,
+            embed_dim=8,
+            time_embed_dim=16,
+            groups=3,
+            attn_resolutions=(16,),
+        )
+
+
+def test_scoreunet_indivisible_image_size_raises():
+    # Contrato 2.3: la resolución de trabajo debe ser divisible por el factor total de
+    # reducción 2**(len(channel_mults)-1); con channel_mults=(1, 2) el factor es 2 y un
+    # image_size impar (15) no es divisible -> ValueError en construcción.
+    with pytest.raises(ValueError):
+        ScoreUNet(
+            in_channels=3,
+            image_size=15,
+            base_channels=8,
+            channel_mults=(1, 2),
+            num_res_blocks=1,
+            embed_dim=8,
+            time_embed_dim=16,
+            groups=4,
+            attn_resolutions=(16,),
+        )
+
+
+def test_scoreunet_wrong_input_size_raises():
+    # Contrato 2.3: la arquitectura queda fijada por image_size en construcción; un
+    # forward con H/W distintos de image_size (red de 32, entrada de 16) -> ValueError.
+    net = _tiny_unet(image_size=32)
+    x = torch.randn(2, 3, 16, 16)
+    with pytest.raises(ValueError):
+        net(x, torch.rand(2))
+
+
+def test_scoreunet_reference_defaults_forward():
+    # Contrato 4.1 / 5.4: ÚNICO test que instancia los defaults (la arquitectura de
+    # referencia del estudio) y corre un forward completo bajo pytest. Excepción
+    # deliberada a la config tiny (research.md, ~100-200 ms): batch 1 y sin parametrizar
+    # para no multiplicar el costo. Cubre el camino de 4 niveles con mult 4.
+    net = ScoreUNet()
+    x = torch.randn(1, 3, 64, 64)
+    out = net(x, torch.rand(1))
+    assert out.shape == (1, 3, 64, 64)

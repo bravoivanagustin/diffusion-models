@@ -46,7 +46,7 @@
   - Mismo `(x, t)` dos veces en eval → salidas bitwise idénticas; recorrido de submódulos sin dropout/batchnorm; muestra sola vs en batch → equivalencia con `allclose(atol=1e-6)`; backward → gradientes finitos en todos los parámetros
   - Observable: los tests nuevos pasan en CPU
   - _Requirements: 3.1, 3.2, 3.3, 3.4_
-- [ ] 4.3 Tests de configuración, errores y arquitectura de referencia
+- [x] 4.3 Tests de configuración, errores y arquitectura de referencia
   - Dos instancias con mismos argumentos → mismo conteo de parámetros; `ValueError` para activación desconocida, grupos incompatibles, resolución de trabajo no divisible y entrada con tamaño distinto al de trabajo
   - Test único con defaults: construcción + forward `(1, 3, 64, 64)` + shape (cubre la arquitectura de referencia bajo pytest)
   - Observable: suite completa del repo en verde (los 242 tests existentes + los nuevos), sin regresiones
