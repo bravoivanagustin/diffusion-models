@@ -290,3 +290,222 @@ class Upsample(nn.Module):
         """
         x = F.interpolate(x, scale_factor=2.0, mode="nearest")
         return self.conv(x)
+
+
+class ScoreUNet(nn.Module):
+    """Red de score convolucional (U-Net estilo DDPM) para imágenes — Fase 2.
+
+    Aproxima el score :math:`s_\\theta(x, t) \\approx \\nabla_x \\log p_t(x)` sobre
+    tensores imagen ``(B, C, H, W)`` con una U-Net condicionada en el tiempo:
+    encoder → bottleneck → decoder con *skip connections* concatenadas por canales.
+    Igual que la :class:`~diffusion.models.mlp.ScoreMLP` de Fase 1, es la **variable
+    de control** del estudio de ablación: una vez fijada por los defaults del
+    constructor (la arquitectura de referencia), queda idéntica en las 12 celdas
+    SDE × sampler, y la red es **enteramente determinística** — GroupNorm, sin
+    dropout, batchnorm ni ninguna capa estocástica. La salida final no lleva
+    activación: el score es no acotado (puede ser positivo o negativo).
+
+    El armado sigue el esquema estándar de las U-Nets de difusión (Ho et al. 2020;
+    Song et al. 2021):
+
+    - **Entrada**: convolución ``3x3`` de ``in_channels`` a ``base_channels``.
+    - **Encoder**: un nivel por entrada de ``channel_mults``; el nivel ``i`` trabaja
+      con ``base_channels * channel_mults[i]`` canales y ``num_res_blocks``
+      :class:`ConvResBlock`, con :class:`AttentionBlock` en los niveles cuya
+      resolución (``image_size / 2**i``) pertenece a ``attn_resolutions``. Entre
+      niveles hay un :class:`Downsample` (``len(channel_mults) - 1`` en total). Cada
+      activación del encoder se guarda como *skip*.
+    - **Bottleneck**: ``ConvResBlock → AttentionBlock → ConvResBlock`` (la atención
+      va **siempre** acá).
+    - **Decoder**: espejo del encoder; antes de cada :class:`ConvResBlock` se
+      **concatena por canales** el *skip* correspondiente del encoder, y se
+      :class:`Upsample` al final de cada nivel para volver a la resolución de
+      entrada.
+    - **Salida**: ``GroupNorm → activación → Conv 3x3`` a ``in_channels``, sin
+      activación final.
+
+    El vector temporal lo produce :class:`TimeMLP` **una sola vez** por forward y lo
+    comparten todos los :class:`ConvResBlock`. Satisface el contrato
+    :class:`~diffusion.models.base.ScoreModel` estructuralmente (``(x, t) -> score``
+    con la misma shape que ``x``), sin heredar de nada.
+
+    Los defaults del constructor definen la arquitectura de referencia; con
+    ``image_size`` 64 o 32 la misma config ``attn_resolutions=(16,)`` coloca atención
+    en la resolución 16×16 (más el bottleneck).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        image_size: int = 64,
+        base_channels: int = 64,
+        channel_mults: tuple[int, ...] = (1, 2, 2, 4),
+        num_res_blocks: int = 2,
+        embed_dim: int = 128,
+        time_embed_dim: int = 256,
+        attn_resolutions: tuple[int, ...] = (16,),
+        groups: int = 8,
+        activation: str = "silu",
+    ) -> None:
+        """Inicializa la red con la arquitectura de referencia por defecto.
+
+        Args:
+            in_channels: Canales de la imagen de entrada y de la salida (p. ej. 1
+                para escala de grises, 3 para RGB).
+            image_size: Resolución espacial de trabajo (``H == W``); fija las
+                resoluciones por nivel (``image_size / 2**i``) y, con ellas, la
+                colocación de la atención en construcción.
+            base_channels: Canales del primer nivel (los demás son
+                ``base_channels * channel_mults[i]``).
+            channel_mults: Multiplicador de canales por nivel; su longitud es la
+                cantidad de niveles del encoder/decoder.
+            num_res_blocks: Cantidad de :class:`ConvResBlock` por nivel del encoder.
+            embed_dim: Dimensión del embedding sinusoidal de tiempo (debe ser par;
+                lo valida :class:`~diffusion.models.layers.SinusoidalEmbedding`).
+            time_embed_dim: Dimensión del vector de condicionamiento que produce
+                :class:`TimeMLP` y comparten los bloques.
+            attn_resolutions: Resoluciones espaciales (absolutas) en las que se
+                coloca :class:`AttentionBlock`; el bottleneck siempre la lleva.
+            groups: Grupos de las capas :class:`~torch.nn.GroupNorm`; debe dividir a
+                todos los anchos de canal.
+            activation: Nombre de la activación, compartida por toda la red vía
+                :func:`~diffusion.models.layers._make_activation`.
+        """
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.image_size = int(image_size)
+        self.base_channels = int(base_channels)
+        self.channel_mults = tuple(int(m) for m in channel_mults)
+        self.num_res_blocks = int(num_res_blocks)
+        self.embed_dim = int(embed_dim)
+        self.time_embed_dim = int(time_embed_dim)
+        self.attn_resolutions = tuple(int(r) for r in attn_resolutions)
+        self.groups = int(groups)
+
+        num_levels = len(self.channel_mults)
+        attn_set = set(self.attn_resolutions)
+
+        # Vector temporal compartido: se computa una vez por forward y lo reusan
+        # todos los ConvResBlock (cada uno lo re-proyecta a sus canales).
+        self.time_mlp = TimeMLP(embed_dim, time_embed_dim, activation)
+
+        # Convolución de entrada: lleva los in_channels a base_channels.
+        self.conv_in = nn.Conv2d(
+            in_channels, base_channels, kernel_size=3, padding=1
+        )
+
+        # --- Encoder: un nivel por multiplicador; se guardan los skips. ---
+        # skip_channels lleva la cuenta de canales de cada activación guardada
+        # (empezando por la salida de conv_in) para dimensionar el decoder.
+        self.down_blocks = nn.ModuleList()
+        ch = self.base_channels
+        skip_channels: list[int] = [ch]
+        for level, mult in enumerate(self.channel_mults):
+            out_ch = self.base_channels * mult
+            resolution = self.image_size // (2 ** level)
+            use_attn = resolution in attn_set
+            for _ in range(self.num_res_blocks):
+                stage: list[nn.Module] = [
+                    ConvResBlock(ch, out_ch, time_embed_dim, groups, activation)
+                ]
+                ch = out_ch
+                if use_attn:
+                    stage.append(AttentionBlock(ch, groups))
+                self.down_blocks.append(nn.ModuleList(stage))
+                skip_channels.append(ch)
+            if level != num_levels - 1:
+                self.down_blocks.append(nn.ModuleList([Downsample(ch)]))
+                skip_channels.append(ch)
+
+        # --- Bottleneck: la atención va siempre acá. ---
+        self.mid_block1 = ConvResBlock(ch, ch, time_embed_dim, groups, activation)
+        self.mid_attn = AttentionBlock(ch, groups)
+        self.mid_block2 = ConvResBlock(ch, ch, time_embed_dim, groups, activation)
+
+        # --- Decoder: espejo del encoder; concatena el skip antes de cada bloque. ---
+        # Cada nivel consume num_res_blocks + 1 skips (los num_res_blocks del nivel
+        # más el del cambio de resolución / conv_in), y el ConvResBlock recibe
+        # ch + skip_ch canales por la concatenación.
+        self.up_blocks = nn.ModuleList()
+        for level in reversed(range(num_levels)):
+            out_ch = self.base_channels * self.channel_mults[level]
+            resolution = self.image_size // (2 ** level)
+            use_attn = resolution in attn_set
+            for i in range(self.num_res_blocks + 1):
+                skip_ch = skip_channels.pop()
+                stage = [
+                    ConvResBlock(
+                        ch + skip_ch, out_ch, time_embed_dim, groups, activation
+                    )
+                ]
+                ch = out_ch
+                if use_attn:
+                    stage.append(AttentionBlock(ch, groups))
+                if level != 0 and i == self.num_res_blocks:
+                    stage.append(Upsample(ch))
+                self.up_blocks.append(nn.ModuleList(stage))
+
+        # --- Cabeza de salida: sin activación final (score no acotado). ---
+        self.out_norm = nn.GroupNorm(groups, ch)
+        self.out_act = _make_activation(activation)
+        self.conv_out = nn.Conv2d(ch, in_channels, kernel_size=3, padding=1)
+
+    @staticmethod
+    def _apply_stage(
+        stage: nn.ModuleList, x: torch.Tensor, t_emb: torch.Tensor
+    ) -> torch.Tensor:
+        """Aplica en orden las capas de una etapa (encoder o decoder).
+
+        Solo los :class:`ConvResBlock` reciben el vector temporal; la atención y el
+        cambio de resolución operan únicamente sobre el tensor espacial.
+
+        Args:
+            stage: Lista ordenada de capas de la etapa.
+            x: Tensor de entrada de la etapa.
+            t_emb: Vector temporal compartido ``(B, time_embed_dim)``.
+
+        Returns:
+            El tensor tras atravesar todas las capas de la etapa.
+        """
+        for layer in stage:
+            if isinstance(layer, ConvResBlock):
+                x = layer(x, t_emb)
+            else:
+                x = layer(x)
+        return x
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Predice el score en ``(x, t)``.
+
+        Args:
+            x: Imagen ruidosa de shape ``(B, in_channels, image_size, image_size)``.
+            t: Tiempo / nivel de ruido de shape ``(B,)`` o ``(B, 1)`` (lo normaliza
+                el embedding reusado), en cualquier escala usada por las SDEs del
+                repo.
+
+        Returns:
+            Score predicho de shape ``(B, in_channels, image_size, image_size)`` (la
+            misma shape y dtype que ``x``), sin activación final.
+        """
+        t_emb = self.time_mlp(t)               # (B, time_embed_dim)
+
+        # Encoder: guarda cada activación como skip (empezando por conv_in).
+        h = self.conv_in(x)
+        skips: list[torch.Tensor] = [h]
+        for stage in self.down_blocks:
+            h = self._apply_stage(stage, h, t_emb)
+            skips.append(h)
+
+        # Bottleneck.
+        h = self.mid_block1(h, t_emb)
+        h = self.mid_attn(h)
+        h = self.mid_block2(h, t_emb)
+
+        # Decoder: concatena el skip por canales antes de cada etapa.
+        for stage in self.up_blocks:
+            h = torch.cat([h, skips.pop()], dim=1)
+            h = self._apply_stage(stage, h, t_emb)
+
+        # Cabeza de salida sin activación final.
+        h = self.out_act(self.out_norm(h))
+        return self.conv_out(h)

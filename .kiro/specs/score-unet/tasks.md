@@ -18,7 +18,7 @@
   - _Requirements: 2.2, 3.1_
 
 - [ ] 2. Núcleo: la red de score completa
-- [ ] 2.1 Ensamblar encoder–bottleneck–decoder con skips
+- [x] 2.1 Ensamblar encoder–bottleneck–decoder con skips
   - Constructor con los hiperparámetros y defaults de referencia del diseño (canales de entrada, resolución de trabajo, canales base, multiplicadores, bloques por nivel, dimensiones de embedding, resoluciones de atención, grupos, activación)
   - La atención se coloca en construcción: niveles cuya resolución (derivada de la resolución de trabajo) pertenece a las resoluciones de atención, más el bottleneck
   - Decoder espejo con skips concatenados por canales; salida final normalización + activación + convolución a los canales de entrada, sin activación final
