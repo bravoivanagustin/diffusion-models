@@ -12,8 +12,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from diffusion.data_generation import make_distribution
-from diffusion.models import ScoreMLP
+from diffusion.data_generation import infinite_bare, make_distribution
+from diffusion.models import ScoreMLP, ScoreModel
 from diffusion.sde import make_sde
 from diffusion.training import (
     RunSpec,
@@ -35,8 +35,13 @@ def _small_net(sde) -> ScoreMLP:
     return ScoreMLP(data_dim=sde.data_dim, hidden_dim=64, num_blocks=2)
 
 
+def _data(dist, n=256, batch_size=64, *, shuffle=True):
+    """Fuente infinita de tensores crudos que consume ``train`` (loader finito envuelto)."""
+    return infinite_bare(dist.dataloader(n, batch_size, shuffle=shuffle))
+
+
 def _tiny_config(**overrides) -> TrainConfig:
-    base = dict(epochs=2, n_samples=128, batch_size=64, hidden_dim=32, num_blocks=1, seed=0)
+    base = dict(num_steps=4, seed=0)
     base.update(overrides)
     return TrainConfig(**base)
 
@@ -104,25 +109,44 @@ def test_sample_timesteps_respeta_horizonte_distinto():
 
 
 @pytest.mark.parametrize("name", SDE_NAMES)
-def test_train_devuelve_red_con_data_dim_correcto(name):
-    """train() instancia la red con el data_dim de la SDE y traza finita."""
+def test_train_usa_la_red_recibida_y_registra_data_dim(name):
+    """train() usa la red que recibe (no construye ninguna) y registra el data_dim de la SDE."""
     sde = make_sde(name)
     dist = make_distribution("gaussian", 2, seed=0)
-    result = train(sde, dist, _tiny_config(epochs=1))
+    net = _small_net(sde)
+    result = train(sde, net, _data(dist), _tiny_config(num_steps=4))
 
     assert isinstance(result, TrainResult)
-    assert result.net.data_dim == sde.data_dim
+    assert result.net is net  # usa la instancia recibida, no una nueva
+    assert result.data_dim == sde.data_dim  # = sde.data_dim (fuente del checkpoint)
     assert result.sde_name == name
-    assert len(result.history) == 1
+    assert len(result.history) >= 1
+    assert all(math.isfinite(v) for v in result.history)
+
+
+def test_train_history_no_vacio_con_log_every_cero():
+    """history se registra a cadencia fija (desacoplada de log_every): nunca queda vacío."""
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    net = _small_net(sde)
+    result = train(sde, net, _data(dist), TrainConfig(num_steps=5, log_every=0, seed=0))
+
+    assert result.history  # no vacío ni con el default log_every=0
     assert all(math.isfinite(v) for v in result.history)
 
 
 def test_train_baja_la_perdida():
-    """Smoke de aprendizaje: tras varias épocas la pérdida final es menor que la inicial."""
+    """Smoke de aprendizaje: tras muchos pasos la pérdida final es menor que la inicial.
+
+    Se compara la **tendencia** (history[-1] < history[0]), no valores paso a paso: al pasar de
+    épocas a pasos cambia el orden de consumo de ruido.
+    """
     sde = make_sde("vp")
     dist = make_distribution("mixture", 2, n_components=8, seed=0)
-    config = _tiny_config(epochs=60, n_samples=512, batch_size=128, hidden_dim=64, num_blocks=2)
-    result = train(sde, dist, config)
+    torch.manual_seed(0)
+    net = ScoreMLP(data_dim=sde.data_dim, hidden_dim=64, num_blocks=2)
+    data = _data(dist, n=512, batch_size=128)
+    result = train(sde, net, data, TrainConfig(num_steps=240, seed=0))
 
     assert all(math.isfinite(v) for v in result.history)
     assert result.history[-1] < result.history[0]
@@ -130,9 +154,12 @@ def test_train_baja_la_perdida():
 
 def test_train_reproducible_con_misma_seed():
     def run():
+        torch.manual_seed(0)  # fija los pesos iniciales de la red (idénticos entre corridas)
         sde = make_sde("vp")
+        net = _small_net(sde)
         dist = make_distribution("gaussian", 2, seed=1)
-        return train(sde, dist, _tiny_config(epochs=5, n_samples=256, seed=7)).history
+        data = _data(dist, n=256, batch_size=64)
+        return train(sde, net, data, TrainConfig(num_steps=20, seed=7)).history
 
     assert run() == pytest.approx(run())
 
@@ -140,19 +167,41 @@ def test_train_reproducible_con_misma_seed():
 def test_train_con_grad_clip_corre():
     sde = make_sde("ve")
     dist = make_distribution("gaussian", 2, seed=0)
-    result = train(sde, dist, _tiny_config(epochs=2, grad_clip=1.0))
-    assert len(result.history) == 2
+    net = _small_net(sde)
+    result = train(sde, net, _data(dist), _tiny_config(num_steps=4, grad_clip=1.0))
+    assert len(result.history) >= 1
     assert all(math.isfinite(v) for v in result.history)
+
+
+def test_trainconfig_acotado_al_loop():
+    """TrainConfig lleva num_steps + campos del loop y NO acepta los campos removidos (3.1/3.2)."""
+    cfg = TrainConfig(
+        num_steps=10, lr=1e-3, t_eps=1e-3, grad_clip=1.0, seed=0, device="cpu", log_every=2
+    )
+    assert cfg.num_steps == 10
+    for removed in (
+        "epochs", "batch_size", "n_samples", "embed_dim", "hidden_dim", "num_blocks",
+        "activation",
+    ):
+        assert not hasattr(cfg, removed)
+    with pytest.raises(TypeError):
+        TrainConfig(epochs=5)  # campo removido: ya no es aceptado
 
 
 # -------------------------------------------------------------- checkpoints
 
 
 def test_checkpoint_roundtrip(tmp_path):
-    """Guardar y recargar reconstruye la red con los mismos pesos y la misma meta."""
+    """Guardar y recargar reconstruye la red con los mismos pesos y la misma meta.
+
+    El contrato de checkpoint es transitorio en esta task: ``save_checkpoint`` toma la receta de
+    red de la propia red entrenada (no de ``TrainConfig``, que ya no la lleva) y ``load_checkpoint``
+    la reconstruye como ``ScoreMLP`` (se vuelve model-agnóstico en la task 3.1).
+    """
     sde = make_sde("vp")
     dist = make_distribution("gaussian", 2, seed=0)
-    result = train(sde, dist, _tiny_config(epochs=1))
+    net = _small_net(sde)
+    result = train(sde, net, _data(dist), _tiny_config(num_steps=2))
 
     path = tmp_path / "ckpt.pt"
     save_checkpoint(result, path)
@@ -173,21 +222,45 @@ def test_checkpoint_roundtrip(tmp_path):
 
 
 def test_build_run_desde_dict():
+    """build_run arma (sde, model, data, config): la red por defecto es un MLP dimensionado
+    desde la SDE y la data es un iterador infinito de tensores crudos con el batch_size pedido."""
     raw = {
         "sde": {"name": "vp", "beta_min": 0.1, "beta_max": 20.0},
-        "data": {"shape": "mixture", "dim": 2, "n_samples": 512, "n_components": 8, "seed": 0},
-        "train": {"epochs": 3, "batch_size": 128, "lr": 1e-3, "seed": 0},
+        "data": {
+            "shape": "mixture", "dim": 2, "n_samples": 512, "batch_size": 128,
+            "n_components": 8, "seed": 0,
+        },
+        "train": {"num_steps": 3, "lr": 1e-3, "seed": 0},
         "out": {"checkpoint": "models/x.pt", "loss_curve": "models/x.png"},
     }
     spec = build_run(raw)
 
     assert isinstance(spec, RunSpec)
     assert spec.sde.name == "vp"
-    assert spec.distribution.name == "mixture"
-    assert spec.config.epochs == 3
-    assert spec.config.n_samples == 512  # n_samples viaja de 'data' a TrainConfig
+    assert spec.config.num_steps == 3
+    # Sin bloque 'model:' -> default MLP dimensionado desde el data_dim de la SDE.
+    assert isinstance(spec.model, ScoreModel)
+    assert isinstance(spec.model, ScoreMLP)
+    assert spec.model.data_dim == spec.sde.data_dim
+    # 'data' es un iterador infinito que yield-ea tensores crudos (B, data_dim).
+    batch = next(iter(spec.data))
+    assert batch.shape == (128, 2)  # batch_size del bloque 'data'
     assert spec.checkpoint.name == "x.pt"
     assert spec.loss_curve.name == "x.png"
+
+
+def test_build_run_con_bloque_model_sobreescribe_el_default():
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1},
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1},
+    }
+    spec = build_run(raw)
+    assert isinstance(spec.model, ScoreMLP)
+    assert spec.model.hidden_dim == 32
+    assert spec.model.num_blocks == 1
+    assert spec.model.data_dim == spec.sde.data_dim  # el data_dim lo sigue aportando la SDE
 
 
 def test_build_run_falla_sin_claves_obligatorias():
@@ -201,7 +274,7 @@ def test_build_run_rechaza_clave_desconocida():
     raw = {
         "sde": {"name": "vp"},
         "data": {"shape": "gaussian", "dim": 2},
-        "train": {"epochs": 1, "lr_typo": 0.1},
+        "train": {"num_steps": 1, "lr_typo": 0.1},  # clave desconocida para TrainConfig
     }
     with pytest.raises(ValueError):
         build_run(raw)
@@ -216,8 +289,9 @@ def test_load_config_yaml_y_build_run(tmp_path):
         "  shape: gaussian\n"
         "  dim: 2\n"
         "  n_samples: 256\n"
+        "  batch_size: 64\n"
         "train:\n"
-        "  epochs: 2\n"
+        "  num_steps: 2\n"
         "  lr: 0.001\n"
     )
     path = tmp_path / "run.yaml"
@@ -225,6 +299,7 @@ def test_load_config_yaml_y_build_run(tmp_path):
 
     spec = build_run(load_config(path))
     assert spec.sde.name == "vp"
-    assert spec.distribution.name == "gaussian"
-    assert spec.config.epochs == 2
-    assert spec.config.n_samples == 256
+    assert isinstance(spec.model, ScoreMLP)
+    assert spec.config.num_steps == 2
+    batch = next(iter(spec.data))
+    assert batch.shape == (64, 2)  # batch_size del bloque 'data'

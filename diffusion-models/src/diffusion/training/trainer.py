@@ -1,14 +1,16 @@
 """Loop de entrenamiento por denoising score matching y persistencia de la red.
 
-Reúne el muestreo de pares de entrenamiento (:mod:`losses`), la red de score
-(:class:`diffusion.models.ScoreMLP`) y un proceso forward (:class:`diffusion.sde.ForwardSDE`)
-en un :func:`train` que devuelve la red entrenada y la historia de pérdida.
+Reúne el muestreo de pares de entrenamiento (:mod:`losses`), una red de score cualquiera
+(cualquier :class:`diffusion.models.ScoreModel`: el ``ScoreMLP`` de Fase 1, la ``ScoreUNet``
+de Fase 2, …) y un proceso forward (:class:`diffusion.sde.ForwardSDE`) en un :func:`train`
+que devuelve la red entrenada y la historia de pérdida.
 
-La red es la **variable de control** del estudio de ablación: sus hiperparámetros viven en
-:class:`TrainConfig` con los defaults de ``ScoreMLP`` y normalmente no se tocan entre
-variantes. La **regla del Eje 1** vive acá implícitamente: cada llamada a :func:`train`
-instancia una red nueva, así que cambiar de SDE = un entrenamiento desde cero (los samplers
-del Eje 2 reusan la misma red sin reentrenar).
+:func:`train` es **agnóstico a la red y al origen de datos**: recibe la ``model`` ya
+construida y un iterador **infinito** de tensores crudos, y corre un loop **por pasos**
+(``config.num_steps``). No construye la red ni ramifica por su tipo — esa responsabilidad vive
+en el caller (``make_model`` / el config-driven). La **regla del Eje 1** sigue vigente: cambiar
+de SDE = una red nueva y un entrenamiento desde cero (los samplers del Eje 2 reusan la misma
+red sin reentrenar).
 
 :func:`save_checkpoint` / :func:`load_checkpoint` guardan los pesos junto con la metadata
 mínima (nombre de la SDE, ``data_dim``, hiperparámetros de la red) para que los samplers
@@ -18,72 +20,74 @@ puedan reconstruir la red sin el config original.
 from __future__ import annotations
 
 import pathlib
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import torch
 
-from ..models import ScoreMLP
+from ..models import ScoreMLP, ScoreModel
 from ..sde import ForwardSDE
 from .losses import dsm_loss, sample_timesteps
 
 
 @dataclass
 class TrainConfig:
-    """Hiperparámetros de una corrida de entrenamiento.
+    """Hiperparámetros del **loop** de entrenamiento (solo optimización y corrida).
 
-    Describe por completo la corrida: optimización + tamaño del dataset + arquitectura de la
-    red. Pensado para construirse desde un archivo de config (ver :mod:`diffusion.training.config`),
-    pero es un dataclass plano y se arma igual de fácil a mano en los tests.
+    Ya no carga hiperparámetros de red (viven en el constructor de la red / ``make_model``) ni
+    de tamaño de dataset (viven en la fuente de datos). Pensado para construirse desde un
+    archivo de config (ver :mod:`diffusion.training.config`), pero es un dataclass plano y se
+    arma igual de fácil a mano en los tests.
     """
 
-    # --- optimización ---
-    epochs: int = 200
-    batch_size: int = 256
-    n_samples: int = 4000
+    num_steps: int = 1000  # pasos de optimización (≈ epochs × n_samples/batch_size viejos)
     lr: float = 2e-3
     t_eps: float = 1e-3
     grad_clip: float | None = None
     seed: int | None = 0
     device: str = "cpu"
-    log_every: int = 0  # 0 = silencioso; N = imprime cada N épocas
-    # --- red (variable de control: defaults de ScoreMLP, normalmente fijos) ---
-    embed_dim: int = 128
-    hidden_dim: int = 256
-    num_blocks: int = 4
-    activation: str = "silu"
+    log_every: int = 0  # 0 = silencioso; N = imprime cada N pasos (no afecta el history)
 
 
 @dataclass
 class TrainResult:
     """Resultado de :func:`train`: la red entrenada y la traza de la corrida."""
 
-    net: ScoreMLP
-    history: list[float] = field(default_factory=list)  # pérdida media por época
+    net: ScoreModel  # cualquier red de score (ScoreMLP, ScoreUNet, …), no atada a una clase
+    history: list[float] = field(default_factory=list)  # pérdida media por intervalo de registro
     config: TrainConfig = field(default_factory=TrainConfig)
     sde_name: str = ""
+    data_dim: int = 0  # = sde.data_dim; lo copia save_checkpoint a meta (lo usa generate.py)
 
 
 def train(
     sde: ForwardSDE,
-    distribution,
+    model: ScoreModel,
+    data: Iterator[torch.Tensor],
     config: TrainConfig,
     *,
     generator: torch.Generator | None = None,
 ) -> TrainResult:
-    """Entrena una :class:`ScoreMLP` para aproximar el score de ``sde`` por DSM.
+    """Entrena la red ``model`` para aproximar el score de ``sde`` por DSM.
+
+    Loop **por pasos** y agnóstico a la red: usa la ``model`` recibida (no construye ninguna ni
+    ramifica por su tipo) y consume ``data`` con ``next()`` — un batch por paso.
 
     Args:
-        sde: Proceso forward (define el kernel y el target del score). Su ``data_dim`` fija la
-            dimensión de la red (2 para VP/VE/sub-VP).
-        distribution: Fuente de datos ``p_data(x_0)`` (una ``PointDistribution`` de
-            :mod:`diffusion.data_generation`); se le pide un ``DataLoader``.
-        config: Hiperparámetros de la corrida.
+        sde: Proceso forward (define el kernel y el target del score). Su ``data_dim`` queda
+            registrado en el resultado (lo usa el checkpoint).
+        model: Red de score ya construida (cualquier :class:`ScoreModel`). Se mueve al
+            dispositivo de forma idempotente y se pone en modo entrenamiento.
+        data: Iterador/iterable **infinito** que yield-ea tensores crudos ``(B, ...)`` (p. ej.
+            ``infinite_bare(distribution.dataloader(...))``). Se le pide un batch por paso.
+        config: Hiperparámetros del loop de entrenamiento.
         generator: Generador opcional para el ruido del kernel / muestreo de ``t``. Si es
             ``None`` se crea uno sembrado con ``config.seed``.
 
     Returns:
-        :class:`TrainResult` con la red entrenada, la historia de pérdida (una entrada por
-        época), el ``config`` usado y el nombre de la SDE.
+        :class:`TrainResult` con la red entrenada, la historia de pérdida (pérdida media por
+        intervalo de registro; nunca vacía: siempre incluye el último paso), el ``config``
+        usado, el nombre de la SDE y su ``data_dim``.
     """
     device = torch.device(config.device)
     if config.seed is not None:
@@ -93,43 +97,47 @@ def train(
         if config.seed is not None:
             generator.manual_seed(config.seed)
 
-    net = ScoreMLP(
-        data_dim=sde.data_dim,
-        embed_dim=config.embed_dim,
-        hidden_dim=config.hidden_dim,
-        num_blocks=config.num_blocks,
-        activation=config.activation,
-    ).to(device)
+    net = model.to(device)  # idempotente: no falla si el caller ya la movió
     net.train()
 
-    loader = distribution.dataloader(config.n_samples, config.batch_size, shuffle=True)
+    data_iter = iter(data)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.lr)
 
+    # El history se registra a una cadencia fija, desacoplada de ``log_every`` (que gobierna
+    # solo el print): si ``log_every>0`` coincide con él; si no, una cadencia interna que
+    # deja ~100 puntos. Siempre se registra además el último paso, así history nunca queda
+    # vacío (ni con el ``log_every=0`` por defecto).
+    cadence = config.log_every if config.log_every > 0 else max(1, config.num_steps // 100)
+
     history: list[float] = []
-    for epoch in range(config.epochs):
-        running, n_batches = 0.0, 0
-        for (x0,) in loader:
-            x0 = x0.to(device)
-            t = sample_timesteps(
-                x0.shape[0], sde.T, config.t_eps, generator=generator, device=device
-            )
-            loss = dsm_loss(net, sde, x0, t, generator=generator)
+    running, n_batches = 0.0, 0
+    for step in range(config.num_steps):
+        x0 = next(data_iter).to(device)
+        t = sample_timesteps(
+            x0.shape[0], sde.T, config.t_eps, generator=generator, device=device
+        )
+        loss = dsm_loss(net, sde, x0, t, generator=generator)
 
-            optimizer.zero_grad()
-            loss.backward()
-            if config.grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
-            optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        if config.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
+        optimizer.step()
 
-            running += loss.item()
-            n_batches += 1
+        running += loss.item()
+        n_batches += 1
 
-        avg = running / max(n_batches, 1)
-        history.append(avg)
-        if config.log_every and (epoch % config.log_every == 0 or epoch == config.epochs - 1):
-            print(f"[{sde.name}] época {epoch + 1}/{config.epochs}  pérdida={avg:.6f}")
+        is_last = step == config.num_steps - 1
+        if (step + 1) % cadence == 0 or is_last:
+            avg = running / max(n_batches, 1)
+            history.append(avg)
+            running, n_batches = 0.0, 0
+            if config.log_every > 0:
+                print(f"[{sde.name}] paso {step + 1}/{config.num_steps}  pérdida={avg:.6f}")
 
-    return TrainResult(net=net, history=history, config=config, sde_name=sde.name)
+    return TrainResult(
+        net=net, history=history, config=config, sde_name=sde.name, data_dim=sde.data_dim
+    )
 
 
 # ----------------------------------------------------------------- persistencia
@@ -147,17 +155,22 @@ def save_checkpoint(result: TrainResult, path: str | pathlib.Path) -> pathlib.Pa
     """
     out = pathlib.Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    cfg = result.config
+    # Transitorio: la receta de red ya no vive en ``TrainConfig`` (que se adelgazó), así que se
+    # lee de la propia red entrenada (un ``ScoreMLP`` expone estos atributos). ``activation`` no
+    # se guarda como atributo → default ``"silu"`` (el único valor usado). Esto conserva el
+    # formato de checkpoint byte-compatible con el ``load_checkpoint`` actual y con los samplers
+    # (se reemplaza por la receta model-agnóstica en la task 3.1).
+    net = result.net
     blob = {
-        "model_state": result.net.state_dict(),
+        "model_state": net.state_dict(),
         "meta": {
             "sde_name": result.sde_name,
-            "data_dim": result.net.data_dim,
+            "data_dim": net.data_dim,
             "model": {
-                "embed_dim": cfg.embed_dim,
-                "hidden_dim": cfg.hidden_dim,
-                "num_blocks": cfg.num_blocks,
-                "activation": cfg.activation,
+                "embed_dim": net.embed_dim,
+                "hidden_dim": net.hidden_dim,
+                "num_blocks": net.num_blocks,
+                "activation": "silu",
             },
             "history": list(result.history),
         },

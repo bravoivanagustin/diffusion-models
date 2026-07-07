@@ -6,7 +6,7 @@ Cada corrida (una celda del estudio de ablación) se describe en un ``.yaml`` co
 Ejemplos (correr desde ``diffusion-models/``)::
 
     python scripts/train.py --config config/vp_mixture.yaml
-    python scripts/train.py --config config/vp_mixture.yaml --epochs 50 --device cpu
+    python scripts/train.py --config config/vp_mixture.yaml --num-steps 50 --device cpu
 
 Guarda los pesos entrenados (``.pt`` con ``state_dict`` + metadata) y una curva de pérdida
 (``.png``) en las rutas de la sección ``out`` del config (relativas al cwd).
@@ -31,12 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Entrena la red de score (DSM) a partir de un config YAML."
     )
     p.add_argument("--config", required=True, help="Ruta del .yaml de la corrida.")
-    p.add_argument("--epochs", type=int, default=None,
-                   help="Override de la cantidad de épocas del config.")
+    p.add_argument("--num-steps", type=int, default=None,
+                   help="Override de la cantidad de pasos de entrenamiento del config.")
     p.add_argument("--device", type=str, default=None,
                    help="Override del dispositivo (p. ej. cpu / cuda).")
     p.add_argument("--quiet", action="store_true",
-                   help="No imprimir el progreso por época.")
+                   help="No imprimir el progreso por paso.")
     return p
 
 
@@ -52,7 +52,7 @@ def save_loss_curve(path: str | pathlib.Path, history: list[float], title: str) 
     ax.plot(range(1, len(history) + 1), history)
     if min(history) > 0:
         ax.set_yscale("log")
-    ax.set_xlabel("época")
+    ax.set_xlabel("intervalo de registro")
     ax.set_ylabel("pérdida DSM")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
@@ -79,21 +79,21 @@ def main(argv=None) -> int:
         return 2
 
     # Overrides de la línea de comandos.
-    if args.epochs is not None:
-        spec.config.epochs = args.epochs
+    if args.num_steps is not None:
+        spec.config.num_steps = args.num_steps
     if args.device is not None:
         spec.config.device = args.device
     if args.quiet:
         spec.config.log_every = 0
     elif spec.config.log_every == 0:
-        spec.config.log_every = max(1, spec.config.epochs // 10)
+        spec.config.log_every = max(1, spec.config.num_steps // 10)
 
     print(
         f"Entrenando sde={spec.sde.name} (data_dim={spec.sde.data_dim}) "
-        f"sobre {spec.distribution.name}: épocas={spec.config.epochs} "
-        f"n={spec.config.n_samples} batch={spec.config.batch_size} device={spec.config.device}"
+        f"con {type(spec.model).__name__}: pasos={spec.config.num_steps} "
+        f"device={spec.config.device}"
     )
-    result = train(spec.sde, spec.distribution, spec.config)
+    result = train(spec.sde, spec.model, spec.data, spec.config)
     print(
         f"Listo. pérdida inicial={result.history[0]:.6f} -> "
         f"final={result.history[-1]:.6f}"
@@ -104,7 +104,7 @@ def main(argv=None) -> int:
         print(f"Checkpoint -> {spec.checkpoint}")
     if spec.loss_curve:
         save_loss_curve(
-            spec.loss_curve, result.history, f"{spec.sde.name} · {spec.distribution.name}"
+            spec.loss_curve, result.history, f"{spec.sde.name} · {type(spec.model).__name__}"
         )
         print(f"Curva      -> {spec.loss_curve}")
     if not spec.checkpoint and not spec.loss_curve:

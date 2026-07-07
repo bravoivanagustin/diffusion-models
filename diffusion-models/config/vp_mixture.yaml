@@ -10,14 +10,14 @@ sde:                      # -> make_sde(name, **resto). Eje 1: cambiar la SDE ex
 data:                     # fuente p_data(x_0); ver `python scripts/data_generation.py --help`
   shape: mixture          # gaussian | mixture | two_moons | spiral | swiss_roll
   dim: 2
-  n_samples: 4000
+  n_samples: 4000         # tamaño del dataset (parámetro de la fuente, no del TrainConfig)
+  batch_size: 256         # tamaño de batch (parámetro de la fuente, no del TrainConfig)
   n_components: 8
   standardize: true
   seed: 0
 
-train:                    # hiperparámetros de optimización (-> TrainConfig)
-  epochs: 300
-  batch_size: 256
+train:                    # hiperparámetros del loop de optimización (-> TrainConfig)
+  num_steps: 240          # pasos de optimización (reemplaza epochs; ver docs/project/training.md)
   lr: 0.002
   t_eps: 1.0e-3           # piso del muestreo de t (evita t=0, sigma->0)
   grad_clip: 1.0          # opcional; quitar para no recortar gradientes
@@ -25,6 +25,7 @@ train:                    # hiperparámetros de optimización (-> TrainConfig)
   device: cpu
 
 # model:                  # opcional: la red es la variable de control (fija entre celdas).
+#   name: mlp             # si falta, se usa {name: mlp} dimensionado desde el dato/SDE.
 #   embed_dim: 128        # Descomentar solo para experimentos de arquitectura, no de ablación.
 #   hidden_dim: 256
 #   num_blocks: 4
