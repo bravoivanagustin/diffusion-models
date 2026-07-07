@@ -42,7 +42,7 @@
   - Shape `(B, C, H, W) → (B, C, H, W)` float32 parametrizado C ∈ {1, 3} × resolución ∈ {32, 64}; `t` en `(B,)` y `(B, 1)` → resultados idénticos; escalas de `t` → salidas finitas; dos `t` distintos → salidas distintas; valores de ambos signos; `isinstance` contra el Protocol
   - Observable: los tests nuevos pasan en CPU
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 2.1, 2.2, 5.3_
-- [ ] 4.2 Tests de determinismo y gradientes
+- [x] 4.2 Tests de determinismo y gradientes
   - Mismo `(x, t)` dos veces en eval → salidas bitwise idénticas; recorrido de submódulos sin dropout/batchnorm; muestra sola vs en batch → equivalencia con `allclose(atol=1e-6)`; backward → gradientes finitos en todos los parámetros
   - Observable: los tests nuevos pasan en CPU
   - _Requirements: 3.1, 3.2, 3.3, 3.4_

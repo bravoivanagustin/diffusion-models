@@ -245,3 +245,53 @@ def test_scoreunet_satisfies_scoremodel_protocol():
     # Contrato 1.6: satisface el Protocol ScoreModel estructuralmente (sin herencia).
     net = _tiny_unet()
     assert isinstance(net, ScoreModel)
+
+
+# Determinismo (Req 3): la red es la variable de control -> enteramente determinística.
+
+
+def test_scoreunet_is_deterministic():
+    # Contrato 3.1: mismo (x, t) evaluado dos veces en eval -> salida bitwise idéntica
+    # (mismo grafo, mismas rutas de cómputo).
+    net = _tiny_unet().eval()
+    x, t = torch.randn(2, 3, 32, 32), torch.rand(2)
+    with torch.no_grad():
+        assert torch.equal(net(x, t), net(x, t))
+
+
+def test_scoreunet_no_stochastic_layers():
+    # Contrato 3.2: sin dropout ni batchnorm (la normalización es GroupNorm,
+    # independiente del batch); la red debe ser enteramente determinística.
+    net = _tiny_unet()
+    for module in net.modules():
+        assert not isinstance(module, torch.nn.Dropout)
+        assert not isinstance(
+            module,
+            (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d),
+        )
+
+
+def test_scoreunet_batch_independence():
+    # Contrato 3.3: una misma muestra evaluada sola o dentro de un batch da salidas
+    # numéricamente equivalentes (la normalización no depende del resto del batch).
+    # No es bitwise en CPU float32 (~6e-07 por paralelización de convs); allclose(atol=1e-6).
+    net = _tiny_unet().eval()
+    x_single = torch.randn(1, 3, 32, 32)
+    t_single = torch.rand(1)
+    # La primera fila del batch es exactamente la muestra evaluada sola.
+    x_batch = torch.cat([x_single, torch.randn(3, 3, 32, 32)], dim=0)
+    t_batch = torch.cat([t_single, torch.rand(3)], dim=0)
+    with torch.no_grad():
+        out_single = net(x_single, t_single)
+        out_batch = net(x_batch, t_batch)
+    assert torch.allclose(out_single, out_batch[0:1], atol=1e-6)
+
+
+def test_scoreunet_gradients_flow():
+    # Contrato 3.4: backward sobre una salida -> gradientes finitos en todos los
+    # parámetros entrenables (ninguno queda desconectado del grafo).
+    net = _tiny_unet()
+    x, t = torch.randn(2, 3, 32, 32), torch.rand(2)
+    net(x, t).pow(2).sum().backward()
+    grads = [p.grad for p in net.parameters()]
+    assert all(g is not None and torch.all(torch.isfinite(g)) for g in grads)
