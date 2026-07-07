@@ -38,4 +38,4 @@ Reestructurar la red de score en un subpaquete `diffusion/models/` que separe la
 
 ## Specs (dependency order)
 
-- [ ] score-unet — ScoreUNet convolucional escrita a mano en `models/unet.py` (bloque residual conv con inyección de tiempo, self-attention en 16×16, down/upsampling, encoder + bottleneck + decoder con skips). Dependencies: models-restructure (item directo, debe completarse antes)
+- [x] score-unet — ScoreUNet convolucional escrita a mano en `models/unet.py` (bloque residual conv con inyección de tiempo, self-attention en 16×16, down/upsampling, encoder + bottleneck + decoder con skips). Dependencies: models-restructure (item directo, debe completarse antes)

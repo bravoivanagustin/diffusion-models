@@ -1,6 +1,6 @@
 # Implementation Plan
 
-- [ ] 1. Fundaciones: los bloques internos de la red
+- [x] 1. Fundaciones: los bloques internos de la red
 - [x] 1.1 Crear la proyección temporal del condicionamiento
   - Nuevo archivo de la red en el módulo de redes, con la pieza que embebe `t` (reusando el embedding sinusoidal compartido y el registry de activaciones de `layers`) y lo proyecta al vector de condicionamiento de dimensión `time_embed_dim`
   - Acepta `t` como `(B,)` o `(B, 1)` (lo normaliza el embedding reusado); salidas finitas para escalas `[0, 1]`, `[0, T]` y pasos enteros
@@ -17,7 +17,7 @@
   - Observable: la atención preserva la shape de entrada; la reducción divide H y W por 2 y la ampliación los duplica
   - _Requirements: 2.2, 3.1_
 
-- [ ] 2. Núcleo: la red de score completa
+- [x] 2. Núcleo: la red de score completa
 - [x] 2.1 Ensamblar encoder–bottleneck–decoder con skips
   - Constructor con los hiperparámetros y defaults de referencia del diseño (canales de entrada, resolución de trabajo, canales base, multiplicadores, bloques por nivel, dimensiones de embedding, resoluciones de atención, grupos, activación)
   - La atención se coloca en construcción: niveles cuya resolución (derivada de la resolución de trabajo) pertenece a las resoluciones de atención, más el bottleneck
@@ -36,7 +36,7 @@
   - Observable: `python -m diffusion.models.unet` imprime shape `(2, 3, 64, 64)` y el conteo; `from diffusion.models import ScoreUNet` funciona
   - _Requirements: 5.1, 1.6_
 
-- [ ] 4. Verificación: la suite de la red en CPU
+- [x] 4. Verificación: la suite de la red en CPU
 - [x] 4.1 Tests de contrato: shapes, tiempo y Protocol
   - Sección nueva en la suite del módulo de redes, bajo la convención `importorskip` existente; config tiny del diseño (una instancia por resolución de trabajo)
   - Shape `(B, C, H, W) → (B, C, H, W)` float32 parametrizado C ∈ {1, 3} × resolución ∈ {32, 64}; `t` en `(B,)` y `(B, 1)` → resultados idénticos; escalas de `t` → salidas finitas; dos `t` distintos → salidas distintas; valores de ambos signos; `isinstance` contra el Protocol
@@ -52,7 +52,7 @@
   - Observable: suite completa del repo en verde (los 242 tests existentes + los nuevos), sin regresiones
   - _Requirements: 2.3, 4.1, 4.2, 4.3, 5.2, 5.4_
 
-- [ ] 5. Documentación del módulo y del alcance
+- [x] 5. Documentación del módulo y del alcance
 - [x] 5.1 (P) Actualizar los documentos de alcance por la decisión de U-Net propia
   - `docs/project/ejes.md`, `.claude/CLAUDE.md` y `.kiro/steering/product.md`: la Fase 2 construye la U-Net a mano (decisión 05/07/2026) en lugar de reusar una de librería
   - Observable: no queda ninguna mención viva a "U-Net de librería" en esos documentos (las menciones históricas de crónica/specs cerradas no se tocan)
