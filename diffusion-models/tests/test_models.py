@@ -7,11 +7,14 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from diffusion.models import (
+    REGISTRY,
     ResidualBlock,
     ScoreMLP,
     ScoreModel,
     ScoreUNet,
     SinusoidalEmbedding,
+    available_models,
+    make_model,
 )
 
 
@@ -386,3 +389,65 @@ def test_scoreunet_reference_defaults_forward():
     x = torch.randn(1, 3, 64, 64)
     out = net(x, torch.rand(1))
     assert out.shape == (1, 3, 64, 64)
+
+
+# ------------------------------------------------ make_model / registry (Req 5.3, 6.1)
+# Factory por nombre additivo, espejo de make_sde / make_distribution: construye la red
+# desde una receta (name, kwargs) para el config-driven y la reconstrucción de checkpoints.
+
+
+def test_make_model_mlp_returns_scoremlp():
+    # make_model("mlp", ...) devuelve un ScoreMLP usable (nn.Module con forward válido).
+    net = make_model("mlp", data_dim=2)
+    assert isinstance(net, ScoreMLP)
+    assert isinstance(net, torch.nn.Module)
+    out = net(torch.randn(4, 2), torch.rand(4))
+    assert out.shape == (4, 2)
+
+
+def test_make_model_unet_returns_scoreunet():
+    # make_model("unet", ...) devuelve un ScoreUNet usable; se pasan los anchos tiny para
+    # mantener el costo del test en el orden del resto de la suite.
+    net = make_model(
+        "unet",
+        in_channels=3,
+        image_size=32,
+        base_channels=8,
+        channel_mults=(1, 2),
+        num_res_blocks=1,
+        embed_dim=8,
+        time_embed_dim=16,
+        groups=4,
+        attn_resolutions=(16,),
+    )
+    assert isinstance(net, ScoreUNet)
+    assert isinstance(net, torch.nn.Module)
+    out = net(torch.randn(2, 3, 32, 32), torch.rand(2))
+    assert out.shape == (2, 3, 32, 32)
+
+
+def test_make_model_satisfies_scoremodel_protocol():
+    # Lo que construye el registry satisface el Protocol ScoreModel (contrato (x, t) -> score).
+    assert isinstance(make_model("mlp", data_dim=2), ScoreModel)
+
+
+def test_available_models_expected_set():
+    # available_models() == conjunto esperado, y REGISTRY mapea a las clases correctas.
+    assert set(available_models()) == {"mlp", "unet"}
+    assert REGISTRY["mlp"] is ScoreMLP
+    assert REGISTRY["unet"] is ScoreUNet
+
+
+def test_make_model_unknown_name_raises():
+    # Nombre desconocido -> ValueError que nombra las opciones válidas (patrón del repo).
+    with pytest.raises(ValueError):
+        make_model("no_existe")
+
+
+def test_make_model_filters_unknown_kwargs():
+    # Espejo de make_sde / make_distribution: los kwargs que no aplican a la red se
+    # descartan (se filtran por la firma del constructor), así un caller genérico puede
+    # pasar siempre el mismo conjunto de parámetros sin que falle la construcción.
+    net = make_model("mlp", data_dim=2, no_aplica_a_mlp=123)
+    assert isinstance(net, ScoreMLP)
+    assert net.data_dim == 2
