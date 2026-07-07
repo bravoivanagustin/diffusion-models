@@ -6,7 +6,7 @@
   - Acepta `t` como `(B,)` o `(B, 1)` (lo normaliza el embedding reusado); salidas finitas para escalas `[0, 1]`, `[0, T]` y pasos enteros
   - Observable: ejecutar la pieza con 8 tiempos devuelve un tensor `(8, time_embed_dim)` finito
   - _Requirements: 1.2, 1.3_
-- [ ] 1.2 Crear el bloque residual convolucional con inyección de tiempo
+- [x] 1.2 Crear el bloque residual convolucional con inyección de tiempo
   - Dos etapas de normalización por grupos + activación + convolución 3×3; el vector temporal se proyecta a los canales de salida y se suma tras la primera convolución (broadcast espacial)
   - Skip identidad si los canales coinciden, proyección 1×1 si no; sin dropout ni batchnorm
   - Observable: forward `(B, C_in, H, W)` + vector temporal → `(B, C_out, H, W)`, y dos tiempos distintos producen salidas distintas
