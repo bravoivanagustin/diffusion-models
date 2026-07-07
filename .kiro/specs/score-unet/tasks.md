@@ -1,7 +1,7 @@
 # Implementation Plan
 
 - [ ] 1. Fundaciones: los bloques internos de la red
-- [ ] 1.1 Crear la proyección temporal del condicionamiento
+- [x] 1.1 Crear la proyección temporal del condicionamiento
   - Nuevo archivo de la red en el módulo de redes, con la pieza que embebe `t` (reusando el embedding sinusoidal compartido y el registry de activaciones de `layers`) y lo proyecta al vector de condicionamiento de dimensión `time_embed_dim`
   - Acepta `t` como `(B,)` o `(B, 1)` (lo normaliza el embedding reusado); salidas finitas para escalas `[0, 1]`, `[0, T]` y pasos enteros
   - Observable: ejecutar la pieza con 8 tiempos devuelve un tensor `(8, time_embed_dim)` finito
