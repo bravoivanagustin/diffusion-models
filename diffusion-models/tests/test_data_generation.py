@@ -9,7 +9,15 @@ import sys
 import numpy as np
 import pytest
 
-from diffusion.data_generation import Gaussian, TwoMoons, available_shapes, make_distribution
+import itertools
+
+from diffusion.data_generation import (
+    Gaussian,
+    TwoMoons,
+    available_shapes,
+    infinite_bare,
+    make_distribution,
+)
 
 ALL_SHAPES = ["gaussian", "mixture", "two_moons", "spiral", "swiss_roll"]
 DEFAULT_DIM = {
@@ -90,6 +98,29 @@ def test_torch_helpers():
     batch = next(iter(loader))[0]
     assert batch.shape[1] == 2
     assert batch.shape[0] <= 32
+
+
+def test_infinite_bare_does_not_exhaust():
+    # Loader finito de 128 puntos en batches de 64 => 2 batches. Consumir 5
+    # veces no debe agotarse (reinicia el recorrido). (4.1, 4.3)
+    pytest.importorskip("torch")
+    dist = make_distribution("two_moons", 2, seed=0)
+    it = infinite_bare(dist.dataloader(128, batch_size=64))
+    batches = list(itertools.islice(it, 5))
+    assert len(batches) == 5
+
+
+def test_infinite_bare_yields_bare_tensor():
+    # Cada elemento es un tensor crudo (B, 2), no una tupla (x0,). (4.2)
+    torch = pytest.importorskip("torch")
+    dist = make_distribution("two_moons", 2, seed=0)
+    it = infinite_bare(dist.dataloader(128, batch_size=64))
+    for batch in itertools.islice(it, 5):
+        assert isinstance(batch, torch.Tensor)
+        assert not isinstance(batch, tuple)
+        assert batch.ndim == 2
+        assert batch.shape[1] == 2
+        assert batch.shape[0] <= 64
 
 
 def test_cli_smoke(tmp_path):

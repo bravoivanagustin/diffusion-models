@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 
 from .base import PointDistribution
+from .iterators import infinite_bare
 from .shapes import Gaussian, GaussianMixture, Spiral, SwissRoll, TwoMoons
 
 REGISTRY: dict[str, type[PointDistribution]] = {
@@ -49,6 +50,7 @@ __all__ = [
     "REGISTRY",
     "available_shapes",
     "make_distribution",
+    "infinite_bare",
     "Gaussian",
     "GaussianMixture",
     "TwoMoons",
