@@ -8,7 +8,7 @@ The project proceeds in **two phases**:
 
 **Phase 1 — 2D toy distributions with an MLP.** Train on low-dimensional synthetic data (Swiss roll, Gaussian mixtures, concentric circles). The score network is a small multi-layer perceptron built from scratch. This phase prioritizes theoretical depth: you can visualize score fields, particle trajectories, and density evolution directly in the plane, and for Gaussian mixtures you can compare the learned score against the analytically computed true score. Training takes minutes on CPU. This phase produces the theoretical core of the monograph and the most visually informative figures for the poster.
 
-**Phase 2 — Image data with a U-Net.** Scale the same SDE framework to FashionMNIST or CIFAR-10, replacing the MLP with a standard U-Net from an existing library (e.g., HuggingFace `diffusers` or Lucidrains' `denoising-diffusion-pytorch`). This phase demonstrates that the theory generalizes to real high-dimensional data and produces FID/IS benchmarks. Training takes 12–20 hours per run on a single GPU (RTX 3060).
+**Phase 2 — Image data with a U-Net.** Scale the same SDE framework to FashionMNIST or CIFAR-10, replacing the MLP with a hand-written convolutional U-Net — the `ScoreUNet` in `diffusion.models.unet`, built from scratch rather than reused from a library (decision of 2026-07-05). Like the MLP, it is deterministic (GroupNorm, no dropout) and stays fixed as the control variable across all runs. This phase demonstrates that the theory generalizes to real high-dimensional data and produces FID/IS benchmarks. Training takes 12–20 hours per run on a single GPU (RTX 3060).
 
 In both phases, the neural network is the **control variable** — the architecture and hyperparameters stay identical across all runs. The **independent variables** are the forward SDE type (Axis 1) and the reverse-process sampler (Axis 2). The **dependent variables** are sample quality, convergence behavior, and visual characteristics.
 
@@ -109,7 +109,7 @@ Input (32×32×3)                                       Output (32×32×3)
 
 Ho et al. (2020) adapted this architecture for DDPM with several additions: **timestep conditioning** (see below), **self-attention layers** at intermediate resolutions (commonly 16×16) for long-range spatial dependencies, **group normalization** instead of batch normalization for small-batch stability, and **residual connections** within each convolutional block.
 
-For this project, the U-Net is taken from an existing library (HuggingFace `diffusers` or Lucidrains' `denoising-diffusion-pytorch`) rather than built from scratch — the SDE framework around the network is where the original contribution lives.
+For this project, the U-Net is written by hand — the `ScoreUNet` in `diffusion.models.unet`, a from-scratch convolutional network implementing the encoder–decoder-with-skips design described above (deterministic: GroupNorm, no dropout, self-attention at intermediate resolutions). It is not reused from a library (decision of 2026-07-05); the network stays fixed as the control variable, and the SDE framework around it is where the original contribution lives.
 
 ### Timestep embedding (shared by both architectures)
 
@@ -344,7 +344,7 @@ The poster gets the 2D trajectory visualizations and a FID heatmap; the monograp
 |---|---|
 | 1–2 | Build the MLP, training loop, and VP-SDE forward/reverse pipeline for 2D data. Get end-to-end generation working on Swiss roll. |
 | 3–4 | Add VE-SDE, sub-VP variants. Implement all four samplers. Run the full 4×3 matrix on all three 2D datasets. Produce score-field and trajectory visualizations. |
-| 5 | Set up the U-Net (from library) and train VP-SDE on CIFAR-10 or FashionMNIST. Verify image generation works. |
+| 5 | Build the `ScoreUNet` and train VP-SDE on CIFAR-10 or FashionMNIST. Verify image generation works. |
 | 6 | Train VE-SDE and sub-VP on images. Run sampler ablation. Compute FID/IS. |
 | 7–8 | Write monograph and design poster. Buffer for re-runs or debugging. |
 

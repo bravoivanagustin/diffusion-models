@@ -31,8 +31,10 @@ independientes forman una matriz de experimentos **3×4 = 12 celdas**:
 - **Fase 1 — toy 2D + MLP (en curso).** Distribuciones 2D con una `ScoreMLP` chica que corre en CPU.
   Permite visualizar campo de score, trayectorias y densidad; para la mezcla de gaussianas se compara
   contra el **score analítico**.
-- **Fase 2 — imágenes + U-Net (no empezada).** Escalar el mismo marco a FashionMNIST / CIFAR-10
-  reusando una U-Net de librería; medir FID / IS. El dataset final de imágenes está **a definir**.
+- **Fase 2 — imágenes + U-Net (red implementada; dataset a definir).** Escalar el mismo marco a
+  FashionMNIST / CIFAR-10 con una U-Net convolucional propia (`ScoreUNet`, construida a mano —
+  decisión 05/07/2026, no se reusa una de librería); medir FID / IS. El dataset final de imágenes
+  está **a definir**.
 
 ## Propuesta de valor
 

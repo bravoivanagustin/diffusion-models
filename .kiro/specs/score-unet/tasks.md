@@ -53,7 +53,7 @@
   - _Requirements: 2.3, 4.1, 4.2, 4.3, 5.2, 5.4_
 
 - [ ] 5. Documentación del módulo y del alcance
-- [ ] 5.1 (P) Actualizar los documentos de alcance por la decisión de U-Net propia
+- [x] 5.1 (P) Actualizar los documentos de alcance por la decisión de U-Net propia
   - `docs/project/ejes.md`, `.claude/CLAUDE.md` y `.kiro/steering/product.md`: la Fase 2 construye la U-Net a mano (decisión 05/07/2026) en lugar de reusar una de librería
   - Observable: no queda ninguna mención viva a "U-Net de librería" en esos documentos (las menciones históricas de crónica/specs cerradas no se tocan)
   - _Requirements: 6.2_

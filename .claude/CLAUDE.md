@@ -5,9 +5,9 @@ Orientación para Claude Code (y cualquier sesión futura) sobre este proyecto. 
 
 > **Importante:** el proyecto ya **dejó de ser solo documentación**: hay un paquete Python
 > (`diffusion-models/`) con cinco módulos terminados y testeados (`data_generation`, `models`, `sde`,
-> `training` y `samplers`). Pero el **resto de la arquitectura todavía no existe y la decide el
-> autor**: no inventes ni armes por tu cuenta los módulos que faltan (la **evaluación /
-> visualización** de Fase 1 y la **U-Net** de Fase 2). Si se pide implementar algo,
+> `training` y `samplers`). Pero **todavía falta parte de la arquitectura y la decide el
+> autor**: no inventes ni armes por tu cuenta el módulo que falta (la **evaluación /
+> visualización** de Fase 1). Si se pide implementar algo,
 > **primero acordá el alcance y el lugar**, y construí **de a poco, con la suite de pytest en verde en
 > cada paso** (ver Convenciones).
 
@@ -27,16 +27,16 @@ El trabajo procede en **dos fases** (detalle en `docs/project/ejes.md`):
   minutos). Es el núcleo teórico: permite visualizar el campo de score, las trayectorias de
   partículas y la evolución de la densidad, y —para la mezcla de gaussianas— comparar contra el
   **score analítico**.
-- **Fase 2 — imágenes + U-Net (no empezada).** Escalar el mismo marco de SDEs a FashionMNIST /
-  CIFAR-10 reusando una **U-Net de librería** (HuggingFace `diffusers` o `denoising-diffusion-pytorch`),
-  para medir FID / IS.
+- **Fase 2 — imágenes + U-Net (red implementada; dataset a definir).** Escalar el mismo marco de SDEs
+  a FashionMNIST / CIFAR-10 con una **U-Net convolucional propia** (`ScoreUNet` en `diffusion.models.unet`,
+  construida a mano — decisión 05/07/2026), para medir FID / IS.
 
 - **Dataset:** el toy 2D ya está implementado y es la pista activa para iterar rápido en CPU. El
   **dataset final de imágenes** (gatos / CIFAR-10 / FashionMNIST) **sigue a definir**.
 - **La red es la variable de control:** sea MLP (Fase 1) o U-Net (Fase 2), es **determinística** y se
-  mantiene **fija** (misma arquitectura, mismos hiperparámetros) en todas las celdas del estudio. La
-  U-Net no se diseña: se reutiliza una existente. El MLP sí se construye desde cero (≈ unas pocas
-  capas con embedding de tiempo).
+  mantiene **fija** (misma arquitectura, mismos hiperparámetros) en todas las celdas del estudio. Ambas
+  se construyen desde cero: el MLP (≈ unas pocas capas con embedding de tiempo) y la U-Net convolucional
+  (`ScoreUNet`, GroupNorm, sin dropout).
 
 ## La idea central: un estudio de ablación controlado
 
@@ -97,7 +97,7 @@ tp-final/
     ├── scripts/              # CLIs: data_generation.py (datasets + preview), train.py (corrida YAML)
     ├── src/diffusion/
     │   ├── data_generation/   # PointDistribution (ABC) + 5 formas + registry/factory
-    │   ├── models/            # redes de score: layers.py (compartido) + mlp.py (ScoreMLP) + base.py (ScoreModel); unet.py pendiente (Fase 2)
+    │   ├── models/            # redes de score: layers.py (compartido) + mlp.py (ScoreMLP) + unet.py (ScoreUNet, Fase 2) + base.py (ScoreModel)
     │   ├── sde/               # ForwardSDE (ABC) + VP/VE/sub-VP + score_target + make_sde
     │   ├── training/          # loop de DSM: train/TrainConfig, dsm_loss, checkpoints, configs YAML
     │   └── samplers/          # ReverseSampler (ABC) + EM/PF-ODE/Heun/PC + make_sampler
@@ -114,8 +114,9 @@ tp-final/
   `diffusion.mlp`, reestructurado 05/07/2026): `layers.py` con las piezas compartidas entre redes
   (`SinusoidalEmbedding`, activaciones), `mlp.py` con `ScoreMLP` para datos 2D (**enteramente
   determinística**, sin dropout ni batchnorm, `data_dim=2` para VP/VE/sub-VP), y `base.py` con el
-  Protocol `ScoreModel` (contrato `(x, t) -> score`). La U-Net de Fase 2 se sumará como `unet.py`
-  (spec en `.kiro/specs/score-unet/`). Ver `docs/project/models.md`.
+  Protocol `ScoreModel` (contrato `(x, t) -> score`). La U-Net de Fase 2 vive en `unet.py`: `ScoreUNet`,
+  una red convolucional construida a mano (decisión 05/07/2026 — no se reusa una de librería), también
+  **determinística** (GroupNorm, sin dropout). Ver `docs/project/models.md`.
 - `diffusion.sde` — el **Eje 1**: procesos *forward* `dx=f\,dt+g\,dW` (`VPSDE`, `VESDE`, `SubVPSDE`)
   sobre la base abstracta `ForwardSDE`, con `make_sde`/`available_sdes`. Producen el par de
   entrenamiento (`perturb`) y el **target del score** (`score_target`); `data_dim` configurable en
@@ -130,7 +131,7 @@ tp-final/
   sobre VP/VE/sub-VP. Ver `docs/project/samplers.md`.
 
 **Todavía no implementado** (lo decide el autor, módulo a módulo): la **evaluación / visualización**
-de Fase 1 (campos de score, trayectorias, densidad) y la **U-Net** de Fase 2.
+de Fase 1 (campos de score, trayectorias, densidad).
 
 > **Nota (05/07/2026):** **CLD se eliminó del alcance del proyecto** (existió como cuarta SDE, con
 > HSM pendiente, y se descartó). El Eje 1 queda con VP/VE/sub-VP; no lo reintroduzcas sin pedido
@@ -171,7 +172,7 @@ correspondiente en `docs/project/`:
 - `docs/project/cronica.md` — bitácora fechada de avances (decisiones y entregas, módulo a módulo).
 - `docs/project/to-do.md` — tareas pendientes, derivadas de los "Próximos pasos" de `cronica.md`.
 - `docs/project/data_generation.md` — doc del módulo `data_generation`.
-- `docs/project/models.md` — doc del módulo `models` (las redes de score: layers compartidas + MLP; U-Net pendiente).
+- `docs/project/models.md` — doc del módulo `models` (las redes de score: layers compartidas + MLP + U-Net `ScoreUNet`).
 - `docs/project/sde.md` — doc del módulo `sde` (los procesos forward, Eje 1).
 - `docs/project/training.md` — doc del módulo `training` (el loop de DSM).
 - `docs/project/samplers.md` — doc del módulo `samplers` (el reverso, Eje 2).
