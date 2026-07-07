@@ -13,7 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from diffusion.data_generation import infinite_bare, make_distribution
-from diffusion.models import ScoreMLP, ScoreModel
+from diffusion.models import ScoreMLP, ScoreModel, make_model
 from diffusion.sde import make_sde
 from diffusion.training import (
     RunSpec,
@@ -192,30 +192,65 @@ def test_trainconfig_acotado_al_loop():
 
 
 def test_checkpoint_roundtrip(tmp_path):
-    """Guardar y recargar reconstruye la red con los mismos pesos y la misma meta.
+    """Round-trip model-agnóstico (R5-c): ``save_checkpoint`` guarda ``state_dict`` + ``meta``
+    con receta genérica ``model={name, kwargs}`` (sin campos de arquitectura hardcodeados);
+    ``load_checkpoint`` devuelve ``(state_dict, meta)`` **sin** reconstruir; y el caller
+    rearma la red con ``make_model`` + ``load_state_dict`` obteniendo la misma salida.
 
-    El contrato de checkpoint es transitorio en esta task: ``save_checkpoint`` toma la receta de
-    red de la propia red entrenada (no de ``TrainConfig``, que ya no la lleva) y ``load_checkpoint``
-    la reconstruye como ``ScoreMLP`` (se vuelve model-agnóstico en la task 3.1).
+    Usa una arquitectura NO por defecto (``hidden_dim=64``, ``num_blocks=2``) a propósito: la
+    reconstrucción debe respetar la receta, no caer en los defaults del constructor.
     """
     sde = make_sde("vp")
     dist = make_distribution("gaussian", 2, seed=0)
-    net = _small_net(sde)
+    net = _small_net(sde)  # hidden_dim=64, num_blocks=2 (no son los defaults del ScoreMLP)
     result = train(sde, net, _data(dist), _tiny_config(num_steps=2))
 
+    model_spec = {
+        "name": "mlp",
+        "kwargs": {"data_dim": sde.data_dim, "hidden_dim": 64, "num_blocks": 2},
+    }
     path = tmp_path / "ckpt.pt"
-    save_checkpoint(result, path)
-    net2, meta = load_checkpoint(path)
+    save_checkpoint(result, path, model_spec=model_spec)
 
-    assert net2.data_dim == sde.data_dim == 2
+    state_dict, meta = load_checkpoint(path)
+
+    # load_checkpoint devuelve el state_dict crudo (no una red) + la metadata (5.2).
+    assert isinstance(state_dict, dict)
+    assert "output_proj.weight" in state_dict  # es el state_dict, no un objeto red
+    # meta model-agnóstica: sde_name / data_dim / history / receta model (5.1).
     assert meta["sde_name"] == "vp"
+    assert meta["data_dim"] == sde.data_dim == 2
     assert meta["history"] == pytest.approx(result.history)
+    assert meta["model"] == model_spec
+    # Sin hiperparámetros de arquitectura hardcodeados fuera de la receta genérica.
+    assert set(meta) == {"sde_name", "data_dim", "history", "model"}
+
+    # El caller reconstruye la red con make_model (receta {name, kwargs}) y le carga los pesos.
+    recipe = meta["model"]
+    net2 = make_model(recipe["name"], **recipe["kwargs"])
+    net2.load_state_dict(state_dict)
 
     x = torch.randn(8, 2)
     t = torch.rand(8)
     result.net.eval()
+    net2.eval()
     with torch.no_grad():
         assert torch.allclose(result.net(x, t), net2(x, t))
+
+
+def test_save_checkpoint_sin_model_spec_omite_la_receta(tmp_path):
+    """Sin ``model_spec`` el checkpoint es válido pero no lleva la clave ``model`` (5.1)."""
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    result = train(sde, _small_net(sde), _data(dist), _tiny_config(num_steps=2))
+
+    path = tmp_path / "ckpt_sin_receta.pt"
+    save_checkpoint(result, path)  # sin model_spec
+    state_dict, meta = load_checkpoint(path)
+
+    assert isinstance(state_dict, dict)
+    assert "model" not in meta
+    assert set(meta) == {"sde_name", "data_dim", "history"}
 
 
 # ------------------------------------------------------------------- config

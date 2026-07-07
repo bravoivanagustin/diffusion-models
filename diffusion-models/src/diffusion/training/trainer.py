@@ -12,9 +12,12 @@ en el caller (``make_model`` / el config-driven). La **regla del Eje 1** sigue v
 de SDE = una red nueva y un entrenamiento desde cero (los samplers del Eje 2 reusan la misma
 red sin reentrenar).
 
-:func:`save_checkpoint` / :func:`load_checkpoint` guardan los pesos junto con la metadata
-mínima (nombre de la SDE, ``data_dim``, hiperparámetros de la red) para que los samplers
-puedan reconstruir la red sin el config original.
+:func:`save_checkpoint` / :func:`load_checkpoint` son **model-agnósticos** (R5-c): guardan el
+``state_dict`` de la red junto con una metadata mínima (nombre de la SDE, ``data_dim`` y una
+**receta genérica** ``model={name, kwargs}`` opcional) y devuelven ``(state_dict, meta)`` **sin
+reconstruir** la red. Es el caller quien reconstruye la red (vía ``make_model`` o una instancia
+explícita) y carga el ``state_dict`` — así el mismo checkpoint sirve al ``ScoreMLP`` y a la
+``ScoreUNet`` sin que ``training`` importe ninguna red concreta.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from ..models import ScoreMLP, ScoreModel
+from ..models import ScoreModel
 from ..sde import ForwardSDE
 from .losses import dsm_loss, sample_timesteps
 
@@ -143,65 +146,65 @@ def train(
 # ----------------------------------------------------------------- persistencia
 
 
-def save_checkpoint(result: TrainResult, path: str | pathlib.Path) -> pathlib.Path:
-    """Guarda la red entrenada y su metadata en ``path`` (``.pt`` de torch).
+def save_checkpoint(
+    result: TrainResult,
+    path: str | pathlib.Path,
+    *,
+    model_spec: dict | None = None,
+) -> pathlib.Path:
+    """Guarda la red entrenada y su metadata **model-agnóstica** en ``path`` (``.pt`` de torch).
+
+    El checkpoint es una receta portable: guarda el ``state_dict`` de la red y una ``meta``
+    sin hiperparámetros de arquitectura hardcodeados. La receta de red (``model``) es
+    **opcional** y la aporta el caller: sin ella el checkpoint sigue siendo válido, pero al
+    generar habrá que pasar una red explícita (ver :func:`load_checkpoint` y
+    :func:`diffusion.samplers.generate_from_checkpoint`).
 
     Args:
         result: Resultado de :func:`train`.
         path: Ruta de salida (se crean los directorios intermedios).
+        model_spec: Receta genérica de la red ``{"name": str, "kwargs": dict}`` para poder
+            reconstruirla vía :func:`diffusion.models.make_model`. Si es ``None`` no se guarda
+            la clave ``model`` (la red se pasa aparte al generar).
 
     Returns:
         La ruta donde se guardó (como :class:`pathlib.Path`).
     """
     out = pathlib.Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Transitorio: la receta de red ya no vive en ``TrainConfig`` (que se adelgazó), así que se
-    # lee de la propia red entrenada (un ``ScoreMLP`` expone estos atributos). ``activation`` no
-    # se guarda como atributo → default ``"silu"`` (el único valor usado). Esto conserva el
-    # formato de checkpoint byte-compatible con el ``load_checkpoint`` actual y con los samplers
-    # (se reemplaza por la receta model-agnóstica en la task 3.1).
-    net = result.net
-    blob = {
-        "model_state": net.state_dict(),
-        "meta": {
-            "sde_name": result.sde_name,
-            "data_dim": net.data_dim,
-            "model": {
-                "embed_dim": net.embed_dim,
-                "hidden_dim": net.hidden_dim,
-                "num_blocks": net.num_blocks,
-                "activation": "silu",
-            },
-            "history": list(result.history),
-        },
+    meta: dict = {
+        "sde_name": result.sde_name,
+        "data_dim": result.data_dim,  # = sde.data_dim (lo registró train); lo usa generate.py
+        "history": list(result.history),
     }
+    if model_spec is not None:
+        meta["model"] = model_spec  # receta genérica {name, kwargs}, independiente de la clase
+    blob = {"model_state": result.net.state_dict(), "meta": meta}
     torch.save(blob, out)
     return out
 
 
 def load_checkpoint(
     path: str | pathlib.Path, *, map_location: torch.device | str = "cpu"
-) -> tuple[ScoreMLP, dict]:
-    """Reconstruye la :class:`ScoreMLP` entrenada desde un checkpoint de :func:`save_checkpoint`.
+) -> tuple[dict, dict]:
+    """Carga un checkpoint de :func:`save_checkpoint` como ``(state_dict, meta)``.
+
+    **No reconstruye** ninguna red concreta (R5-c): devuelve el ``state_dict`` crudo y la
+    metadata, y es el caller quien arma la red (vía :func:`diffusion.models.make_model` con la
+    receta ``meta["model"]`` o una instancia propia) y le carga el ``state_dict``. Así
+    ``training`` no depende de ninguna clase de red.
 
     Args:
         path: Ruta del ``.pt`` guardado.
         map_location: Dispositivo donde cargar los pesos (default ``"cpu"``).
 
     Returns:
-        ``(net, meta)`` con la red en modo ``eval`` y la metadata guardada.
+        ``(state_dict, meta)``: el ``state_dict`` de la red y el ``dict`` de metadata guardado.
+
+    Raises:
+        KeyError: Si el archivo no tiene la forma de un checkpoint de :func:`save_checkpoint`
+            (faltan ``"model_state"`` o ``"meta"``).
     """
     # weights_only=False: es nuestro propio checkpoint (incluye un dict de metadata).
     blob = torch.load(path, map_location=map_location, weights_only=False)
-    meta = blob["meta"]
-    m = meta["model"]
-    net = ScoreMLP(
-        data_dim=meta["data_dim"],
-        embed_dim=m["embed_dim"],
-        hidden_dim=m["hidden_dim"],
-        num_blocks=m["num_blocks"],
-        activation=m["activation"],
-    )
-    net.load_state_dict(blob["model_state"])
-    net.eval()
-    return net, meta
+    return blob["model_state"], blob["meta"]

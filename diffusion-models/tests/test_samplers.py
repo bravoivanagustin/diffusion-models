@@ -777,19 +777,20 @@ def test_make_sampler_passes_common_kwargs():
 def _make_checkpoint(tmp_path, sde_name="vp", data_dim=2):
     """Arma un checkpoint válido SIN entrenar: red sin entrenar -> save_checkpoint.
 
-    Reusa el contrato real de :mod:`diffusion.training` (``TrainResult`` +
-    ``save_checkpoint``), de modo que ``load_checkpoint`` lo reconstruya idéntico a uno
-    producido por una corrida real. Devuelve la ruta del ``.pt`` guardado.
+    Reusa el contrato real (R5-c) de :mod:`diffusion.training` (``TrainResult`` con ``data_dim``
+    +  ``save_checkpoint`` con ``model_spec``), de modo que ``load_checkpoint`` devuelva el mismo
+    ``(state_dict, meta)`` que produciría una corrida real y ``generate_from_checkpoint``
+    reconstruya la red vía la receta ``meta["model"]``. Devuelve la ruta del ``.pt`` guardado.
     """
     ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
     from diffusion.training import TrainConfig, TrainResult, save_checkpoint
 
     net = ScoreMLP(data_dim=data_dim)
     result = TrainResult(
-        net=net, history=[1.0, 0.5], config=TrainConfig(), sde_name=sde_name
+        net=net, history=[1.0, 0.5], config=TrainConfig(), sde_name=sde_name, data_dim=data_dim
     )
     path = tmp_path / "ckpt.pt"
-    save_checkpoint(result, path)
+    save_checkpoint(result, path, model_spec={"name": "mlp", "kwargs": {"data_dim": data_dim}})
     return path
 
 
@@ -903,25 +904,24 @@ def test_generate_from_checkpoint_invalid_meta_raises(tmp_path):
 def _make_checkpoint_blob_missing_meta_key(tmp_path, missing_key, data_dim=2):
     """Arma a mano un blob que SOBREVIVE ``load_checkpoint`` pero le falta ``missing_key``.
 
-    Aísla la guarda propia de ``generate.py`` (líneas 88–95): ``load_checkpoint`` sólo
-    consume ``blob["model_state"]``, ``meta["model"]`` y ``meta["data_dim"]`` —NO toca
-    ``meta["sde_name"]``—, así que un ``meta`` con ``model``/``data_dim``/``model_state``
-    válidos pero sin ``sde_name`` carga bien y recién falla cuando ``generate_from_checkpoint``
-    lee ``meta["sde_name"]``. Esto discrimina del test ``_invalid_meta_raises`` (que ni
-    siquiera tiene la clave ``meta`` y dispara el ``KeyError("meta")`` de ``load_checkpoint``).
+    Aísla la guarda propia de ``generate.py`` (la lectura de ``meta["sde_name"]``/
+    ``meta["data_dim"]``): con el contrato R5-c ``load_checkpoint`` sólo devuelve
+    ``(state_dict, meta)`` sin tocar la metadata, así que el blob siempre "sobrevive" la carga
+    y el error aparece recién cuando ``generate_from_checkpoint`` lee la clave faltante (p. ej.
+    ``meta["sde_name"]``). Esto discrimina del test ``_invalid_meta_raises`` (que ni siquiera
+    tiene la clave ``meta`` y dispara el ``KeyError("meta")`` en ``load_checkpoint``).
 
-    El ``state_dict`` proviene de una ``ScoreMLP`` real (sin entrenar) con los mismos
-    hiperparámetros que el ``meta["model"]``, de modo que ``load_checkpoint`` reconstruya la
-    red sin error de claves de pesos.
+    El ``state_dict`` proviene de una ``ScoreMLP`` real (sin entrenar) coherente con la receta
+    ``meta["model"]`` (``{name, kwargs}``), de modo que la reconstrucción posterior no falle por
+    claves de pesos.
     """
     ScoreMLP = pytest.importorskip("diffusion.models").ScoreMLP
 
-    model_hp = {"embed_dim": 128, "hidden_dim": 256, "num_blocks": 4, "activation": "silu"}
-    net = ScoreMLP(data_dim=data_dim, **model_hp)
+    net = ScoreMLP(data_dim=data_dim)
     meta = {
         "sde_name": "vp",
         "data_dim": data_dim,
-        "model": model_hp,
+        "model": {"name": "mlp", "kwargs": {"data_dim": data_dim}},
         "history": [1.0, 0.5],
     }
     del meta[missing_key]  # quita SOLO la clave bajo prueba; el resto queda válido

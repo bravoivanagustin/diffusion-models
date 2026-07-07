@@ -51,12 +51,16 @@ class RunSpec:
 
     Lleva la red (``model``) y el iterador infinito de datos (``data``) ya construidos, listos
     para pasarle a :func:`~diffusion.training.train` (en vez de una ``distribution`` finita).
+    Además transporta ``model_spec`` —la receta ``{name, kwargs}`` con la que se construyó la
+    red— para que ``scripts/train.py`` la pase a :func:`~diffusion.training.save_checkpoint` y
+    el checkpoint quede reconstruible sin el config original.
     """
 
     sde: ForwardSDE
     model: ScoreModel
     data: Iterator
     config: TrainConfig
+    model_spec: dict | None = None  # receta {name, kwargs} para el checkpoint model-agnóstico
     checkpoint: pathlib.Path | None = None
     loss_curve: pathlib.Path | None = None
 
@@ -136,6 +140,9 @@ def build_run(raw: dict) -> RunSpec:
     model_name = model_raw.pop("name", "mlp")
     model_raw.setdefault("data_dim", sde.data_dim)  # dimensiona el default MLP desde la SDE
     model = make_model(model_name, **model_raw)
+    # Receta genérica {name, kwargs} para el checkpoint model-agnóstico: la misma con la que se
+    # construyó la red, así generate.py la reconstruye con make_model sin el config original.
+    model_spec = {"name": model_name, "kwargs": dict(model_raw)}
 
     # --- salidas ---
     out_raw = dict(raw.get("out") or {})
@@ -146,6 +153,7 @@ def build_run(raw: dict) -> RunSpec:
         model=model,
         data=data,
         config=config,
+        model_spec=model_spec,
         checkpoint=pathlib.Path(checkpoint) if checkpoint else None,
         loss_curve=pathlib.Path(loss_curve) if loss_curve else None,
     )

@@ -1,7 +1,9 @@
 """Orquestación de generación checkpoint-driven (Eje 2).
 
-Cierra el pipeline forward→score→**sampleo** desde un checkpoint entrenado: carga la red y
-su metadata (:func:`diffusion.training.load_checkpoint`), reconstruye la SDE del Eje 1
+Cierra el pipeline forward→score→**sampleo** desde un checkpoint entrenado: carga el
+``state_dict`` y la metadata (:func:`diffusion.training.load_checkpoint`), **reconstruye la
+red** desde la receta ``meta["model"]`` con :func:`diffusion.models.make_model` (o desde una
+instancia ``model=`` explícita) y le carga los pesos, reconstruye la SDE del Eje 1
 (:func:`diffusion.sde.make_sde`) y arma el sampler del Eje 2 (:func:`make_sampler`), genera
 las muestras ``x_0`` y opcionalmente las persiste en un ``.npz``.
 
@@ -25,6 +27,7 @@ import pathlib
 
 import torch
 
+from ..models import ScoreModel, make_model
 from ..sde import make_sde
 from ..training import load_checkpoint
 
@@ -39,14 +42,16 @@ def generate_from_checkpoint(
     out: str | pathlib.Path | None = None,
     save_trajectory: bool = False,
     map_location: str = "cpu",
+    model: ScoreModel | None = None,
     **sampler_kwargs,
 ) -> torch.Tensor:
     """Genera muestras ``x_0`` a partir de un checkpoint entrenado y opcionalmente las guarda.
 
-    Reconstruye la SDE y la red desde la metadata del checkpoint (``sde_name``, ``data_dim``,
-    hiperparámetros de red), arma el sampler ``sampler_name`` con la factory e integra el
-    proceso reverso. No reentrena ni muta la red (Eje 2): la pone en ``eval`` y la consume
-    como función pura ``(x, t) -> score``.
+    Reconstruye la SDE desde la metadata (``sde_name``, ``data_dim``) y la **red** desde la
+    receta ``meta["model"]`` con :func:`diffusion.models.make_model` (o desde ``model=`` si el
+    checkpoint no trae receta), le carga el ``state_dict``, arma el sampler ``sampler_name`` con
+    la factory e integra el proceso reverso. No reentrena ni muta la red (Eje 2): la pone en
+    ``eval`` y la consume como función pura ``(x, t) -> score``.
 
     Args:
         checkpoint_path: Ruta del ``.pt`` producido por
@@ -63,6 +68,9 @@ def generate_from_checkpoint(
         save_trajectory: Si es ``True``, captura la trayectoria de integración y la incluye
             en la salida (y en el ``.npz`` si ``out`` se provee).
         map_location: Dispositivo donde cargar los pesos del checkpoint (default ``"cpu"``).
+        model: Red de score ya construida a la que cargarle los pesos. Solo se usa cuando el
+            checkpoint **no** trae la receta ``meta["model"]``; si la trae, la red se
+            reconstruye con :func:`~diffusion.models.make_model` y este argumento se ignora.
         **sampler_kwargs: Parámetros extra del sampler elegido (p. ej. ``t_eps``; para
             ``"pc"`` también ``n_corrector``/``snr``); los no aplicables se descartan.
 
@@ -74,7 +82,9 @@ def generate_from_checkpoint(
         KeyError: Si el checkpoint carece de las claves esperadas en su metadata
             (``sde_name``/``data_dim``); el contrato lo provee
             :func:`diffusion.training.save_checkpoint`.
-        ValueError: Si ``sampler_name`` no está en el registry (lista las opciones válidas).
+        ValueError: Si ``sampler_name`` no está en el registry (lista las opciones válidas), o
+            si el checkpoint no trae receta de red (``meta["model"]``) **y** tampoco se pasó
+            ``model=`` (no hay con qué reconstruir la red).
     """
     # Import diferido para evitar cualquier ciclo de import durante la inicialización del
     # paquete (``__init__`` importa este módulo; ``make_sampler`` vive en ``__init__``).
@@ -84,7 +94,7 @@ def generate_from_checkpoint(
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint inexistente: {path}")
 
-    net, meta = load_checkpoint(path, map_location=map_location)
+    state_dict, meta = load_checkpoint(path, map_location=map_location)
     try:
         sde_name = meta["sde_name"]
         data_dim = meta["data_dim"]
@@ -93,6 +103,23 @@ def generate_from_checkpoint(
             f"Checkpoint inválido en {path}: la metadata no tiene las claves esperadas "
             "('sde_name', 'data_dim'). ¿Se guardó con diffusion.training.save_checkpoint?"
         ) from exc
+
+    # Reconstrucción de la red (R5-c): con la receta genérica {name, kwargs} vía make_model, o
+    # con la instancia explícita ``model=`` si el checkpoint no la trae. make_model recibe el
+    # nombre posicional y los kwargs desempaquetados (su firma es ``make_model(name, **kwargs)``).
+    recipe = meta.get("model") if isinstance(meta, dict) else None
+    if recipe is not None:
+        net = make_model(recipe["name"], **recipe["kwargs"])
+        net.load_state_dict(state_dict)
+    elif model is not None:
+        net = model
+        net.load_state_dict(state_dict)
+    else:
+        raise ValueError(
+            f"Checkpoint en {path} sin receta de red (meta['model']) y no se pasó `model=`: "
+            "no hay con qué reconstruir la red. Guardá el checkpoint con `model_spec=` "
+            "(el camino config-driven lo hace) o pasá una red vía `model=`."
+        )
 
     net.eval()
     sde = make_sde(sde_name, data_dim=data_dim)

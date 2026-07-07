@@ -100,7 +100,7 @@ def main(argv=None) -> int:
     )
 
     if spec.checkpoint:
-        save_checkpoint(result, spec.checkpoint)
+        save_checkpoint(result, spec.checkpoint, model_spec=spec.model_spec)
         print(f"Checkpoint -> {spec.checkpoint}")
     if spec.loss_curve:
         save_loss_curve(
