@@ -58,7 +58,7 @@
   - Observable: no queda ninguna mención viva a "U-Net de librería" en esos documentos (las menciones históricas de crónica/specs cerradas no se tocan)
   - _Requirements: 6.2_
   - _Boundary: docs de alcance (ejes.md, CLAUDE.md, product.md)_
-- [ ] 5.2 (P) Documentar la red en la doc del módulo
+- [x] 5.2 (P) Documentar la red en la doc del módulo
   - Sección de la U-Net en `docs/project/models.md`: contrato, piezas, arquitectura de referencia (defaults), cómo correr el smoke, y la nota explícita de que la mitigación de memorización (flip horizontal + EMA) vive fuera de la red, en el entrenamiento futuro de Fase 2
   - Observable: `models.md` describe la red entregada y el árbol de archivos ya no la lista como pendiente
   - _Requirements: 6.1, 6.3_
