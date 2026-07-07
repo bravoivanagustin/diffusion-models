@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .layers import SinusoidalEmbedding, _make_activation
 
@@ -160,3 +161,132 @@ class ConvResBlock(nn.Module):
         h = h + self.time_proj(t_emb)[:, :, None, None]
         h = self.conv2(self.act2(self.norm2(h)))        # (B, out_channels, H, W)
         return h + self.skip(x)
+
+
+class AttentionBlock(nn.Module):
+    """Auto-atención espacial *single-head* con conexión residual.
+
+    Deja que cada posición espacial atienda a todas las demás del mapa de
+    características, capturando dependencias de largo alcance que la convolución
+    (con su campo receptivo local) no alcanza. En la U-Net se coloca en las
+    resoluciones bajas (16×16 y el bottleneck), donde el número de tokens
+    ``H·W`` es manejable. El flujo es::
+
+        GroupNorm -> proyección QKV (conv 1x1) -> scaled_dot_product_attention
+                  -> proyección de salida (conv 1x1) -> + skip
+
+    La proyección QKV es una única convolución ``1x1`` que produce ``3·C``
+    canales, partidos luego en las tres matrices ``Q``, ``K`` y ``V``; cada mapa
+    ``(B, C, H, W)`` se aplana a ``(B, H·W, C)`` para tratar las ``H·W``
+    posiciones como una secuencia de tokens de dimensión ``C`` (una sola
+    cabeza). :func:`torch.nn.functional.scaled_dot_product_attention` calcula la
+    atención escalada por ``1/sqrt(C)`` y es determinística en CPU (float32), en
+    línea con la red como variable de control. La convolución ``1x1`` de salida
+    reproyecta el resultado y se suma a la entrada (skip identidad), por lo que el
+    bloque **preserva la shape** ``(B, C, H, W)``. La normalización es
+    :class:`~torch.nn.GroupNorm`: no hay dropout ni batchnorm.
+    """
+
+    def __init__(self, channels: int, groups: int = 8) -> None:
+        """Inicializa el bloque de atención.
+
+        Args:
+            channels: Canales del tensor de entrada y de salida (se conservan).
+            groups: Grupos de la capa :class:`~torch.nn.GroupNorm`; debe dividir
+                a ``channels``.
+        """
+        super().__init__()
+        self.channels = int(channels)
+
+        self.norm = nn.GroupNorm(groups, channels)
+        # Proyección conjunta a Q, K, V (3 x channels), luego se parte en 3.
+        self.to_qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
+        self.proj_out = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Aplica la auto-atención espacial con conexión residual.
+
+        Args:
+            x: Tensor de shape ``(B, channels, H, W)``.
+
+        Returns:
+            Tensor de shape ``(B, channels, H, W)`` (misma shape que la entrada).
+        """
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        # (B, 3C, H, W) -> tres mapas (B, C, H, W).
+        q, k, v = self.to_qkv(h).chunk(3, dim=1)
+        # Aplanar a tokens: (B, C, H, W) -> (B, H*W, C).
+        q = q.reshape(B, C, H * W).transpose(1, 2)
+        k = k.reshape(B, C, H * W).transpose(1, 2)
+        v = v.reshape(B, C, H * W).transpose(1, 2)
+        # Atención single-head sobre los H*W tokens (escala 1/sqrt(C) interna).
+        attn = F.scaled_dot_product_attention(q, k, v)   # (B, H*W, C)
+        # De vuelta al mapa espacial: (B, H*W, C) -> (B, C, H, W).
+        attn = attn.transpose(1, 2).reshape(B, C, H, W)
+        return x + self.proj_out(attn)
+
+
+class Downsample(nn.Module):
+    """Reducción espacial ×2 por convolución ``3x3`` con stride 2.
+
+    Divide ``H`` y ``W`` por 2 aprendiendo el submuestreo (a diferencia de un
+    pooling fijo), manteniendo el número de canales. Con ``kernel_size=3``,
+    ``stride=2`` y ``padding=1``, una resolución par ``H`` pasa a ``H/2``.
+    """
+
+    def __init__(self, channels: int) -> None:
+        """Inicializa la reducción.
+
+        Args:
+            channels: Canales del tensor de entrada y de salida (se conservan).
+        """
+        super().__init__()
+        self.channels = int(channels)
+        self.conv = nn.Conv2d(
+            channels, channels, kernel_size=3, stride=2, padding=1
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Reduce la resolución espacial a la mitad.
+
+        Args:
+            x: Tensor de shape ``(B, channels, H, W)`` con ``H`` y ``W`` pares.
+
+        Returns:
+            Tensor de shape ``(B, channels, H // 2, W // 2)``.
+        """
+        return self.conv(x)
+
+
+class Upsample(nn.Module):
+    """Ampliación espacial ×2 por interpolación *nearest* + convolución ``3x3``.
+
+    Duplica ``H`` y ``W`` con interpolación al vecino más cercano y luego suaviza
+    el resultado con una convolución ``3x3`` (``padding=1``, preserva la
+    resolución) que además aprende a atenuar los artefactos de bloque. Separar el
+    reescalado de la convolución evita el *checkerboard* típico de la
+    convolución transpuesta. El número de canales se conserva.
+    """
+
+    def __init__(self, channels: int) -> None:
+        """Inicializa la ampliación.
+
+        Args:
+            channels: Canales del tensor de entrada y de salida (se conservan).
+        """
+        super().__init__()
+        self.channels = int(channels)
+        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Amplía la resolución espacial al doble.
+
+        Args:
+            x: Tensor de shape ``(B, channels, H, W)``.
+
+        Returns:
+            Tensor de shape ``(B, channels, H * 2, W * 2)``.
+        """
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.conv(x)

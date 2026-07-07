@@ -11,7 +11,7 @@
   - Skip identidad si los canales coinciden, proyección 1×1 si no; sin dropout ni batchnorm
   - Observable: forward `(B, C_in, H, W)` + vector temporal → `(B, C_out, H, W)`, y dos tiempos distintos producen salidas distintas
   - _Requirements: 1.4, 3.2, 3.3_
-- [ ] 1.3 Crear la atención espacial y los cambios de resolución
+- [x] 1.3 Crear la atención espacial y los cambios de resolución
   - Atención single-head: normalización por grupos, proyecciones QKV por convolución 1×1, `scaled_dot_product_attention` sobre los H·W tokens, proyección de salida + residual
   - Reducción por convolución 3×3 stride 2; ampliación por nearest ×2 + convolución 3×3
   - Observable: la atención preserva la shape de entrada; la reducción divide H y W por 2 y la ampliación los duplica
