@@ -30,7 +30,7 @@
   - Observable: cada condición inválida levanta `ValueError` con mensaje que nombra la restricción y el valor recibido (esperado vs recibido)
   - _Requirements: 2.3, 4.3_
 
-- [ ] 3. Integración: smoke ejecutable y export público
+- [x] 3. Integración: smoke ejecutable y export público
   - Bloque de smoke manual: instancia la red con defaults, corre un forward con `(2, 3, 64, 64)`, reporta la shape de salida y el conteo de parámetros entrenables
   - Re-export de la red en el paquete de redes (docstring y `__all__` actualizados); la red satisface el contrato estructural del módulo sin heredar de él
   - Observable: `python -m diffusion.models.unet` imprime shape `(2, 3, 64, 64)` y el conteo; `from diffusion.models import ScoreUNet` funciona

@@ -549,3 +549,17 @@ class ScoreUNet(nn.Module):
         # Cabeza de salida sin activación final.
         h = self.out_act(self.out_norm(h))
         return self.conv_out(h)
+
+
+if __name__ == "__main__":
+    # Smoke test manual: instancia la red, corre un forward y reporta tamaños.
+    # Correr (con diffusion-models/src en PYTHONPATH): python -m diffusion.models.unet
+    # (los imports relativos exigen ejecutarlo como módulo, no como script suelto).
+    net = ScoreUNet()
+    x = torch.randn(2, 3, 64, 64)
+    t = torch.rand(2)
+    out = net(x, t)
+    print(f"ScoreUNet(in_channels=3, image_size=64): salida {tuple(out.shape)}")
+
+    n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"Parámetros entrenables: {n_params:,}")
