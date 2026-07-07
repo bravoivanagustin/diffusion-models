@@ -382,6 +382,28 @@ class ScoreUNet(nn.Module):
         self.attn_resolutions = tuple(int(r) for r in attn_resolutions)
         self.groups = int(groups)
 
+        # --- Validaciones fail-fast (antes de construir sub-módulos, para cortar
+        # con un mensaje propio y no con un error críptico de torch más abajo). ---
+        # image_size debe soportar los len(channel_mults) - 1 Downsample (uno por
+        # nivel salvo el último): cada uno divide la resolución por 2.
+        reduction = 2 ** (len(self.channel_mults) - 1)
+        if self.image_size % reduction != 0:
+            raise ValueError(
+                f"image_size debe ser divisible por {reduction} "
+                f"(= 2**(len(channel_mults)-1), un Downsample por nivel salvo el "
+                f"último); recibí image_size={self.image_size}"
+            )
+        # groups debe dividir a todos los anchos de canal base_channels*m que
+        # normaliza GroupNorm; se reporta el primer nivel infractor y su ancho.
+        for level, mult in enumerate(self.channel_mults):
+            width = self.base_channels * mult
+            if width % self.groups != 0:
+                raise ValueError(
+                    f"groups debe dividir a todos los anchos de canal; en el nivel "
+                    f"{level} el ancho es base_channels*{mult}={width}, no divisible "
+                    f"por groups={self.groups}"
+                )
+
         num_levels = len(self.channel_mults)
         attn_set = set(self.attn_resolutions)
 
@@ -486,7 +508,25 @@ class ScoreUNet(nn.Module):
         Returns:
             Score predicho de shape ``(B, in_channels, image_size, image_size)`` (la
             misma shape y dtype que ``x``), sin activación final.
+
+        Raises:
+            ValueError: Si ``x`` no tiene alto y ancho iguales a ``image_size`` (la
+                arquitectura quedó fijada en construcción) o si su número de canales
+                no coincide con ``in_channels``.
         """
+        # --- Validaciones fail-fast del tensor de entrada. ---
+        if x.shape[-2] != self.image_size or x.shape[-1] != self.image_size:
+            raise ValueError(
+                f"x debe tener alto y ancho iguales a image_size={self.image_size} "
+                f"(la arquitectura quedó fijada en construcción); recibí "
+                f"(H, W)=({x.shape[-2]}, {x.shape[-1]})"
+            )
+        if x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"x debe tener in_channels={self.in_channels} canales; "
+                f"recibí {x.shape[1]}"
+            )
+
         t_emb = self.time_mlp(t)               # (B, time_embed_dim)
 
         # Encoder: guarda cada activación como skip (empezando por conv_in).

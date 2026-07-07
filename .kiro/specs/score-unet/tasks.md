@@ -24,7 +24,7 @@
   - Decoder espejo con skips concatenados por canales; salida final normalización + activación + convolución a los canales de entrada, sin activación final
   - Observable: forward `(2, 3, 64, 64)` + `(2,)` con defaults devuelve `(2, 3, 64, 64)` en float32 con valores finitos y de ambos signos
   - _Requirements: 1.1, 1.5, 2.1, 2.2, 4.1, 4.2_
-- [ ] 2.2 Implementar las validaciones fail-fast
+- [x] 2.2 Implementar las validaciones fail-fast
   - En construcción: resolución de trabajo divisible por el factor total de reducción; grupos dividen a todos los anchos de canal; activación conocida y dimensión de embedding par (reusando los errores de las piezas compartidas)
   - En forward: alto y ancho iguales a la resolución de trabajo; canales de entrada correctos
   - Observable: cada condición inválida levanta `ValueError` con mensaje que nombra la restricción y el valor recibido (esperado vs recibido)
