@@ -277,7 +277,11 @@ def test_scoreunet_no_stochastic_layers():
 def test_scoreunet_batch_independence():
     # Contrato 3.3: una misma muestra evaluada sola o dentro de un batch da salidas
     # numéricamente equivalentes (la normalización no depende del resto del batch).
-    # No es bitwise en CPU float32 (~6e-07 por paralelización de convs); allclose(atol=1e-6).
+    # No es bitwise en CPU float32 (~6e-07 por paralelización de convs); se usa
+    # allclose con margen (atol=1e-5) y seed fijo para que el test sea determinístico
+    # (sin seed, el ~6e-07 rozaba 1e-6 y el test era flaky). Un acople real del batch
+    # produce diferencias mucho mayores (~1e-2), así que 1e-5 sigue detectándolo.
+    torch.manual_seed(0)
     net = _tiny_unet().eval()
     x_single = torch.randn(1, 3, 32, 32)
     t_single = torch.rand(1)
@@ -287,7 +291,7 @@ def test_scoreunet_batch_independence():
     with torch.no_grad():
         out_single = net(x_single, t_single)
         out_batch = net(x_batch, t_batch)
-    assert torch.allclose(out_single, out_batch[0:1], atol=1e-6)
+    assert torch.allclose(out_single, out_batch[0:1], atol=1e-5)
 
 
 def test_scoreunet_gradients_flow():
