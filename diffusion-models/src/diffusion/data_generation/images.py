@@ -17,7 +17,7 @@ torch diferido del core de puntos (ver :mod:`diffusion.data_generation.base`).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -192,6 +192,120 @@ def _build_cat_images_class() -> type:
             return self.transform(image)
 
     return CatImages
+
+
+def _infinite(loader) -> Iterator[torch.Tensor]:
+    """Recorre un ``DataLoader`` finito en bucle y yield-ea el batch crudo.
+
+    Convierte un ``DataLoader`` finito de imágenes en un iterador que **nunca se
+    agota**: al terminar de recorrer el loader vuelve a empezar (``while True:
+    yield from loader``). A diferencia de :func:`infinite_bare` —que desempaqueta
+    la 1-tupla ``(x0,)`` de las fuentes 2D—, acá se yield-ea el tensor batcheado
+    **pelado** tal cual lo produce el collate por defecto sobre los tensores
+    pelados de :class:`CatImages` (un ``(B, 3, H, W)``, no una tupla).
+
+    No altera el ``loader``; solo lo envuelve.
+
+    Args:
+        loader: ``DataLoader`` (u otro iterable) que yield-ea tensores batcheados
+            pelados ``(B, 3, H, W)``.
+
+    Yields:
+        El tensor batcheado crudo de cada paso, indefinidamente.
+    """
+    while True:
+        yield from loader
+
+
+def infinite_batches(
+    root: str | Path,
+    batch_size: int,
+    *,
+    image_size: int = 64,
+    augment: bool = True,
+    crop: bool = True,
+    num_workers: int = 0,
+    shuffle: bool = True,
+    seed: int | None = None,
+    pin_memory: bool = False,
+) -> Iterator[torch.Tensor]:
+    """Fuente infinita de batches de imágenes, drop-in para el ``data`` de ``train``.
+
+    Arma el :class:`CatImages` sobre ``root`` con la cadena de transforms de
+    :func:`_build_transform`, lo envuelve en un ``DataLoader`` (con ``shuffle``,
+    ``drop_last=True`` para que **todos** los batches tengan tamaño exacto, y un
+    ``generator`` sembrado desde ``seed`` para barajado reproducible) y lo entrega
+    a través de un wrapper infinito (:func:`_infinite`). El iterador resultante
+    **nunca se agota**: cada ``next()`` devuelve un tensor batcheado **pelado**
+    ``(batch_size, 3, image_size, image_size)`` float32 en ``[-1, 1]`` (no una
+    tupla), que es exactamente el contrato de ``data`` que consume el ``train``
+    genérico.
+
+    **Fail-fast:** los errores cortan **antes** de construir el iterador (esta
+    función no es un generador, así que su cuerpo corre en la llamada). Si ``root``
+    no existe o no tiene imágenes, :class:`CatImages` levanta ``ValueError`` al
+    construirse; si hay imágenes pero son menos que ``batch_size``, se levanta
+    ``ValueError`` acá —porque con ``drop_last=True`` el loader quedaría vacío y el
+    ``while True`` del wrapper giraría sin yield-ear nunca (cuelgue silencioso).
+
+    Los imports de ``torch`` y torchvision (vía :func:`_build_transform`) son
+    **diferidos**, en línea con el resto del módulo.
+
+    Args:
+        root: Carpeta raíz con las imágenes (se recorre recursivamente).
+        batch_size: Cantidad de imágenes por batch; todos los batches salen con
+            exactamente este tamaño (``drop_last=True``).
+        image_size: Lado del cuadrado de salida en píxeles; cada batch tiene shape
+            ``(batch_size, 3, image_size, image_size)``.
+        augment: Si es ``True``, la cadena aplica volteo horizontal aleatorio
+            (ver :func:`_build_transform`); si es ``False``, sin augmentation.
+        crop: Modo de encuadre. ``True`` (por defecto) preserva aspect ratio
+            (``Resize`` del lado corto + ``CenterCrop``); ``False`` deforma con
+            ``Resize((image_size, image_size))`` sin recortar.
+        num_workers: Cantidad de procesos de carga del ``DataLoader`` (``0`` corre
+            en el proceso principal; funciona en CPU).
+        shuffle: Si es ``True``, baraja las imágenes en cada recorrido interno.
+        seed: Semilla del ``torch.Generator`` que gobierna el barajado. Con
+            ``seed`` fijo, ``augment=False`` y ``num_workers=0`` la secuencia de
+            batches es reproducible. Si es ``None``, el barajado usa el RNG global.
+        pin_memory: Se pasa tal cual al ``DataLoader`` (útil solo con GPU).
+
+    Returns:
+        Un iterador infinito de tensores ``(batch_size, 3, image_size,
+        image_size)`` float32 en ``[-1, 1]`` (tensores pelados, sin tupla).
+
+    Raises:
+        ValueError: Si ``root`` no existe, no contiene imágenes, o contiene menos
+            de ``batch_size`` imágenes (fail-fast, antes de devolver el iterador).
+    """
+    import torch
+
+    transform = _build_transform(image_size, augment, crop)
+    dataset = _build_cat_images_class()(root, transform)
+
+    n_images = len(dataset)
+    if n_images < batch_size:
+        raise ValueError(
+            f"La carpeta {Path(root)!s} tiene {n_images} imagen(es), menos que "
+            f"batch_size={batch_size}: con drop_last=True el loader quedaría "
+            f"vacío y el iterador infinito no entregaría ningún batch."
+        )
+
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        generator=generator,
+    )
+    return _infinite(loader)
 
 
 def __getattr__(name: str):
