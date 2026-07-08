@@ -308,6 +308,61 @@ def infinite_batches(
     return _infinite(loader)
 
 
+def report_small_images(
+    root: str | Path,
+    *,
+    min_size: int = 64,
+    verbose: bool = False,
+) -> list[Path]:
+    """Reporta (sin borrar) las imágenes cuyo lado corto es menor que ``min_size``.
+
+    Chequeo de higiene **report-only** y **separado del flujo de carga** (no corre
+    en cada batch ni lo dispara :func:`infinite_batches`): recorre las imágenes
+    descubiertas bajo ``root`` y devuelve las que tienen ``min(width, height) <
+    min_size``. El **lado corto** es el criterio relevante porque es el que el
+    ``Resize`` del pipeline escalaría *hacia arriba* (upscale): una imagen con el
+    lado corto por debajo de ``min_size`` entra al modelo borrosa y degrada la
+    calidad de las muestras.
+
+    **No borra ni modifica ningún archivo**: solo lee las dimensiones (con PIL, sin
+    decodificar los píxeles) y devuelve la lista de rutas problemáticas para que el
+    autor decida qué descartar. **No** implementa detección de duplicados: esa
+    responsabilidad es de ``scripts/limpiar_imagenes.py``.
+
+    El import de ``PIL`` es **diferido** (dentro de la función), en línea con el
+    resto del módulo.
+
+    Args:
+        root: Carpeta raíz con las imágenes (se recorre recursivamente, igual que
+            en la carga).
+        min_size: Umbral en píxeles para el lado corto; se reporta toda imagen con
+            ``min(width, height) < min_size``. Por defecto ``64`` (el ``image_size``
+            habitual de la Fase 2).
+        verbose: Si es ``True``, imprime cada ruta reportada con sus dimensiones; si
+            es ``False`` (por defecto), solo devuelve la lista sin imprimir nada.
+
+    Returns:
+        Lista ordenada de rutas (:class:`pathlib.Path`) a las imágenes con el lado
+        corto por debajo de ``min_size`` (subconjunto del orden determinístico de
+        :func:`_discover_image_paths`). Lista vacía si no hay ninguna.
+
+    Raises:
+        ValueError: Si ``root`` no existe o no contiene ninguna imagen (delegado a
+            :func:`_discover_image_paths`).
+    """
+    from PIL import Image
+
+    small: list[Path] = []
+    for path in _discover_image_paths(root):
+        with Image.open(path) as img:
+            width, height = img.size
+        if min(width, height) < min_size:
+            small.append(path)
+            if verbose:
+                print(f"  too-small: {path.name} ({width}x{height})")
+    return small
+
+
 def __getattr__(name: str):
     """Resuelve ``CatImages`` de forma perezosa (PEP 562).
 
@@ -330,3 +385,33 @@ def __getattr__(name: str):
         globals()["CatImages"] = cls
         return cls
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+if __name__ == "__main__":
+    # Smoke test manual: carga las 2 imágenes reales de data/cats-prueba/, arma un
+    # batch y verifica el contrato de salida (shape + rango ~[-1, 1]); después corre
+    # el chequeo de higiene report-only sobre la misma carpeta. Correr como módulo
+    # (imports diferidos):  python -m diffusion.data_generation.images
+    # (con diffusion-models/src en PYTHONPATH).
+    import torch
+
+    # images.py está en src/diffusion/data_generation/; parents[3] es diffusion-models/.
+    cats_prueba = Path(__file__).resolve().parents[3] / "data" / "cats-prueba"
+
+    batch = next(infinite_batches(cats_prueba, batch_size=2, image_size=64))
+    assert tuple(batch.shape) == (2, 3, 64, 64), (
+        f"shape inesperada: {tuple(batch.shape)}"
+    )
+    assert batch.dtype == torch.float32, f"dtype inesperado: {batch.dtype}"
+    lo, hi = float(batch.min()), float(batch.max())
+    assert -1.01 <= lo and hi <= 1.01, f"rango fuera de ~[-1, 1]: [{lo:.3f}, {hi:.3f}]"
+    print(
+        f"infinite_batches(cats-prueba, batch_size=2): batch {tuple(batch.shape)} "
+        f"{batch.dtype}, rango [{lo:.3f}, {hi:.3f}]"
+    )
+
+    small = report_small_images(cats_prueba, min_size=64)
+    print(
+        f"report_small_images(min_size=64): {len(small)} imagen(es) demasiado "
+        f"chica(s) (report-only, no se borra ninguna)"
+    )
