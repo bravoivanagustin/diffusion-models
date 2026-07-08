@@ -65,6 +65,66 @@ def _discover_image_paths(root: str | Path) -> list[Path]:
     return paths
 
 
+def _build_transform(
+    image_size: int,
+    augment: bool,
+    crop: bool = True,
+) -> Callable[..., torch.Tensor]:
+    """Arma la cadena de transforms PIL→tensor ``(3, image_size, image_size)``.
+
+    Devuelve un ``torchvision.transforms.Compose`` que lleva una ``PIL.Image``
+    RGB a un ``torch.Tensor`` float32 de shape ``(3, image_size, image_size)`` con
+    valores en ``[-1, 1]``. El orden de la cadena es: (flip opcional) → encuadre →
+    ``ToTensor`` → ``Normalize``.
+
+    - **Augmentation:** si ``augment`` es ``True`` se antepone
+      ``RandomHorizontalFlip(p=0.5)`` (volteo **solo horizontal**). La cadena
+      **nunca** incluye volteos verticales ni rotaciones: un gato al revés no es
+      una muestra válida de la distribución.
+    - **Encuadre (framing) configurable:** con ``crop=True`` (por defecto) se
+      preserva el aspect ratio — ``Resize(image_size)`` escala el lado corto a
+      ``image_size`` y ``CenterCrop(image_size)`` recorta el centro al cuadrado.
+      Con ``crop=False`` se usa ``Resize((image_size, image_size))``, que deforma
+      la imagen al cuadrado sin recortar.
+    - **Normalización a ``[-1, 1]``:** ``ToTensor`` lleva la imagen a float32 en
+      ``[0, 1]`` (canales primero) y ``Normalize([0.5]*3, [0.5]*3)`` la recentra a
+      ``[-1, 1]``.
+
+    El import de ``torchvision`` es **diferido** (dentro de la función), en línea
+    con el criterio del resto del módulo: ``import diffusion.data_generation`` no
+    debe arrastrar torchvision.
+
+    Args:
+        image_size: Lado del cuadrado de salida en píxeles; la imagen resultante
+            tiene shape ``(3, image_size, image_size)``.
+        augment: Si es ``True``, antepone el volteo horizontal aleatorio
+            (``RandomHorizontalFlip(p=0.5)``); si es ``False``, la cadena no
+            incluye ningún volteo.
+        crop: Modo de encuadre. ``True`` (por defecto) preserva el aspect ratio
+            (``Resize`` del lado corto + ``CenterCrop``); ``False`` deforma con
+            ``Resize((image_size, image_size))`` sin recortar.
+
+    Returns:
+        Un ``torchvision.transforms.Compose`` que mapea una ``PIL.Image`` RGB a un
+        ``torch.Tensor`` ``(3, image_size, image_size)`` float32 en ``[-1, 1]``.
+    """
+    from torchvision import transforms
+
+    steps: list[Callable[..., object]] = []
+    if augment:
+        steps.append(transforms.RandomHorizontalFlip(p=0.5))
+    if crop:
+        # Preserva aspect ratio: escala el lado corto y recorta el centro.
+        steps.append(transforms.Resize(image_size))
+        steps.append(transforms.CenterCrop(image_size))
+    else:
+        # Deforma al cuadrado sin recortar (encuadre no configurable a mano).
+        steps.append(transforms.Resize((image_size, image_size)))
+    steps.append(transforms.ToTensor())
+    steps.append(transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]))
+    return transforms.Compose(steps)
+
+
 def _build_cat_images_class() -> type:
     """Construye la clase :class:`CatImages` importando torch de forma diferida.
 
