@@ -39,3 +39,9 @@ Reestructurar la red de score en un subpaquete `diffusion/models/` que separe la
 ## Specs (dependency order)
 
 - [x] score-unet — ScoreUNet convolucional escrita a mano en `models/unet.py` (bloque residual conv con inyección de tiempo, self-attention en 16×16, down/upsampling, encoder + bottleneck + decoder con skips). Dependencies: models-restructure (item directo, debe completarse antes)
+
+## Fase 2 — Entrenamiento agnóstico a la red (07/07/2026)
+
+Con `ScoreUNet` entregada, el siguiente paso es que el loop de entrenamiento pueda usarla (hoy `train()` clava `ScoreMLP`). Se abre una spec para desacoplar `train()` de la construcción de la red y pasar a un loop por pasos sobre un iterador infinito. Decisiones de frontera (discovery 07/07/2026, ambas del lado sin regresión): (1) checkpoints se vuelven **model-agnósticos** en esta spec (`save` guarda `state_dict`+`sde_name`+`history`; `load` devuelve `(state_dict, meta)` y el caller reconstruye), actualizando `samplers/generate.py`; (2) el front-end config-driven (`build_run`/`RunSpec`/`scripts/train.py`/YAML) se **actualiza** en esta spec para seguir andando. Fuera: pipeline de imágenes / `infinite_batches` (dataset a definir) y EMA (paso posterior).
+
+- [x] train-decoupling — `train(sde, model, data, config)`: recibe la red ya construida (`ScoreModel`) y un iterador infinito de tensores crudos; loop por pasos (`num_steps`); `TrainConfig` sin hiperparámetros de red/dataset; adaptador `infinite_bare` en `data_generation`; checkpoints model-agnósticos + config-driven actualizado. Dependencies: score-unet (provee `ScoreUNet`/`ScoreModel`; ya completa)
