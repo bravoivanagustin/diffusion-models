@@ -1,0 +1,22 @@
+{
+  "feature_name": "nd-shapes",
+  "created_at": "2026-07-09T13:37:44Z",
+  "updated_at": "2026-07-09T14:01:58Z",
+  "language": "es",
+  "phase": "tasks-generated",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  },
+  "ready_for_implementation": true
+}
