@@ -26,9 +26,12 @@ def main() -> None:
         net = ScoreMLP(data_dim=sde.data_dim, hidden_dim=64, num_blocks=2)
         data = infinite_bare(dist.dataloader(512, 128, shuffle=True))
         result = train(sde, net, data, config)
+        hist = result.history
+        k = max(1, len(hist) // 10)  # medias de extremos: la pérdida per-step es ruidosa
+        ini, fin = sum(hist[:k]) / k, sum(hist[-k:]) / k
         print(
             f"{name:7s} data_dim={sde.data_dim}  "
-            f"pérdida inicial={result.history[0]:.4f} -> final={result.history[-1]:.4f}"
+            f"pérdida inicial~{ini:.4f} -> final~{fin:.4f}"
         )
 
 

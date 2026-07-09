@@ -129,3 +129,122 @@ Este documento contiene el historial del projecto. Aca se suben creaciones, modi
 **Follow-ups:**
 - Re-ejecutar los notebooks 01 y 02: los outputs guardados siguen mostrando la lista de SDEs con `cld` y un traceback de la era HSM (las celdas de código están limpias).
 - Módulo de **evaluación / visualización** de Fase 1 (campos de score, trayectorias, densidad, comparación con el score analítico de la mezcla; FID/IS en Fase 2). Los samplers ya exponen `return_trajectory`.
+
+### 06/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Reestructura de la red de score: `diffusion.mlp` pasa al subpaquete `diffusion.models` (`layers.py` compartido + `mlp.py` + `base.py` con el Protocol `ScoreModel`), como base limpia para la U-Net de Fase 2. Refactor puro, sin cambio de comportamiento.
+
+**Contexto:** Antes de escribir la U-Net convolucional de Fase 2 hacía falta separar las piezas compartidas entre redes de las específicas de cada una (el módulo `mlp` mezclaba el embedding de tiempo reusable con el MLP concreto). Se decidió partir el trabajo en dos pasos que no se pisan: primero el movimiento mecánico de código (protegido por la suite existente, sin gate de spec), y recién después la U-Net. La decisión de construir la U-Net **a mano** (no de librería) se fijó acá.
+
+**Acciones realizadas:**
+- Creado el subpaquete `diffusion.models`: `layers.py` (piezas compartidas: `SinusoidalEmbedding` + activaciones), `mlp.py` (`ScoreMLP`, sin cambios), `base.py` (Protocol `ScoreModel`, contrato `(x, t) → score`) y `__init__.py` con re-exports. Import público `from diffusion.models import ScoreMLP`.
+- Eliminado el paquete `diffusion.mlp`; actualizados los imports internos en `training/`, `samplers/` y los tests.
+- Docs: `docs/project/mlp.md` → `docs/project/models.md`; `.claude/CLAUDE.md` y steering sincronizados.
+- Refactor puro: mismos parámetros y misma salida; la suite existente (241) protege el movimiento y queda en verde sin regresiones.
+
+**Follow-ups:**
+- Construir la `ScoreUNet` a mano sobre esta base (spec `score-unet`).
+
+**Categoría:** Desarrollo
+
+**Resumen:** Nueva red de Fase 2: `ScoreUNet`, una U-Net convolucional para imágenes **construida a mano** en `models/unet.py`, vía el flujo Kiro spec-driven. ~17.2 M params, determinística; suite 241 → 263.
+
+**Contexto:** La Fase 2 necesita una red de score `(B,C,H,W) → (B,C,H,W)`. Se descartó reusar una U-Net de librería (diffusers / denoising-diffusion-pytorch): igual que el MLP, la red es la variable de control del estudio de ablación, así que conviene tenerla propia y fija. Se construyó sobre el subpaquete `models/` reestructurado el mismo día.
+
+**Acciones realizadas:**
+- Nueva `ScoreUNet` en `models/unet.py`, ensamblada a mano: `TimeMLP` (proyección temporal desde el embedding sinusoidal), `ConvResBlock` (bloque residual convolucional con inyección de tiempo), self-attention espacial (a 16×16), down/upsampling, y encoder + bottleneck + decoder con skips.
+- Determinística: GroupNorm, sin dropout (misma regla que el MLP). Fail-fast `ValueError` (`image_size`/`groups` en `__init__`; H/W y canales en `forward`). Con los defaults (`base_channels=64`, `channel_mults=(1,2,2,4)`, `attn_resolutions=(16,)`), ~17.2 M params.
+- Suite de `ScoreUNet` (contrato de shape, determinismo/gradientes, config/errores/arquitectura de referencia): 241 → **263 passed** sin regresiones. Fix de una flakiness (semilla + `atol`) en `test_scoreunet_batch_independence`.
+- Doc en `docs/project/models.md`; `ejes.md`/`CLAUDE.md` actualizados a "U-Net a mano". **Proceso Kiro:** discovery → requirements → gap → design (con validación) → tasks → impl autónoma (subagente por tarea + review adversarial + validación GO). Artefactos en `.kiro/specs/score-unet/`.
+
+**Follow-ups:**
+- Desacoplar `train()` de la construcción de la red para poder alimentar `ScoreMLP` **o** `ScoreUNet` (spec `train-decoupling`).
+
+### 07/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** `train-decoupling`: `train(sde, model, data, config)` se vuelve agnóstico a la red y al dato —recibe la red ya construida y un iterador infinito de tensores crudos, con loop por pasos— y los checkpoints pasan a ser model-agnósticos. Suite 263 → 275. Kiro spec-driven.
+
+**Contexto:** El `train()` clavaba `ScoreMLP` por dentro (instanciación hardcodeada) y consumía una `PointDistribution`. Con la `ScoreUNet` ya entregada, eso bloqueaba la Fase 2. Se decidió invertir la dependencia: el caller construye la red y arma la fuente de datos; `train` solo corre el loop de DSM. En discovery se acordó que en esta spec también se vuelven model-agnósticos los checkpoints y se actualiza el front-end config-driven.
+
+**Acciones realizadas:**
+- Registry `make_model(name, **kwargs)` en `diffusion.models` (`{mlp, unet}`), espejo de `make_sde`/`make_distribution`.
+- Adaptador `infinite_bare(loader)` en `data_generation`: generador infinito que desempaqueta la 1-tupla `(x0,)` y yield-ea el tensor crudo — el contrato de `data`.
+- Flip del API: `train(sde, model, data, config)` recibe la red ya construida (`ScoreModel`) + un iterador infinito; loop **por pasos** (`num_steps`, `next(data)` por step). `TrainConfig` adelgazado (solo el loop: sin hiperparámetros de red ni de dataset).
+- Checkpoints model-agnósticos (R5-c): `save` guarda `state_dict` + meta (`sde_name`, `data_dim`, `history`, receta `model:{name,kwargs}`); `load` devuelve `(state_dict, meta)` y el caller reconstruye vía `make_model`. Actualizado `generate_from_checkpoint`.
+- Front-end config-driven actualizado (`build_run`/`RunSpec`/`scripts/train.py`/YAML): `n_samples`/`batch_size` al bloque `data:`, `num_steps` en `train:`, bloque `model:` opcional. Doc en `docs/project/training.md` + notebook al API nuevo. Suite: 263 → **275 passed**.
+
+**Follow-ups:**
+- Falta la **fuente de datos de imágenes** (el `infinite_batches` "dataset a definir") para alimentar la Fase 2.
+- `sde`/`samplers` todavía asumen `(B, data_dim)`: generalizarlos a `(B,C,H,W)` es un bloqueo aparte.
+
+### 08/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** `image-data-source`: la fuente de datos de imágenes de Fase 2 — `infinite_batches(root, batch_size, …)` en `data_generation`, que entrega `(B,3,64,64)` en `[-1,1]` con el mismo contrato que el toy 2D. Agrega `torchvision==0.27.0`. Suite 275 → 291. Kiro spec-driven.
+
+**Contexto:** Con `ScoreUNet` y el `train` model-agnóstico listos, faltaba con qué alimentarlos en imágenes: el `infinite_batches` que el roadmap dejó anotado como "dataset a definir". Debía cumplir el mismo contrato que la fuente toy 2D (iterador infinito de tensores crudos), pero de imágenes. En discovery se fijó: transforms con torchvision (no a mano), higiene report-only "too-small" (el dedup sigue en `scripts/limpiar_imagenes.py`) y framing explícito (center-crop vs deform).
+
+**Acciones realizadas:**
+- Nuevo `data_generation/images.py` con imports pesados (torch/torchvision/PIL) diferidos: `CatImages` (Dataset sin labels; descubrimiento por `rglob` ordenado; `.convert("RGB")` obligatorio; devuelve tensor pelado), `_build_transform` (flip horizontal opcional → encuadre `Resize`+`CenterCrop` o `Resize` deformante → `ToTensor` → `Normalize` a `[-1,1]`), `infinite_batches` (DataLoader `drop_last` + wrapper infinito; **fail-fast** `ValueError` si la carpeta no existe/está vacía/tiene menos imágenes que `batch_size`) y `report_small_images` (higiene report-only, no borra).
+- Export `infinite_batches`/`report_small_images`; el import diferido mantiene `import diffusion.data_generation` liviano (no arrastra torchvision).
+- Agregada la dependencia `torchvision==0.27.0` (+ `pillow`) — wheel cp314-win CPU, fija `torch==2.12.0`; steering `tech.md` actualizado.
+- 16 tests autocontenidos (imágenes sintéticas en `tmp_path`, sin depender de `data/cats-prueba`): 275 → **291 passed**. Doc en `docs/project/data_generation.md`. **Proceso Kiro** completo; artefactos en `.kiro/specs/image-data-source/`.
+
+**Follow-ups:**
+- El camino de entrenamiento de imágenes de punta a punta sigue bloqueado: `sde`/`samplers` asumen `(B, data_dim)` — generalizarlos a event shapes N-D es la próxima spec.
+
+### 09/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Generalización N-D de `sde`/`samplers` a event shapes arbitrarios (spec `nd-shapes`, mergeada a master), que habilita imágenes `(B,C,H,W)` sin romper el toy 2D; más el notebook `04_image_forward.ipynb` que visualiza el proceso forward sobre las fotos de gatos de `cats-prueba`.
+
+**Contexto:** Con la `ScoreUNet` (score-unet), el `train` model+data-agnóstico (train-decoupling) y la fuente `infinite_batches` (image-data-source) ya entregados, el único eslabón que faltaba para el camino de imágenes de Fase 2 era que `sde` y `samplers` operaran sobre `(B,C,H,W)`: asumían datos planos `(B, data_dim)` y los coeficientes de la SDE salían `(B,1)`, que no broadcastean contra imágenes. El roadmap ya lo marcaba como "bloqueo separado". Se hizo vía el flujo Kiro spec-driven; el cambio resultó contenido (por broadcasting, sin hardcodear la forma).
+
+**Acciones realizadas:**
+- **Spec `nd-shapes`** (Kiro: discovery → requirements → validate-gap → design → validate-design → tasks → impl autónomo), mergeada a master (rama `feat/nd-shapes`, 7 commits: 1 de spec + 6 de tareas, con review adversarial independiente por tarea y validación final GO).
+- `sde/base.py`: `_expand_t(t, ref)` **rank-aware** (reshape de `t` a `(B,1,…,1)` según el rango de `x`; para rango 2 devuelve `(B,1)`, byte-idéntico a antes); `data_dim` acepta `int | tuple` y expone `data_shape` normalizada, conservando el valor crudo. `variants.py`: threading del tensor de referencia en las 6 llamadas a `_expand_t` de VP/VE/sub-VP (sin cambios de fórmula).
+- `samplers/base.py`: `sample()` arma el prior desde `data_shape` (`(n, *E)`); el resto del driver, los `step()` y el `_expand_t` del sampler no cambian (la SDE re-expande `t` contra el estado).
+- Plomería: la forma de evento viaja en la metadata de checkpoint (`training/trainer.py`), `generate_from_checkpoint` reconstruye la SDE con ella, y `config.py` gatea la inyección de `data_dim` al modelo solo cuando es entero (path MLP 2D; una tupla no se mete como hiperparámetro de la U-Net). `dsm_loss` quedó N-D-safe **sin cambios** (el peso `std²` es `(B,1,1,1)` y broadcastea solo).
+- Tests parametrizados 2D + imagen-chica `(3,8,8)`: familia escalar N-D, invariancia 2D byte-idéntica, prior/muestras N-D en los 4 samplers, round-trip end-to-end de generación de imágenes vía checkpoint (con una `ScoreUNet` real chica) y DSM N-D. Suite completa en verde: **322 passed, 2 skipped**.
+- **Notebook `04_image_forward.ipynb`** (análogo de `01` para imágenes): carga los 2 gatos de `cats-prueba` (`infinite_batches`, sin augmentation, determinista), aplica el forward y visualiza —reusando los helpers `denorm`/`show_grid` de `03`— una grilla 3 SDEs × (tiempos + prior) para un gato y una "tira" VP por imagen. Verificado corriendo las celdas headless en el venv (`uv`/torchvision): carga `(2,3,64,64)` en `[-1,1]`, forward y figuras sin error (VP/sub-VP disuelven rápido a `N(0,I)`; VE conserva señal y explota tarde).
+
+**Follow-ups:**
+- Refrescar el markdown de cierre de `03_image_data_source.ipynb`, que todavía dice que `sde`/`samplers` no operan sobre `(B,C,H,W)` — obsoleto con `nd-shapes`.
+- El notebook `04` requiere el `.venv` con `torchvision` (el `python` del PATH no lo tiene).
+- (Hueco de la crónica) Sumar entradas para score-unet, train-decoupling e image-data-source, no cronicados entre el 05/07 y hoy.
+- Próximo (Fase 2): entrenar la `ScoreUNet` sobre gatos y correr el reverso para generar — el análogo de imágenes de `02`.
+
+**Categoría:** Desarrollo
+
+**Resumen:** Notebook `03_image_data_source.ipynb`: demostración aislada de `infinite_batches` sobre `data/cats-prueba/`, con outputs ejecutados (contrato, higiene, des-normalización, augment, framing, reproducibilidad, fail-fast).
+
+**Contexto:** Para *ver* funcionar la fuente de imágenes sin montar una corrida completa, se armó un notebook de demostración —al lado de `01`/`02`, y previo al `04`— que ejercita el módulo con la API pública sobre los 2 gatos de prueba.
+
+**Acciones realizadas:**
+- Nuevo `diffusion-models/notebooks/03_image_data_source.ipynb` (mismo bootstrap y kernel que `01`/`02`), ejecutado con outputs embebidos: contrato `(2,3,64,64)` en `[-1,1]` e infinitud; higiene report-only; des-normalización `[-1,1]→[0,1]`; augment (flip horizontal) on/off; framing `crop=True` vs `crop=False` (ilustrado sobre una imagen no cuadrada sintética, porque los gatos ya son 64×64 cuadrados); reproducibilidad por `seed`; fail-fast; y una grilla de 16 de `cats-v1`.
+- Hallazgo registrado: todo el dataset de gatos ya viene pre-escalado a 64×64 RGB, así que sobre ese dato `crop` y la higiene "<64" son no-ops (importan para carpetas de fotos de tamaño arbitrario). El notebook aporta los helpers `denorm`/`show_grid` que después reusa el `04`.
+
+**Follow-ups:**
+- El markdown de cierre del notebook todavía dice que `sde`/`samplers` no operan sobre `(B,C,H,W)`: quedó obsoleto con `nd-shapes` (mismo follow-up que la entrada de nd-shapes).
+
+**Categoría:** Desarrollo
+
+**Resumen:** Checkpointing intermedio opt-in en `training`: `TrainConfig.checkpoint_every` (default `0`) + un callback `on_checkpoint` en `train`, que habilita snapshots periódicos (`…_stepNNNNN.pt`) y un `…_best.pt` junto al checkpoint final. Sin regresión (default apagado). Suite 322 → 327 passed. Cambio simple, sin proceso Kiro (acordado con el autor).
+
+**Contexto:** Hasta ahora el modelo se guardaba **una sola vez, al final** del entrenamiento (`save_checkpoint` lo llama el caller tras `train`; el loop no persistía nada). Se pidió poder guardar también estados intermedios. Es una modificación acotada a un módulo, así que se saltó el flujo Kiro (spec/requirements/design) por overkill y se construyó de a poco con la suite en verde, respetando el diseño del módulo: `train` es **agnóstico y sin I/O**.
+
+**Acciones realizadas:**
+- `TrainConfig.checkpoint_every: int = 0` — switch único: `0` = solo el checkpoint final (comportamiento histórico, sin regresión); `N>0` = además snapshots periódicos + best.
+- `train(..., on_checkpoint=None)`: el loop decide **cuándo** (cadencia periódica propia, chequeada cada paso para no atarse a la de `history`, con el último paso excluido porque lo cubre el final; y best-so-far sobre la pérdida **media de intervalo**) e invoca el callback con `(tag, snapshot)` —un `TrainResult` foto del estado—; el callback decide **cómo/dónde** persistir. Así `train` sigue sin tocar el filesystem.
+- `scripts/train.py`: arma el callback cuando hay `out.checkpoint`, derivando rutas hermanas con `Path.with_stem` (`vp_mixture.pt` → `vp_mixture_step00050.pt` / `vp_mixture_best.pt`) y reusando `save_checkpoint` con el mismo `model_spec` (cada snapshot es tan reconstruible como el final). Nuevo override `--checkpoint-every`; aviso si `checkpoint_every>0` sin `out.checkpoint`.
+- Tests (5 nuevos): gate apagado no llama al callback (sin regresión), emisión de periódicos correctos (múltiplos de `N`, sin el último) + al menos un `best`, persistencia/carga de los `…_stepNNNNN.pt`/`…_best.pt` estilo-CLI, y `build_run` pasa `train.checkpoint_every` al `TrainConfig`. Suite completa: **327 passed, 2 skipped**. Smoke CLI-equivalente verificado (pasos 5/10/15 + best + final, cargables). Docs: `docs/project/training.md`, docstrings de `config.py`/`train.py` y el YAML de ejemplo.
+
+**Follow-ups:**
+- No se implementó *resume* (retomar el entrenamiento desde un snapshot): el checkpoint guarda solo el `state_dict` de la red, no el estado del optimizador ni el paso. Si se quiere, es una extensión aparte.
+- El best usa la pérdida DSM (ruidosa), así que es orientativo; para comparar estados suele servir más un snapshot periódico.

@@ -23,7 +23,7 @@ explícita) y carga el ``state_dict`` — así el mismo checkpoint sirve al ``Sc
 from __future__ import annotations
 
 import pathlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 import torch
@@ -49,7 +49,12 @@ class TrainConfig:
     grad_clip: float | None = None
     seed: int | None = 0
     device: str = "cpu"
-    log_every: int = 0  # 0 = silencioso; N = imprime cada N pasos (no afecta el history)
+    log_every: int = 0  # 0 = silencioso; N = imprime (media móvil) cada N pasos. Solo consola.
+    # Checkpointing intermedio: 0 = solo el checkpoint final (comportamiento por defecto, sin
+    # regresión); N>0 = además, snapshot cada N pasos y un checkpoint "best" (menor pérdida
+    # vista). El *cómo/dónde* persistir lo decide el callback ``on_checkpoint`` de :func:`train`
+    # (el loop no toca el filesystem); sin ese callback este campo no hace nada.
+    checkpoint_every: int = 0
 
 
 @dataclass
@@ -57,7 +62,7 @@ class TrainResult:
     """Resultado de :func:`train`: la red entrenada y la traza de la corrida."""
 
     net: ScoreModel  # cualquier red de score (ScoreMLP, ScoreUNet, …), no atada a una clase
-    history: list[float] = field(default_factory=list)  # pérdida media por intervalo de registro
+    history: list[float] = field(default_factory=list)  # pérdida por paso (serie completa: una por paso)
     config: TrainConfig = field(default_factory=TrainConfig)
     sde_name: str = ""
     # = sde.data_dim (valor crudo): un entero para dato plano 2D o una tupla (forma de evento,
@@ -72,6 +77,7 @@ def train(
     config: TrainConfig,
     *,
     generator: torch.Generator | None = None,
+    on_checkpoint: Callable[[str, TrainResult], None] | None = None,
 ) -> TrainResult:
     """Entrena la red ``model`` para aproximar el score de ``sde`` por DSM.
 
@@ -88,11 +94,18 @@ def train(
         config: Hiperparámetros del loop de entrenamiento.
         generator: Generador opcional para el ruido del kernel / muestreo de ``t``. Si es
             ``None`` se crea uno sembrado con ``config.seed``.
+        on_checkpoint: Callback **opcional** de checkpointing intermedio. Se invoca con
+            ``(tag, snapshot)`` donde ``tag`` es ``"step{N:05d}"`` (snapshot periódico cada
+            ``config.checkpoint_every`` pasos) o ``"best"`` (nueva pérdida mínima de intervalo),
+            y ``snapshot`` es un :class:`TrainResult` con la red en ese punto. El loop decide
+            **cuándo** llamar; el callback decide **cómo/dónde** persistir — ``train`` no toca el
+            filesystem. Sin este callback (o con ``checkpoint_every=0``) solo se entrena; el
+            checkpoint final lo guarda el caller con :func:`save_checkpoint`.
 
     Returns:
-        :class:`TrainResult` con la red entrenada, la historia de pérdida (pérdida media por
-        intervalo de registro; nunca vacía: siempre incluye el último paso), el ``config``
-        usado, el nombre de la SDE y su ``data_dim``.
+        :class:`TrainResult` con la red entrenada, la historia de pérdida (**serie per-step
+        completa**: una entrada por paso, ``len(history) == num_steps``), el ``config`` usado,
+        el nombre de la SDE y su ``data_dim``.
     """
     device = torch.device(config.device)
     if config.seed is not None:
@@ -108,14 +121,30 @@ def train(
     data_iter = iter(data)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.lr)
 
-    # El history se registra a una cadencia fija, desacoplada de ``log_every`` (que gobierna
-    # solo el print): si ``log_every>0`` coincide con él; si no, una cadencia interna que
-    # deja ~100 puntos. Siempre se registra además el último paso, así history nunca queda
-    # vacío (ni con el ``log_every=0`` por defecto).
-    cadence = config.log_every if config.log_every > 0 else max(1, config.num_steps // 100)
+    # ``history`` guarda la pérdida de CADA paso (serie completa, la fuente de verdad). ``log_every``
+    # gobierna solo el print de consola, desacoplado. Para el "best" se usa una cadencia interna
+    # propia (media de ventana suavizada), también desacoplada de ``log_every``.
+    eval_every = max(1, config.num_steps // 100)
+
+    # Checkpointing intermedio (opt-in): activo solo si el caller inyecta un callback y
+    # ``checkpoint_every > 0``. El loop decide *cuándo* (cadencia periódica + best por pérdida);
+    # el callback decide *cómo/dónde* persistir — ``train`` no toca el filesystem.
+    do_checkpoints = on_checkpoint is not None and config.checkpoint_every > 0
+    best_loss = float("inf")
 
     history: list[float] = []
-    running, n_batches = 0.0, 0
+
+    def _snapshot() -> TrainResult:
+        # Foto del estado actual para que el callback la persista (lee la red viva vía state_dict
+        # dentro del callback, así que refleja los pesos de este paso).
+        return TrainResult(
+            net=net,
+            history=list(history),
+            config=config,
+            sde_name=sde.name,
+            data_dim=sde.data_dim,
+        )
+
     for step in range(config.num_steps):
         x0 = next(data_iter).to(device)
         t = sample_timesteps(
@@ -129,16 +158,32 @@ def train(
             torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
         optimizer.step()
 
-        running += loss.item()
-        n_batches += 1
-
+        history.append(loss.item())  # serie completa: la pérdida de cada paso
         is_last = step == config.num_steps - 1
-        if (step + 1) % cadence == 0 or is_last:
-            avg = running / max(n_batches, 1)
-            history.append(avg)
-            running, n_batches = 0.0, 0
-            if config.log_every > 0:
-                print(f"[{sde.name}] paso {step + 1}/{config.num_steps}  pérdida={avg:.6f}")
+
+        # Snapshot periódico: cadencia propia, chequeada cada paso para que ``checkpoint_every``
+        # no tenga que ser múltiplo de nada. El último paso lo cubre el checkpoint final del
+        # caller, así que se excluye acá.
+        if do_checkpoints and not is_last and (step + 1) % config.checkpoint_every == 0:
+            on_checkpoint(f"step{step + 1:05d}", _snapshot())
+
+        # Best-so-far sobre una media de ventana (suavizada; la pérdida de un paso suelto es muy
+        # ruidosa por el t aleatorio), a una cadencia interna desacoplada de log_every/history.
+        if do_checkpoints and ((step + 1) % eval_every == 0 or is_last):
+            window = history[-eval_every:]
+            window_mean = sum(window) / len(window)
+            if window_mean < best_loss:
+                best_loss = window_mean
+                on_checkpoint("best", _snapshot())
+
+        # Print de progreso (solo consola, desacoplado del history): media móvil de los últimos
+        # log_every pasos, más legible que un paso suelto.
+        if config.log_every > 0 and ((step + 1) % config.log_every == 0 or is_last):
+            recent = history[-config.log_every:]
+            print(
+                f"[{sde.name}] paso {step + 1}/{config.num_steps}  "
+                f"pérdida(móvil)={sum(recent) / len(recent):.6f}"
+            )
 
     return TrainResult(
         net=net, history=history, config=config, sde_name=sde.name, data_dim=sde.data_dim

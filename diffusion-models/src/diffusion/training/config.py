@@ -20,6 +20,7 @@ Estructura esperada del YAML::
     train:                # -> campos de TrainConfig (solo el loop de optimización)
       num_steps: 300
       lr: 0.002
+      checkpoint_every: 50  # opcional: 0 = solo final; N>0 = snapshots …_stepNNNNN.pt + …_best.pt
     model:                # opcional: receta de la red -> make_model(name, **resto)
       name: mlp           #   si falta, se usa {name: mlp} dimensionado desde el dato/SDE
       hidden_dim: 256

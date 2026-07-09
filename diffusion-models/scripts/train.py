@@ -7,9 +7,13 @@ Ejemplos (correr desde ``diffusion-models/``)::
 
     python scripts/train.py --config config/vp_mixture.yaml
     python scripts/train.py --config config/vp_mixture.yaml --num-steps 50 --device cpu
+    python scripts/train.py --config config/vp_mixture.yaml --checkpoint-every 50
 
 Guarda los pesos entrenados (``.pt`` con ``state_dict`` + metadata) y una curva de pérdida
-(``.png``) en las rutas de la sección ``out`` del config (relativas al cwd).
+(``.png``) en las rutas de la sección ``out`` del config (relativas al cwd). Con
+``train.checkpoint_every > 0`` (o ``--checkpoint-every``) guarda además, junto al checkpoint
+final, un snapshot periódico ``…_stepNNNNN.pt`` cada N pasos y un ``…_best.pt`` con la menor
+pérdida vista.
 """
 
 from __future__ import annotations
@@ -35,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override de la cantidad de pasos de entrenamiento del config.")
     p.add_argument("--device", type=str, default=None,
                    help="Override del dispositivo (p. ej. cpu / cuda).")
+    p.add_argument("--checkpoint-every", type=int, default=None,
+                   help="Override de cada cuántos pasos guardar un snapshot intermedio "
+                        "(0 = solo el checkpoint final; requiere 'out.checkpoint').")
     p.add_argument("--quiet", action="store_true",
                    help="No imprimir el progreso por paso.")
     return p
@@ -49,10 +56,10 @@ def save_loss_curve(path: str | pathlib.Path, history: list[float], title: str) 
     out = pathlib.Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(range(1, len(history) + 1), history)
+    ax.plot(range(1, len(history) + 1), history, linewidth=0.7, alpha=0.8)
     if min(history) > 0:
         ax.set_yscale("log")
-    ax.set_xlabel("intervalo de registro")
+    ax.set_xlabel("paso")
     ax.set_ylabel("pérdida DSM")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
@@ -83,20 +90,42 @@ def main(argv=None) -> int:
         spec.config.num_steps = args.num_steps
     if args.device is not None:
         spec.config.device = args.device
+    if args.checkpoint_every is not None:
+        spec.config.checkpoint_every = args.checkpoint_every
     if args.quiet:
         spec.config.log_every = 0
     elif spec.config.log_every == 0:
         spec.config.log_every = max(1, spec.config.num_steps // 10)
+
+    # Callback de checkpointing intermedio: solo si hay una ruta base de checkpoint. Deriva
+    # rutas hermanas (…_stepNNNNN.pt / …_best.pt) del checkpoint final y reusa save_checkpoint;
+    # así train() sigue sin tocar el filesystem (decide *cuándo*, esto decide *dónde*).
+    on_checkpoint = None
+    if spec.checkpoint is not None:
+        base = spec.checkpoint
+
+        def on_checkpoint(tag, snapshot):
+            tagged = base.with_stem(f"{base.stem}_{tag}")
+            save_checkpoint(snapshot, tagged, model_spec=spec.model_spec)
+            print(f"Checkpoint ({tag}) -> {tagged}")
+    elif spec.config.checkpoint_every > 0:
+        print(
+            "nota: 'train.checkpoint_every' > 0 pero falta 'out.checkpoint'; "
+            "no se guardarán snapshots intermedios."
+        )
 
     print(
         f"Entrenando sde={spec.sde.name} (data_dim={spec.sde.data_dim}) "
         f"con {type(spec.model).__name__}: pasos={spec.config.num_steps} "
         f"device={spec.config.device}"
     )
-    result = train(spec.sde, spec.model, spec.data, spec.config)
+    result = train(spec.sde, spec.model, spec.data, spec.config, on_checkpoint=on_checkpoint)
+    hist = result.history
+    k = max(1, len(hist) // 20)  # media de extremos: la pérdida per-step es ruidosa
+    ini, fin = sum(hist[:k]) / k, sum(hist[-k:]) / k
     print(
-        f"Listo. pérdida inicial={result.history[0]:.6f} -> "
-        f"final={result.history[-1]:.6f}"
+        f"Listo. pérdida inicial≈{ini:.6f} -> final≈{fin:.6f}  "
+        f"(medias de {k} pasos; {len(hist)} pasos guardados)"
     )
 
     if spec.checkpoint:

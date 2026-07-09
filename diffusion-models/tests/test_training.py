@@ -167,26 +167,32 @@ def test_train_usa_la_red_recibida_y_registra_data_dim(name):
     assert result.net is net  # usa la instancia recibida, no una nueva
     assert result.data_dim == sde.data_dim  # = sde.data_dim (fuente del checkpoint)
     assert result.sde_name == name
-    assert len(result.history) >= 1
+    assert len(result.history) == 4  # una entrada por paso (num_steps=4)
     assert all(math.isfinite(v) for v in result.history)
 
 
-def test_train_history_no_vacio_con_log_every_cero():
-    """history se registra a cadencia fija (desacoplada de log_every): nunca queda vacío."""
+def test_history_es_per_step_e_independiente_de_log_every():
+    """history guarda la pérdida de CADA paso: len == num_steps y NO depende de log_every.
+
+    Regresión del bug en que ``log_every`` gobernaba la cadencia de registro (y el CLI la forzaba
+    a num_steps//10 → ~10 puntos). Ahora es la serie completa; ``log_every`` solo afecta el print.
+    """
     sde = make_sde("vp")
     dist = make_distribution("gaussian", 2, seed=0)
-    net = _small_net(sde)
-    result = train(sde, net, _data(dist), TrainConfig(num_steps=5, log_every=0, seed=0))
-
-    assert result.history  # no vacío ni con el default log_every=0
-    assert all(math.isfinite(v) for v in result.history)
+    for log_every in (0, 2, 5):
+        net = _small_net(sde)
+        result = train(
+            sde, net, _data(dist), TrainConfig(num_steps=7, log_every=log_every, seed=0)
+        )
+        assert len(result.history) == 7  # una por paso, sin importar log_every
+        assert all(math.isfinite(v) for v in result.history)
 
 
 def test_train_baja_la_perdida():
     """Smoke de aprendizaje: tras muchos pasos la pérdida final es menor que la inicial.
 
-    Se compara la **tendencia** (history[-1] < history[0]), no valores paso a paso: al pasar de
-    épocas a pasos cambia el orden de consumo de ruido.
+    Se compara la **tendencia** con medias de bloque (primer vs último quinto), no valores paso a
+    paso: la pérdida per-step es ruidosa por el t aleatorio de cada paso.
     """
     sde = make_sde("vp")
     dist = make_distribution("mixture", 2, n_components=8, seed=0)
@@ -195,8 +201,12 @@ def test_train_baja_la_perdida():
     data = _data(dist, n=512, batch_size=128)
     result = train(sde, net, data, TrainConfig(num_steps=240, seed=0))
 
+    assert len(result.history) == 240  # serie per-step completa
     assert all(math.isfinite(v) for v in result.history)
-    assert result.history[-1] < result.history[0]
+    # Tendencia sobre medias de bloque (la pérdida per-step es ruidosa por el t aleatorio).
+    hist = result.history
+    k = max(1, len(hist) // 5)
+    assert sum(hist[-k:]) / k < sum(hist[:k]) / k
 
 
 def test_train_reproducible_con_misma_seed():
@@ -216,7 +226,7 @@ def test_train_con_grad_clip_corre():
     dist = make_distribution("gaussian", 2, seed=0)
     net = _small_net(sde)
     result = train(sde, net, _data(dist), _tiny_config(num_steps=4, grad_clip=1.0))
-    assert len(result.history) >= 1
+    assert len(result.history) == 4
     assert all(math.isfinite(v) for v in result.history)
 
 
@@ -331,6 +341,97 @@ def test_checkpoint_roundtrip_conserva_forma_de_imagen(tmp_path):
     assert sde2.data_shape == event_shape
 
 
+# ------------------------------------------------ checkpointing intermedio
+
+
+def test_trainconfig_checkpoint_every_default_cero():
+    """El switch de checkpointing intermedio arranca apagado (0 = solo el checkpoint final)."""
+    assert TrainConfig().checkpoint_every == 0
+
+
+def test_train_sin_checkpoint_every_no_llama_callback():
+    """Gate por defecto: con ``checkpoint_every=0`` el callback NO se invoca (sin regresión)."""
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    calls: list[str] = []
+    result = train(
+        sde,
+        _small_net(sde),
+        _data(dist),
+        _tiny_config(num_steps=6),  # checkpoint_every=0 por defecto
+        on_checkpoint=lambda tag, snap: calls.append(tag),
+    )
+    assert calls == []  # ni snapshots periódicos ni "best"
+    assert result.history
+
+
+def test_train_checkpoint_every_emite_periodicos_y_best():
+    """Con ``checkpoint_every=N`` el loop emite snapshots periódicos y al menos un "best".
+
+    Los tags periódicos son ``step{N:05d}`` en los múltiplos de ``checkpoint_every``, **excluido
+    el último paso** (lo cubre el checkpoint final del caller). Con ``num_steps=9`` y
+    ``checkpoint_every=3`` se esperan los pasos 3 y 6 (el 9 es el último y se omite).
+    """
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    calls: list[tuple[str, TrainResult]] = []
+    net = _small_net(sde)
+    result = train(
+        sde,
+        net,
+        _data(dist),
+        _tiny_config(num_steps=9, checkpoint_every=3),
+        on_checkpoint=lambda tag, snap: calls.append((tag, snap)),
+    )
+
+    tags = [tag for tag, _ in calls]
+    periodic = [t for t in tags if t.startswith("step")]
+    assert periodic == ["step00003", "step00006"]  # múltiplos de 3, sin el último (9)
+    assert "best" in tags  # al menos un mínimo de pérdida de intervalo registrado
+    # Cada snapshot es un TrainResult que apunta a la MISMA red que se está entrenando.
+    assert all(isinstance(snap, TrainResult) and snap.net is net for _, snap in calls)
+    assert result.net is net
+
+
+def test_train_checkpoints_intermedios_persisten_y_cargan(tmp_path):
+    """El callback estilo-CLI escribe snapshots hermanos (…_stepNNNNN.pt / …_best.pt) cargables.
+
+    Reproduce el wiring de ``scripts/train.py``: deriva rutas del checkpoint base con
+    ``Path.with_stem`` y persiste con ``save_checkpoint``. Verifica que los archivos existen, que
+    el último paso NO genera snapshot periódico (lo cubre el final) y que ``load_checkpoint``
+    recupera la metadata esperada.
+    """
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    base = tmp_path / "vp_gaussian.pt"
+    model_spec = {
+        "name": "mlp",
+        "kwargs": {"data_dim": sde.data_dim, "hidden_dim": 64, "num_blocks": 2},
+    }
+
+    def on_checkpoint(tag, snap):
+        save_checkpoint(snap, base.with_stem(f"{base.stem}_{tag}"), model_spec=model_spec)
+
+    train(
+        sde,
+        _small_net(sde),
+        _data(dist),
+        _tiny_config(num_steps=4, checkpoint_every=2),
+        on_checkpoint=on_checkpoint,
+    )
+
+    step_ckpt = tmp_path / "vp_gaussian_step00002.pt"
+    best_ckpt = tmp_path / "vp_gaussian_best.pt"
+    assert step_ckpt.exists()  # paso 2 (el 4 es el último: lo omite el periódico)
+    assert best_ckpt.exists()
+    assert not (tmp_path / "vp_gaussian_step00004.pt").exists()  # último paso excluido
+
+    _, meta = load_checkpoint(step_ckpt)
+    assert meta["sde_name"] == "vp"
+    assert meta["data_dim"] == 2
+    assert meta["model"] == model_spec
+
+
 # ------------------------------------------------------------------- config
 
 
@@ -409,6 +510,18 @@ def test_build_run_no_inyecta_forma_tupla_en_el_modelo():
     assert spec.sde.data_dim == (3, 8, 8)
     assert not isinstance(spec.sde.data_dim, int)
     assert "data_dim" not in spec.model_spec["kwargs"]
+
+
+def test_build_run_acepta_checkpoint_every():
+    """El validador estricto de ``train:`` acepta el nuevo campo ``checkpoint_every`` y lo pasa
+    al ``TrainConfig`` (el camino config-driven activa el checkpointing intermedio por YAML)."""
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1, "checkpoint_every": 2},
+    }
+    spec = build_run(raw)
+    assert spec.config.checkpoint_every == 2
 
 
 def test_build_run_falla_sin_claves_obligatorias():

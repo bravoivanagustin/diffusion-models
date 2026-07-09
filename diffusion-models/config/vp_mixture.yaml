@@ -17,12 +17,13 @@ data:                     # fuente p_data(x_0); ver `python scripts/data_generat
   seed: 0
 
 train:                    # hiperparámetros del loop de optimización (-> TrainConfig)
-  num_steps: 240          # pasos de optimización (reemplaza epochs; ver docs/project/training.md)
+  num_steps: 19200          # pasos de optimización (reemplaza epochs; ver docs/project/training.md)
   lr: 0.002
-  t_eps: 1.0e-3           # piso del muestreo de t (evita t=0, sigma->0)
-  grad_clip: 1.0          # opcional; quitar para no recortar gradientes
+  t_eps: 1.0e-4           # piso del muestreo de t (evita t=0, sigma->0)
   seed: 0
   device: cpu
+  # checkpoint_every: 50  # opcional: 0 = solo el checkpoint final (default). N>0 guarda además
+                          #   un snapshot cada N pasos (…_stepNNNNN.pt) y un …_best.pt (menor pérdida).
 
 # model:                  # opcional: la red es la variable de control (fija entre celdas).
 #   name: mlp             # si falta, se usa {name: mlp} dimensionado desde el dato/SDE.
@@ -32,5 +33,5 @@ train:                    # hiperparámetros del loop de optimización (-> Train
 #   activation: silu
 
 out:                      # rutas de salida (se crean los directorios)
-  checkpoint: models/vp_mixture.pt
-  loss_curve: models/vp_mixture_loss.png
+  checkpoint: models/phase_1/vp_mixture.pt
+  loss_curve: models/phase_1/vp_mixture_loss.png

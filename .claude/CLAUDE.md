@@ -169,6 +169,8 @@ correspondiente en `docs/project/`:
 - `docs/project/proyecto.md` — overview y objetivo, en español, con la voz del autor.
 - `docs/project/ejes.md` — diseño experimental completo: las dos fases, los dos ejes, la matriz 3×4,
   la red como variable de control y los requisitos de reentrenamiento.
+- `docs/project/dataflow.md` — flujo de datos cross-módulo: configs (YAML) + artefactos + I/O de cada
+  módulo de punta a punta, y el estado listo/pendiente del pipeline.
 - `docs/project/cronica.md` — bitácora fechada de avances (decisiones y entregas, módulo a módulo).
 - `docs/project/to-do.md` — tareas pendientes, derivadas de los "Próximos pasos" de `cronica.md`.
 - `docs/project/data_generation.md` — doc del módulo `data_generation`.

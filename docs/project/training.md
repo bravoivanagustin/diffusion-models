@@ -55,10 +55,12 @@ Loop y persistencia (en `trainer.py`):
 
 | Símbolo | Qué es |
 |---|---|
-| `TrainConfig` | Dataclass **acotado al loop**: `num_steps, lr, t_eps, grad_clip, seed, device, log_every`. Ya no lleva hiperparámetros de red (van al constructor / `make_model`) ni de dataset (`n_samples`/`batch_size` van a la fuente de datos). |
-| `TrainResult` | `net` entrenada (cualquier `ScoreModel`), `history` (pérdida media por intervalo de registro), `config`, `sde_name` y `data_dim` (`= sde.data_dim`, lo copia el checkpoint). |
-| `train(sde, model, data, config, *, generator=None)` | Corre el loop **por pasos** (`num_steps`) y devuelve `TrainResult`. Recibe la red ya construida y un iterador infinito de datos; no instancia la red ni ramifica por su tipo (agnóstico a la red y al origen de datos). |
+| `TrainConfig` | Dataclass **acotado al loop**: `num_steps, lr, t_eps, grad_clip, seed, device, log_every, checkpoint_every`. Ya no lleva hiperparámetros de red (van al constructor / `make_model`) ni de dataset (`n_samples`/`batch_size` van a la fuente de datos). `log_every` es **solo para el print** de consola (media móvil), desacoplado del `history`. `checkpoint_every` (default `0`) activa el checkpointing intermedio (ver abajo). |
+| `TrainResult` | `net` entrenada (cualquier `ScoreModel`), `history` (**serie per-step completa**: una entrada por paso, `len == num_steps`), `config`, `sde_name` y `data_dim` (`= sde.data_dim`, lo copia el checkpoint). |
+| `train(sde, model, data, config, *, generator=None, on_checkpoint=None)` | Corre el loop **por pasos** (`num_steps`) y devuelve `TrainResult`. Recibe la red ya construida y un iterador infinito de datos; no instancia la red ni ramifica por su tipo (agnóstico a la red y al origen de datos). `on_checkpoint(tag, snapshot)` es un callback **opcional** de checkpointing intermedio: el loop decide *cuándo* llamarlo, el callback decide *cómo/dónde* persistir — `train` no toca el filesystem. |
 | `save_checkpoint(result, path, *, model_spec=None)` / `load_checkpoint(path)` | Persistencia **model-agnóstica** (R5-c): guarda `state_dict` + `meta{sde_name, data_dim, history, model?}`; `load_checkpoint` devuelve `(state_dict, meta)` sin reconstruir la red (ver más abajo). |
+
+> **La curva de pérdida (`history`) es la serie per-step completa** — una entrada por paso, no un promedio por ventana. Es lo más fiel: la pérdida DSM de un paso es de cola pesada (depende mucho del `t` aleatorio que se sortea cada paso), así que promediar la distorsiona; guardando todo, siempre se puede suavizar después para graficar. El print de consola (`log_every`) muestra una media móvil, pero es **solo display** y está desacoplado de lo que se guarda.
 
 Compañeros del flujo (viven en otros módulos, pero el loop los necesita):
 
@@ -99,6 +101,7 @@ train:               # -> campos de TrainConfig (solo el loop de optimización)
   grad_clip: 1.0     # opcional
   seed: 0
   device: cpu
+  checkpoint_every: 0  # opcional; 0 = solo el checkpoint final. N>0 = snapshots intermedios
 # model:             # opcional: la red es la variable de control (normalmente fija)
 #   name: mlp        #   si falta, se usa {name: mlp} dimensionado desde el dato/SDE
 #   hidden_dim: 256
@@ -114,6 +117,26 @@ Ejemplo listo en `diffusion-models/config/`: `vp_mixture.yaml`.
 `save_checkpoint`/`load_checkpoint` no dependen de ninguna clase de red concreta. El `.pt` guarda el `state_dict` de la red y una `meta` mínima: `{sde_name, data_dim, history}` más —opcionalmente— una **receta genérica** `model = {"name": str, "kwargs": dict}`. Esa receta la aporta el caller vía `save_checkpoint(result, path, model_spec={"name": "mlp", "kwargs": {...}})`; en el camino config-driven la transporta el `RunSpec` (`spec.model_spec`) y `scripts/train.py` la pasa sola.
 
 `load_checkpoint(path)` devuelve `(state_dict, meta)` **sin reconstruir** la red: es el caller quien arma la red y le carga los pesos. La reconstrucción canónica es `make_model(recipe["name"], **recipe["kwargs"])` seguida de `net.load_state_dict(state_dict)`, y la hace `diffusion.samplers.generate_from_checkpoint`, que cierra el pipeline forward→score→sampleo desde el checkpoint. Si el checkpoint se guardó **sin** receta (`model_spec=None`) sigue siendo válido, pero al generar hay que pasarle una red explícita (`model=`). Así el mismo checkpoint sirve al `ScoreMLP` (Fase 1) y a la `ScoreUNet` (Fase 2) sin que `training` importe ninguna red concreta.
+
+## Checkpointing intermedio (opt-in)
+
+Por defecto **solo se guarda el checkpoint final** (el `state_dict` tal como quedó en el último paso): el loop no persiste nada, y `save_checkpoint` lo escribe una vez terminado `train`. Para guardar también estados intermedios está el switch `checkpoint_every` de `TrainConfig`:
+
+- `checkpoint_every = 0` (**default**) — nada intermedio; comportamiento idéntico al histórico (sin regresión).
+- `checkpoint_every = N > 0` — además del final, el loop pide guardar:
+  - un **snapshot periódico** cada `N` pasos (tag `step{N:05d}` → `…_stepNNNNN.pt`), con cadencia propia (se chequea cada paso, así `N` no tiene que ser múltiplo de nada). El **último** paso se omite porque ya lo cubre el checkpoint final.
+  - un **best-so-far** (tag `best` → `…_best.pt`), que se reescribe cada vez que baja una **media de ventana** de la pérdida (cadencia interna `eval_every = num_steps//100`, suavizada — la de un paso suelto es muy ruidosa por el `t` aleatorio). *Nota:* aún así la pérdida DSM es ruidosa, así que "best" es orientativo; para comparar suele ser más útil un snapshot periódico.
+
+El diseño mantiene `train` **sin I/O**: el loop decide **cuándo** (la política de cadencia y best) e invoca un callback `on_checkpoint(tag, snapshot)`; el **caller** decide **cómo/dónde** persistir. En el camino config-driven eso lo arma `scripts/train.py`, que deriva rutas hermanas del `out.checkpoint` con `Path.with_stem` (`vp_mixture.pt` → `vp_mixture_step00050.pt`, `vp_mixture_best.pt`) y reusa `save_checkpoint` (con el mismo `model_spec`, así cada snapshot es reconstruible igual que el final). A mano:
+
+```python
+base = pathlib.Path("models/vp_mixture.pt")
+def on_checkpoint(tag, snap):
+    save_checkpoint(snap, base.with_stem(f"{base.stem}_{tag}"), model_spec=spec.model_spec)
+train(sde, model, data, TrainConfig(num_steps=1000, checkpoint_every=200), on_checkpoint=on_checkpoint)
+```
+
+Se activa por YAML (`train.checkpoint_every`) o con el override `--checkpoint-every` del CLI. Si `checkpoint_every > 0` pero no hay `out.checkpoint`, el CLI avisa y no escribe snapshots (no hay ruta base de dónde colgarlos).
 
 ## Cómo correr
 
@@ -148,13 +171,14 @@ Torch es **dependencia dura** del módulo (como `mlp` y `sde`): importa `torch` 
 
 ## Tests
 
-`diffusion-models/tests/test_training.py` (21 tests, en verde; suite completa sin regresiones):
+`diffusion-models/tests/test_training.py` (33 tests, en verde; suite completa sin regresiones):
 
 - `dsm_loss` para las **3 SDEs**: escalar finito, diferenciable, gradientes finitos en la red; reproducible con `generator`.
 - `sample_timesteps`: shape, rango $[t_\text{eps}, T]$, reproducibilidad, horizonte $T$ distinto.
-- `train`: **usa la red recibida** y registra el `data_dim` correcto por SDE (las 3 variantes); `history` no vacío con `log_every=0`; la **pérdida baja** en VP sobre la mezcla de gaussianas; reproducibilidad con misma `seed`; camino `grad_clip`.
-- `TrainConfig`: acotado al loop (no expone campos de red ni de dataset).
+- `train`: **usa la red recibida** y registra el `data_dim` correcto por SDE (las 3 variantes); `history` es la **serie per-step completa** (`len == num_steps`), independiente de `log_every`; la **pérdida baja** (medias de bloque) en VP sobre la mezcla de gaussianas; reproducibilidad con misma `seed`; camino `grad_clip`.
+- `TrainConfig`: acotado al loop (no expone campos de red ni de dataset); `checkpoint_every` arranca en `0`.
 - `save_checkpoint`/`load_checkpoint`: ida y vuelta reconstruye la red con los mismos pesos; sin `model_spec` el checkpoint omite la receta `model`.
-- `build_run`/`load_config`: ensamblado desde `dict` y desde YAML; el bloque `model:` sobreescribe el default; falla ante claves faltantes (`sde.name`, `data.shape`) o desconocidas en `train:`.
+- **Checkpointing intermedio**: con `checkpoint_every=0` el callback no se invoca (sin regresión); con `N>0` emite los snapshots periódicos correctos (múltiplos de `N`, excluido el último paso) más al menos un `best`; el wiring estilo-CLI escribe los `…_stepNNNNN.pt`/`…_best.pt` cargables con la metadata esperada.
+- `build_run`/`load_config`: ensamblado desde `dict` y desde YAML; el bloque `model:` sobreescribe el default; `train.checkpoint_every` se pasa al `TrainConfig`; falla ante claves faltantes (`sde.name`, `data.shape`) o desconocidas en `train:`.
 
 > La convergencia solo se asserta para VP (el smoke de aprendizaje); de las demás variantes se testea la mecánica (finitud, shapes, reproducibilidad).

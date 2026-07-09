@@ -12,7 +12,7 @@ el dato, en el forward SDE y en el sampler—, nunca dentro de ella. Cada famili
 
 - **Lenguaje**: Python ≥3.10 (entorno real: 3.14 en Windows).
 - **Cómputo**: `torch` (probado en 2.12.0+cpu; corre en CPU, sin GPU en Fase 1), `numpy`.
-- **Datos / viz**: `scikit-learn` (formas toy), `matplotlib` (previews y figuras).
+- **Datos / viz**: `scikit-learn` (formas toy), `matplotlib` (previews y figuras); `torchvision==0.27.0` + `pillow` para la fuente de datos de imágenes de Fase 2 (transforms/IO; fija `torch==2.12.0`, wheel cp314 CPU).
 - **Config / tests**: `pyyaml` (corridas config-driven), `pytest`.
 - **Entorno**: gestionado con **`uv`** (`uv.lock` en la raíz).
 
