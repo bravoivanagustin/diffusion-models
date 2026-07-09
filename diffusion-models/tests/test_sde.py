@@ -292,44 +292,61 @@ def test_invalid_shape_raises(bad):
         make_sde("vp", data_dim=bad)
 
 
+# --------------------------- matriz consolidada VP/VE/sub-VP × event shape (task 4.1)
+#
+# Cross-product de la familia escalar sobre una forma 2D `(2,)` y una forma tipo-imagen
+# chica `(3, 8, 8)`: las cuatro operaciones (`perturb`/`score_target`/`sde`/
+# `marginal_prob`) devuelven/broadcastean sobre `(B, *E)` en float32 y finito. Consolida
+# los chequeos de shape/dtype/finitud que antes vivían en tests N-D separados por forma.
+# `B=16` es distinto de las dims espaciales `(3, 8, 8)`, así que un coeficiente colapsado
+# `(B, 1)` NO broadcastearía contra `(B, 3, 8, 8)` (16 vs 8) -> el chequeo es
+# discriminante frente a una regresión de coeficiente rank-2, no cosmético.
+
+EVENT_SHAPES = [(2,), IMG]
+
+
+def _x0_t_event(event, n=B, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x0 = torch.randn(n, *event, generator=g)
+    t = torch.rand(n, generator=g)
+    return x0, t
+
+
 @pytest.mark.parametrize("name", SCALAR)
-def test_nd_perturb_shapes_dtype_finite(name):
-    sde = make_sde(name, data_dim=IMG)
-    x0 = torch.randn(B, *IMG)
-    t = torch.rand(B)
+@pytest.mark.parametrize("event", EVENT_SHAPES)
+def test_scalar_family_matrix_shapes_dtype_finite(name, event):
+    # Construcción con int para el dato plano `(2,)` y con tupla para la imagen.
+    data_dim = event[0] if len(event) == 1 else event
+    sde = make_sde(name, data_dim=data_dim)
+    assert sde.data_shape == event
+    x0, t = _x0_t_event(event)
+    expected = (B, *event)
+
+    # marginal_prob: media `(B, *E)` + std por-muestra que broadcastea contra el estado.
+    mean, std = sde.marginal_prob(x0, t)
+    assert mean.shape == expected and std.shape[0] == B
+    assert (mean + std).shape == expected
+    assert mean.dtype == torch.float32 and std.dtype == torch.float32
+    assert torch.all(torch.isfinite(mean)) and torch.all(torch.isfinite(std))
+
+    # perturb: `(x_t, eps)` ambos `(B, *E)` float32 y finitos.
     x_t, eps = sde.perturb(x0, t, generator=torch.Generator().manual_seed(0))
-    assert x_t.shape == (B, *IMG) and eps.shape == (B, *IMG)
+    assert x_t.shape == expected and eps.shape == expected
     assert x_t.dtype == torch.float32 and eps.dtype == torch.float32
     assert torch.all(torch.isfinite(x_t)) and torch.all(torch.isfinite(eps))
 
-
-@pytest.mark.parametrize("name", SCALAR)
-def test_nd_score_target_shapes_finite(name):
-    sde = make_sde(name, data_dim=IMG)
-    x0 = torch.randn(B, *IMG)
-    t = torch.rand(B)
-    x_t, eps = sde.perturb(x0, t, generator=torch.Generator().manual_seed(1))
+    # score_target: score `(B, *E)` + peso por-muestra que broadcastea (rank-matched).
     score, weight = sde.score_target(x0, t, eps)
-    assert score.shape == (B, *IMG)
-    assert torch.all(torch.isfinite(score))
-    # peso por-muestra que broadcastea contra el estado (rank-matched).
-    assert weight.shape[0] == B
-    assert (score * weight).shape == (B, *IMG)
+    assert score.shape == expected and weight.shape[0] == B
+    assert (score * weight).shape == expected
+    assert score.dtype == torch.float32
+    assert torch.all(torch.isfinite(score)) and torch.all(torch.isfinite(weight))
 
-
-@pytest.mark.parametrize("name", SCALAR)
-def test_nd_marginal_and_sde_broadcast_finite(name):
-    sde = make_sde(name, data_dim=IMG)
-    x0 = torch.randn(B, *IMG)
-    t = torch.rand(B)
-    mean, std = sde.marginal_prob(x0, t)
-    assert mean.shape == (B, *IMG)
-    assert std.shape[0] == B
-    assert (mean + std).shape == (B, *IMG)  # coeficiente de t broadcastea sin error
-    assert torch.all(torch.isfinite(mean)) and torch.all(torch.isfinite(std))
+    # sde: drift `(B, *E)` + diffusion por-muestra que broadcastea.
     drift, diffusion = sde.sde(x0, t)
-    assert drift.shape == (B, *IMG)
-    assert (drift + diffusion).shape == (B, *IMG)
+    assert drift.shape == expected and diffusion.shape[0] == B
+    assert (drift + diffusion).shape == expected
+    assert drift.dtype == torch.float32 and diffusion.dtype == torch.float32
     assert torch.all(torch.isfinite(drift)) and torch.all(torch.isfinite(diffusion))
 
 

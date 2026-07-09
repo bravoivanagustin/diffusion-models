@@ -26,7 +26,7 @@
   - _Boundary: training/trainer.py, training/config.py, samplers/generate.py_
 
 - [ ] 4. Validación: tests N-D, invariancia 2D y no-regresión
-- [ ] 4.1 (P) Tests de la familia escalar de SDEs sobre event shapes
+- [x] 4.1 (P) Tests de la familia escalar de SDEs sobre event shapes
   - Parametrizar VP/VE/sub-VP sobre una forma 2D `(2,)` y una forma tipo-imagen chica (p. ej. `(3, 8, 8)`): shapes/dtype/finitud de `perturb`/`score_target`/`sde`/`marginal_prob`; `t` como `(B,)` y `(B,1)` dan el mismo resultado; construcción con entero y con tupla, y forma inválida → error; invariancia 2D (salida byte-idéntica a la referencia con el mismo seed).
   - Observable: la suite parametrizada de `sde` corre en verde, incluyendo el caso tipo-imagen y la invariancia 2D.
   - _Depends: 1_
