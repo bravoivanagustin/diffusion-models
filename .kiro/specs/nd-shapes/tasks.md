@@ -16,7 +16,7 @@
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
   - _Boundary: samplers/base.py_
 
-- [ ] 3. Integración: la forma de evento por la plomería de entrenamiento y generación
+- [x] 3. Integración: la forma de evento por la plomería de entrenamiento y generación
   - Ampliar el tipo del campo de geometría del dato en la metadata de checkpoint para que transporte un entero o una forma multidimensional (widening de tipo; la serialización de la tupla es transparente).
   - Confirmar que la generación desde checkpoint reconstruye la SDE con la forma de la metadata (el factory ya acepta la forma tras la task 1); ajustar la docstring de retorno si menciona la forma plana.
   - Gate en la capa de configuración: inyectar la geometría del dato como default del modelo **solo** cuando es un entero (camino MLP 2D); una forma multidimensional (imágenes) no se inyecta como hiperparámetro del modelo (la U-Net trae su propia config).

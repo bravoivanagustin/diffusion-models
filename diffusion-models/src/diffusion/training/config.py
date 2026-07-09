@@ -138,7 +138,12 @@ def build_run(raw: dict) -> RunSpec:
     # las claves del bloque van a make_model, que filtra por firma (no se validan acá) ---
     model_raw = dict(raw.get("model") or {})
     model_name = model_raw.pop("name", "mlp")
-    model_raw.setdefault("data_dim", sde.data_dim)  # dimensiona el default MLP desde la SDE
+    # Gate: inyectamos ``data_dim`` en la receta del modelo solo cuando es un entero (path MLP
+    # 2D: dimensiona el default desde la SDE). Para una forma de evento multidimensional (tupla,
+    # imágenes) NO se inyecta: la red de imágenes es la U-Net, que trae su propia config y no
+    # toma ``data_dim`` —además ``ScoreMLP`` haría ``int(tupla)`` y reventaría—.
+    if isinstance(sde.data_dim, int):
+        model_raw.setdefault("data_dim", sde.data_dim)
     model = make_model(model_name, **model_raw)
     # Receta genérica {name, kwargs} para el checkpoint model-agnóstico: la misma con la que se
     # construyó la red, así generate.py la reconstruye con make_model sin el config original.

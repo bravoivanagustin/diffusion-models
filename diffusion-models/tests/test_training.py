@@ -253,6 +253,37 @@ def test_save_checkpoint_sin_model_spec_omite_la_receta(tmp_path):
     assert set(meta) == {"sde_name", "data_dim", "history"}
 
 
+def test_checkpoint_roundtrip_conserva_forma_de_imagen(tmp_path):
+    """La forma de evento de una SDE tipo-imagen viaja por la metadata del checkpoint (4.1) y
+    ``make_sde`` la reconstruye desde ahí (4.2).
+
+    El checkpoint transporta ``data_dim`` como el valor **crudo** de la SDE: un entero para el
+    dato plano 2D o una **tupla** (forma de evento) para imágenes. Se arma un ``TrainResult`` a
+    mano (sin correr entrenamiento): la identidad de la red es irrelevante acá —solo se verifica
+    el round-trip de la forma en la meta y la reconstrucción de la SDE—. La generación
+    end-to-end a ``(n, *E)`` se cubre en los tests de samplers (task 4.2).
+    """
+    event_shape = (3, 8, 8)
+    sde = make_sde("vp", data_dim=event_shape)
+    assert sde.data_dim == event_shape  # la SDE conserva el valor crudo (tupla)
+
+    # Red mínima sin entrenar: solo actúa de portador del state_dict; no se reconstruye acá.
+    net = ScoreMLP(data_dim=2, hidden_dim=8, num_blocks=1)
+    result = TrainResult(net=net, history=[1.0], sde_name="vp", data_dim=sde.data_dim)
+
+    path = tmp_path / "ckpt_imagen.pt"
+    save_checkpoint(result, path)
+    _, meta = load_checkpoint(path)
+
+    # 4.1: la forma de evento (tupla) sobrevive torch.save/torch.load sin perder el tipo.
+    assert meta["data_dim"] == event_shape
+    assert isinstance(meta["data_dim"], tuple)
+
+    # 4.2: make_sde reconstruye la SDE con esa forma (data_shape normalizada).
+    sde2 = make_sde(meta["sde_name"], data_dim=meta["data_dim"])
+    assert sde2.data_shape == event_shape
+
+
 # ------------------------------------------------------------------- config
 
 
@@ -296,6 +327,41 @@ def test_build_run_con_bloque_model_sobreescribe_el_default():
     assert spec.model.hidden_dim == 32
     assert spec.model.num_blocks == 1
     assert spec.model.data_dim == spec.sde.data_dim  # el data_dim lo sigue aportando la SDE
+
+
+def test_build_run_inyecta_data_dim_entero_en_el_modelo():
+    """Gate de config (4.1): con una SDE de dato plano (``data_dim`` entero) el default MLP
+    recibe ``data_dim`` inyectado desde la SDE (path 2D, sin regresión)."""
+    raw = {
+        "sde": {"name": "vp"},  # data_dim entero (2 por defecto)
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1},
+    }
+    spec = build_run(raw)
+
+    assert isinstance(spec.sde.data_dim, int)
+    assert spec.model_spec["kwargs"]["data_dim"] == spec.sde.data_dim == 2
+    assert spec.model.data_dim == 2
+
+
+def test_build_run_no_inyecta_forma_tupla_en_el_modelo():
+    """Gate de config (4.1): con una SDE de forma de evento multidimensional (tupla) la forma
+    NO se inyecta como hiperparámetro del modelo (la U-Net trae su propia config).
+
+    Sin el gate, ``setdefault('data_dim', (3,8,8))`` inyectaría la tupla en la receta del MLP
+    y ``ScoreMLP(data_dim=(3,8,8))`` reventaría (``int()`` sobre una tupla). El gate deja la
+    forma fuera de la config del modelo; acá se usa el default MLP solo para ejercitar la rama
+    del gate (en un run real de imágenes el bloque ``model:`` nombra la U-Net)."""
+    raw = {
+        "sde": {"name": "vp", "data_dim": (3, 8, 8)},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1},
+    }
+    spec = build_run(raw)
+
+    assert spec.sde.data_dim == (3, 8, 8)
+    assert not isinstance(spec.sde.data_dim, int)
+    assert "data_dim" not in spec.model_spec["kwargs"]
 
 
 def test_build_run_falla_sin_claves_obligatorias():

@@ -75,7 +75,9 @@ def generate_from_checkpoint(
             ``"pc"`` también ``n_corrector``/``snr``); los no aplicables se descartan.
 
     Returns:
-        El tensor de muestras ``x_0`` de shape ``(n_samples, data_dim)`` en ``float32``.
+        El tensor de muestras ``x_0`` de shape ``(n_samples, *forma_de_evento)`` en
+        ``float32`` —``(n_samples, d)`` para dato plano, ``(n_samples, C, H, W)`` para
+        imágenes—, según la forma que la meta transporte en ``data_dim`` (entero o tupla).
 
     Raises:
         FileNotFoundError: Si ``checkpoint_path`` no existe.

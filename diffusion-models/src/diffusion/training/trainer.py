@@ -60,7 +60,9 @@ class TrainResult:
     history: list[float] = field(default_factory=list)  # pérdida media por intervalo de registro
     config: TrainConfig = field(default_factory=TrainConfig)
     sde_name: str = ""
-    data_dim: int = 0  # = sde.data_dim; lo copia save_checkpoint a meta (lo usa generate.py)
+    # = sde.data_dim (valor crudo): un entero para dato plano 2D o una tupla (forma de evento,
+    # imágenes). Lo copia save_checkpoint a la meta y lo consume generate.py para reconstruir la SDE.
+    data_dim: int | tuple[int, ...] = 0
 
 
 def train(
@@ -174,7 +176,9 @@ def save_checkpoint(
     out.parent.mkdir(parents=True, exist_ok=True)
     meta: dict = {
         "sde_name": result.sde_name,
-        "data_dim": result.data_dim,  # = sde.data_dim (lo registró train); lo usa generate.py
+        # = sde.data_dim (int o tupla; lo registró train); torch.save serializa la tupla sin
+        # problema y generate.py la reusa para reconstruir la SDE con su forma de evento.
+        "data_dim": result.data_dim,
         "history": list(result.history),
     }
     if model_spec is not None:
