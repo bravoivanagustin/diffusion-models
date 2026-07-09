@@ -8,7 +8,7 @@
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 3.1, 3.2, 3.3, 5.1_
   - _Boundary: sde/base.py, sde/variants.py_
 
-- [ ] 2. Prior N-D en los samplers
+- [x] 2. Prior N-D en los samplers
   - Que el muestreo del prior arme la forma a partir de la forma de evento de la SDE (en vez de una forma plana), de modo que la integración reversa corra sobre cualquier rango. El resto del driver y los pasos de los cuatro samplers no cambian (ya operan sobre la shape del estado); la normalización temporal del sampler tampoco cambia (la SDE re-expande `t` contra el estado).
   - Actualizar la docstring de la geometría del estado inicial/retorno para reflejar la forma de evento.
   - Observable: `sample(n)` devuelve muestras `(n, *forma_de_evento)` en `float32` para una forma tipo-imagen chica en los cuatro samplers; con captura de trayectoria devuelve `(n_steps+1, n, *forma_de_evento)`; el caso 2D no cambia.

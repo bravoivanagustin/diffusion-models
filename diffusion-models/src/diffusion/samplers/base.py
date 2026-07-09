@@ -27,7 +27,8 @@ import torch
 
 from diffusion.sde import ForwardSDE
 
-#: Contrato de inyección del score: ``(x: (B, data_dim), t: (B,) | (B,1)) -> (B, data_dim)``.
+#: Contrato de inyección del score: ``(x: (B, *E), t: (B,) | (B,1)) -> (B, *E)`` para
+#: cualquier forma de evento ``E`` (``(2,)`` en el toy 2D, ``(C, H, W)`` en imágenes).
 #: Tanto una :class:`diffusion.models.ScoreMLP` entrenada como un score analítico en forma
 #: cerrada encajan sin cambios en el sampler.
 ScoreFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -96,14 +97,14 @@ class ReverseSampler(abc.ABC):
         grilla (la maneja el driver).
 
         Args:
-            x: Estado actual de shape ``(B, data_dim)``.
+            x: Estado actual de shape ``(B, *E)`` para cualquier forma de evento ``E``.
             t: Tiempo actual de shape ``(B,)`` o ``(B, 1)``.
             dt: Tamaño de paso (negativo: se integra en tiempo decreciente).
             generator: Generador de torch para los samplers estocásticos; los
                 determinísticos (PF-ODE/Heun) lo ignoran.
 
         Returns:
-            El nuevo estado de shape ``(B, data_dim)``.
+            El nuevo estado de shape ``(B, *E)``.
         """
         raise NotImplementedError
 
@@ -126,9 +127,14 @@ class ReverseSampler(abc.ABC):
         ``float32``, sin tocar los parámetros de la red (el score se consume como función
         pura), de modo que cambiar de sampler nunca reentrena (Eje 2).
 
+        La geometría de salida sale de la forma de evento de la SDE
+        (:attr:`ForwardSDE.data_shape`): el prior se arma como ``(n_samples, *data_shape)``,
+        de modo que la integración corre igual sobre el toy 2D ``(N, 2)`` que sobre una forma
+        tipo-imagen ``(N, C, H, W)`` — el driver y cada :meth:`step` operan sobre ``x.shape``.
+
         Args:
             n_samples: Número de muestras a generar (``N``).
-            init: Estado inicial ``x_T`` de shape ``(n_samples, sde.data_dim)``. Si es
+            init: Estado inicial ``x_T`` de shape ``(n_samples, *sde.data_shape)``. Si es
                 ``None`` se sortea de ``sde.prior_sampling``; pasarlo aísla el determinismo
                 del integrador del muestreo del prior.
             generator: Generador de torch para reproducibilidad; alimenta tanto el muestreo
@@ -137,14 +143,14 @@ class ReverseSampler(abc.ABC):
             return_trajectory: Si es ``True``, devuelve además la trayectoria completa.
 
         Returns:
-            El estado final ``x_0`` de shape ``(n_samples, sde.data_dim)`` en ``float32``.
+            El estado final ``x_0`` de shape ``(n_samples, *sde.data_shape)`` en ``float32``.
             Si ``return_trajectory`` es ``True``, una tupla ``(x_0, trayectoria)`` donde la
-            trayectoria tiene shape ``(n_steps + 1, n_samples, sde.data_dim)`` e incluye el
+            trayectoria tiene shape ``(n_steps + 1, n_samples, *sde.data_shape)`` e incluye el
             estado inicial ``x_T`` (capa ``0``) y cada estado intermedio.
         """
         if init is None:
             x = self.sde.prior_sampling(
-                (n_samples, self.sde.data_dim), generator=generator, dtype=torch.float32
+                (n_samples, *self.sde.data_shape), generator=generator, dtype=torch.float32
             )
         else:
             x = init.to(dtype=torch.float32)
@@ -180,11 +186,11 @@ class ReverseSampler(abc.ABC):
         """Drift de la SDE reversa ``f - g^2 s``.
 
         Args:
-            x: Estado de shape ``(B, data_dim)``.
+            x: Estado de shape ``(B, *E)`` para cualquier forma de evento ``E``.
             t: Tiempo de shape ``(B,)`` o ``(B, 1)``.
 
         Returns:
-            Tensor de shape ``(B, data_dim)``.
+            Tensor de shape ``(B, *E)``.
         """
         t = self._expand_t(t)
         f, g = self.sde.sde(x, t)
@@ -197,11 +203,11 @@ class ReverseSampler(abc.ABC):
         Comparte las mismas marginales que la SDE reversa pero sin término de ruido.
 
         Args:
-            x: Estado de shape ``(B, data_dim)``.
+            x: Estado de shape ``(B, *E)`` para cualquier forma de evento ``E``.
             t: Tiempo de shape ``(B,)`` o ``(B, 1)``.
 
         Returns:
-            Tensor de shape ``(B, data_dim)``.
+            Tensor de shape ``(B, *E)``.
         """
         t = self._expand_t(t)
         f, g = self.sde.sde(x, t)

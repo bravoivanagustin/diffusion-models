@@ -1385,3 +1385,79 @@ def test_seam_dimension_agnostic_non_default_dim():
     assert x0.shape == (n, 3)
     assert x0.dtype == torch.float32
     assert torch.all(torch.isfinite(x0))
+
+
+# ================================================================================
+# Task 2 (nd-shapes): prior N-D en los samplers.
+#
+# El muestreo del prior arma la forma a partir de la forma de evento de la SDE
+# (``sde.data_shape``), de modo que la integración reversa corre sobre cualquier rango.
+# El driver, los step() de los 4 samplers y la normalización temporal del sampler NO
+# cambian (la SDE re-expande ``t`` contra el estado). Se ejercita sobre una forma
+# tipo-imagen chica ``(3, 8, 8)`` (rápida en CPU) por los cuatro samplers vía la factory.
+# Requisitos: 2.1, 2.2, 2.3, 2.4, 5.2.
+# ================================================================================
+
+_IMAGE_SHAPE = (3, 8, 8)
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_sample_nd_shape_dtype_finite_via_factory(sampler_name):
+    # 2.1, 2.2, 2.4: para una SDE con forma de evento (3, 8, 8), cada sampler (vía
+    # factory) muestrea el prior N-D e integra el reverso devolviendo (n, 3, 8, 8)
+    # float32 finito. Un score nulo mantiene la geometría y no introduce NaN/Inf.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=_IMAGE_SHAPE)
+    s = make_sampler(sampler_name, sde, _zero_score, n_steps=4)
+    n = 4
+    x0 = s.sample(n, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (n, *_IMAGE_SHAPE)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_sample_nd_return_trajectory_shape_via_factory(sampler_name):
+    # 2.3: con captura de trayectoria sobre una forma de evento (3, 8, 8), cada sampler
+    # devuelve (n_steps+1, n, 3, 8, 8) float32; el último estado coincide con x_0.
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=_IMAGE_SHAPE)
+    n_steps = 4
+    s = make_sampler(sampler_name, sde, _zero_score, n_steps=n_steps)
+    n = 4
+    x0, traj = s.sample(
+        n, generator=torch.Generator().manual_seed(0), return_trajectory=True
+    )
+    assert x0.shape == (n, *_IMAGE_SHAPE)
+    assert traj.shape == (n_steps + 1, n, *_IMAGE_SHAPE)
+    assert traj.dtype == torch.float32
+    assert torch.equal(traj[-1], x0)
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_sample_nd_finite_across_scalar_sdes(sampler_name):
+    # 2.2: finitud N-D sobre las TRES SDEs escalares (no solo VP) para la forma imagen.
+    from diffusion.samplers import make_sampler
+
+    for sde_name in _SCALAR_SDES:
+        sde = make_sde(sde_name, data_dim=_IMAGE_SHAPE)
+        s = make_sampler(sampler_name, sde, _zero_score, n_steps=4)
+        x0 = s.sample(4, generator=torch.Generator().manual_seed(0))
+        assert x0.shape == (4, *_IMAGE_SHAPE), sde_name
+        assert torch.all(torch.isfinite(x0)), sde_name
+
+
+@pytest.mark.parametrize("sampler_name", _ALL_SAMPLERS)
+def test_sample_2d_still_flat_no_regression_via_factory(sampler_name):
+    # 5.2: el caso 2D no cambia — la forma de evento (2,) sigue devolviendo (n, 2).
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")  # data_dim=2 por defecto -> data_shape=(2,)
+    s = make_sampler(sampler_name, sde, _linear_score, n_steps=6)
+    n = 8
+    x0 = s.sample(n, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (n, 2)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
