@@ -1461,3 +1461,146 @@ def test_sample_2d_still_flat_no_regression_via_factory(sampler_name):
     assert x0.shape == (n, 2)
     assert x0.dtype == torch.float32
     assert torch.all(torch.isfinite(x0))
+
+
+# ================================================================================
+# Task 4.2 (nd-shapes): generación checkpoint-driven con forma de imagen (round-trip).
+#
+# La matriz N-D de los samplers (Req 2.1–2.4) ya quedó cubierta por los tests de la
+# Task 2 más arriba (test_sample_nd_shape_dtype_finite_via_factory,
+# test_sample_nd_return_trajectory_shape_via_factory, test_sample_nd_finite_across_
+# scalar_sdes, test_sample_2d_still_flat_no_regression_via_factory), parametrizados
+# sobre la forma imagen-chica (3, 8, 8) por los cuatro samplers vía la factory. NO se
+# duplican acá.
+#
+# Lo GENUINAMENTE nuevo de 4.2 es el *seam* de generación checkpoint-driven para
+# imágenes (Req 4.1, 4.2, 4.3): construir un checkpoint (red SIN entrenar) con forma de
+# evento tipo-imagen, generar vía generate_from_checkpoint y verificar la forma
+# (n, *E) y el .npz de salida; y que una meta que no permita reconstruir la forma del
+# dato falle con un error claro. La red image-capable es una ScoreUNet MINÚSCULA (8×8,
+# pocos canales) para correr en CPU en fracciones de segundo; generate la reconstruye
+# desde meta["model"] vía make_model, igual que el camino 2D reconstruye una ScoreMLP.
+# ================================================================================
+
+# Config chica de ScoreUNet coherente con _IMAGE_SHAPE=(3, 8, 8): image_size=8 (soporta
+# el único Downsample de channel_mults=(1,2): 8 % 2 == 0), canales chicos, groups=8
+# divide a los anchos 8 y 16, embed_dim par. Se reusa IDÉNTICA al construir el checkpoint
+# y al reconstruir la red (make_model filtra por firma del constructor), para que el
+# state_dict cargue sin discrepancias de arquitectura.
+_UNET_KWARGS = {
+    "in_channels": 3,
+    "image_size": 8,
+    "base_channels": 8,
+    "channel_mults": (1, 2),
+    "num_res_blocks": 1,
+    "embed_dim": 8,
+    "time_embed_dim": 16,
+    "attn_resolutions": (),
+    "groups": 8,
+}
+
+
+def _make_image_checkpoint(tmp_path, sde_name="vp"):
+    """Checkpoint válido SIN entrenar con forma de evento imagen (3, 8, 8) -> ScoreUNet chica.
+
+    Espejo de :func:`_make_checkpoint` pero para el camino de imágenes: ``TrainResult`` con
+    ``data_dim=(3, 8, 8)`` + ``save_checkpoint`` con una ``model_spec`` de receta ``unet``, de
+    modo que ``generate_from_checkpoint`` reconstruya la SDE con su forma de evento (vía
+    ``make_sde(sde_name, data_dim=(3,8,8))``) y la red vía ``make_model("unet", **kwargs)``.
+    No corre ningún loop de entrenamiento (la red arranca con pesos aleatorios). Devuelve la
+    ruta del ``.pt`` guardado.
+    """
+    models = pytest.importorskip("diffusion.models")
+    from diffusion.training import TrainConfig, TrainResult, save_checkpoint
+
+    net = models.ScoreUNet(**_UNET_KWARGS)
+    result = TrainResult(
+        net=net,
+        history=[1.0, 0.5],
+        config=TrainConfig(),
+        sde_name=sde_name,
+        data_dim=_IMAGE_SHAPE,
+    )
+    path = tmp_path / "ckpt_image.pt"
+    save_checkpoint(
+        result, path, model_spec={"name": "unet", "kwargs": dict(_UNET_KWARGS)}
+    )
+    return path
+
+
+def test_generate_from_checkpoint_image_shape_returns_samples(tmp_path):
+    # 4.1, 4.2: desde un checkpoint cuya forma de evento es (3, 8, 8), generate reconstruye la
+    # SDE con esa forma y la ScoreUNet vía make_model, y devuelve muestras (n, 3, 8, 8) float32
+    # finito — no la forma plana 2D del camino MLP.
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_image_checkpoint(tmp_path, sde_name="vp")
+    x0 = generate_from_checkpoint(ckpt, "pf_ode", n_samples=2, n_steps=3, seed=0)
+    assert x0.shape == (2, *_IMAGE_SHAPE)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+
+def test_generate_from_checkpoint_image_writes_npz_roundtrip(tmp_path):
+    # 4.1, 4.2: round-trip end-to-end del seam de imágenes — checkpoint imagen -> generate con
+    # `out` -> el .npz releído con np.load contiene `samples` de shape (n, 3, 8, 8) float32,
+    # EXACTAMENTE el tensor devuelto. Cierra 4.2 (generación de imágenes desde checkpoint y
+    # el archivo de salida). El subdir inexistente debe crearse.
+    pytest.importorskip("numpy")
+    import numpy as np
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_image_checkpoint(tmp_path, sde_name="vp")
+    out = tmp_path / "gen_img" / "img.npz"  # subdir inexistente: debe crearse
+    x0 = generate_from_checkpoint(
+        ckpt, "pf_ode", n_samples=2, n_steps=3, seed=0, out=out
+    )
+    assert out.exists()
+    assert x0.shape == (2, *_IMAGE_SHAPE)
+    with np.load(out) as data:
+        assert "samples" in data
+        assert data["samples"].shape == (2, *_IMAGE_SHAPE)
+        assert data["samples"].dtype == np.float32
+        # El .npz persiste EXACTAMENTE el tensor devuelto (forma de imagen incluida).
+        assert np.array_equal(data["samples"], x0.cpu().numpy())
+
+
+def _make_image_checkpoint_blob_missing_meta_key(tmp_path, missing_key):
+    """Blob imagen que SOBREVIVE ``load_checkpoint`` pero le falta ``missing_key`` de la meta.
+
+    Espejo de :func:`_make_checkpoint_blob_missing_meta_key` para el camino de imágenes: el
+    ``state_dict`` proviene de una ScoreUNet chica coherente con la receta ``unet`` y la meta
+    trae ``sde_name``/``data_dim``/``model`` válidos salvo la clave bajo prueba. Aísla la guarda
+    PROPIA de generate.py sobre la forma del dato: sin ``data_dim`` no hay con qué reconstruir la
+    forma de evento de la SDE, y el error debe ser claro (no un ``KeyError("meta")`` opaco de
+    load_checkpoint, ni un error críptico de make_sde).
+    """
+    models = pytest.importorskip("diffusion.models")
+
+    net = models.ScoreUNet(**_UNET_KWARGS)
+    meta = {
+        "sde_name": "vp",
+        "data_dim": _IMAGE_SHAPE,
+        "model": {"name": "unet", "kwargs": dict(_UNET_KWARGS)},
+        "history": [1.0, 0.5],
+    }
+    del meta[missing_key]  # quita SOLO la clave bajo prueba; el resto queda válido
+    blob = {"model_state": net.state_dict(), "meta": meta}
+    path = tmp_path / "incomplete_meta_image.pt"
+    torch.save(blob, path)
+    return path
+
+
+def test_generate_from_checkpoint_image_meta_missing_data_dim_raises_clear_error(tmp_path):
+    # 4.3: un checkpoint de imagen cuya meta NO trae la forma del dato (`data_dim`) no permite
+    # reconstruir la forma de evento -> error claro que identifica las claves esperadas por
+    # generate.py ('sde_name', 'data_dim'), en vez de un error opaco de make_sde. Discrimina de
+    # _invalid_meta_raises (que ni siquiera tiene la clave `meta`).
+    from diffusion.samplers import generate_from_checkpoint
+
+    ckpt = _make_image_checkpoint_blob_missing_meta_key(tmp_path, "data_dim")
+    with pytest.raises(KeyError) as excinfo:
+        generate_from_checkpoint(ckpt, "pf_ode", n_samples=2, n_steps=3)
+    msg = str(excinfo.value)
+    assert "sde_name" in msg
+    assert "data_dim" in msg

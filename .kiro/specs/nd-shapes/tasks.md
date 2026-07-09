@@ -33,7 +33,7 @@
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 3.1, 3.2, 3.3, 5.1, 5.2_
   - _Boundary: tests/test_sde.py_
 
-- [ ] 4.2 (P) Tests de samplers N-D y generación checkpoint-driven de imágenes
+- [x] 4.2 (P) Tests de samplers N-D y generación checkpoint-driven de imágenes
   - `sample()` sobre una forma tipo-imagen chica → `(n, *forma)` `float32` finito para los cuatro samplers; trayectoria con shape coherente. Round-trip end-to-end: construir un checkpoint (red sin entrenar) con forma tipo-imagen, generar vía la función de generación y verificar shape `(n, *forma)` y el archivo de salida; metadata insuficiente → error claro.
   - Observable: la suite de `samplers` corre en verde, incluyendo generación de muestras con forma de imagen y el round-trip desde checkpoint.
   - _Depends: 2, 3_
