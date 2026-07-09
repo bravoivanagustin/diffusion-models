@@ -31,7 +31,7 @@ class VPSDE(ForwardSDE):
         self,
         beta_min: float = 0.1,
         beta_max: float = 20.0,
-        data_dim: int = 2,
+        data_dim: int | tuple[int, ...] = 2,
         T: float = 1.0,
     ) -> None:
         """Inicializa la VP-SDE.
@@ -39,7 +39,8 @@ class VPSDE(ForwardSDE):
         Args:
             beta_min: ``beta(0)`` del schedule lineal.
             beta_max: ``beta(T)`` del schedule lineal.
-            data_dim: Dimensión del dato (anda en cualquier dimensión).
+            data_dim: Geometría del dato: entero (dato plano) o tupla ``(C, H, W)`` (forma
+                de evento multidimensional). Anda en cualquier rango.
             T: Horizonte temporal.
         """
         super().__init__(data_dim=data_dim, T=T)
@@ -47,7 +48,7 @@ class VPSDE(ForwardSDE):
         self.beta_max = float(beta_max)
 
     def sde(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        tt = self._expand_t(t)
+        tt = self._expand_t(t, x)
         beta = linear_beta(tt, self.beta_min, self.beta_max)
         drift = -0.5 * beta * x
         diffusion = torch.sqrt(beta)
@@ -56,7 +57,7 @@ class VPSDE(ForwardSDE):
     def marginal_prob(
         self, x0: torch.Tensor, t: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tt = self._expand_t(t)
+        tt = self._expand_t(t, x0)
         b_int = linear_beta_integral(tt, self.beta_min, self.beta_max)
         alpha = torch.exp(-0.5 * b_int)
         mean = alpha * x0
@@ -91,7 +92,7 @@ class VESDE(ForwardSDE):
         self,
         sigma_min: float = 0.01,
         sigma_max: float = 5.0,
-        data_dim: int = 2,
+        data_dim: int | tuple[int, ...] = 2,
         T: float = 1.0,
     ) -> None:
         """Inicializa la VE-SDE.
@@ -99,7 +100,8 @@ class VESDE(ForwardSDE):
         Args:
             sigma_min: ``sigma(0)`` del schedule geométrico.
             sigma_max: ``sigma(T)`` del schedule geométrico (escala del prior).
-            data_dim: Dimensión del dato (anda en cualquier dimensión).
+            data_dim: Geometría del dato: entero (dato plano) o tupla ``(C, H, W)`` (forma
+                de evento multidimensional). Anda en cualquier rango.
             T: Horizonte temporal.
         """
         super().__init__(data_dim=data_dim, T=T)
@@ -109,7 +111,7 @@ class VESDE(ForwardSDE):
         self._log_ratio = math.log(self.sigma_max / self.sigma_min)
 
     def sde(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        tt = self._expand_t(t)
+        tt = self._expand_t(t, x)
         sigma = geometric_sigma(tt, self.sigma_min, self.sigma_max)
         drift = torch.zeros_like(x)
         diffusion = sigma * math.sqrt(2.0 * self._log_ratio)
@@ -118,7 +120,7 @@ class VESDE(ForwardSDE):
     def marginal_prob(
         self, x0: torch.Tensor, t: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tt = self._expand_t(t)
+        tt = self._expand_t(t, x0)
         mean = x0
         std = geometric_sigma(tt, self.sigma_min, self.sigma_max)
         return mean, std
@@ -150,7 +152,7 @@ class SubVPSDE(ForwardSDE):
         self,
         beta_min: float = 0.1,
         beta_max: float = 20.0,
-        data_dim: int = 2,
+        data_dim: int | tuple[int, ...] = 2,
         T: float = 1.0,
     ) -> None:
         """Inicializa la sub-VP SDE.
@@ -158,7 +160,8 @@ class SubVPSDE(ForwardSDE):
         Args:
             beta_min: ``beta(0)`` del schedule lineal.
             beta_max: ``beta(T)`` del schedule lineal.
-            data_dim: Dimensión del dato (anda en cualquier dimensión).
+            data_dim: Geometría del dato: entero (dato plano) o tupla ``(C, H, W)`` (forma
+                de evento multidimensional). Anda en cualquier rango.
             T: Horizonte temporal.
         """
         super().__init__(data_dim=data_dim, T=T)
@@ -166,7 +169,7 @@ class SubVPSDE(ForwardSDE):
         self.beta_max = float(beta_max)
 
     def sde(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        tt = self._expand_t(t)
+        tt = self._expand_t(t, x)
         beta = linear_beta(tt, self.beta_min, self.beta_max)
         b_int = linear_beta_integral(tt, self.beta_min, self.beta_max)
         drift = -0.5 * beta * x
@@ -176,7 +179,7 @@ class SubVPSDE(ForwardSDE):
     def marginal_prob(
         self, x0: torch.Tensor, t: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tt = self._expand_t(t)
+        tt = self._expand_t(t, x0)
         b_int = linear_beta_integral(tt, self.beta_min, self.beta_max)
         alpha = torch.exp(-0.5 * b_int)
         mean = alpha * x0

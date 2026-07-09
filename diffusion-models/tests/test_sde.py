@@ -7,6 +7,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from diffusion.sde import (
+    ForwardSDE,
     SubVPSDE,
     VESDE,
     VPSDE,
@@ -251,3 +252,108 @@ def test_scalar_arbitrary_dim(name, dim):
     drift, diffusion = sde.sde(x0, t)
     assert drift.shape == (B, dim) and diffusion.shape == (B, 1)
     assert sde.prior_sampling((5, dim)).shape == (5, dim)
+
+
+# ============================================ event shapes N-D (nd-shapes, task 1)
+
+IMG = (3, 8, 8)  # forma tipo-imagen chica (rápida en CPU)
+
+
+def test_expand_t_rank_aware():
+    # (B,) o (B,1) -> (B, 1, ..., 1) con ref.ndim-1 unos.
+    t = torch.rand(B)
+    x2 = torch.randn(B, 2)
+    ex2 = ForwardSDE._expand_t(t, x2)
+    assert ex2.shape == (B, 1)
+    assert torch.equal(ex2, t.reshape(-1, 1))  # byte-idéntico al comportamiento 2D previo
+    ximg = torch.randn(B, *IMG)
+    assert ForwardSDE._expand_t(t, ximg).shape == (B, 1, 1, 1)
+    # t ya como (B,1) da lo mismo que (B,)
+    assert torch.equal(
+        ForwardSDE._expand_t(t.reshape(B, 1), ximg), ForwardSDE._expand_t(t, ximg)
+    )
+
+
+@pytest.mark.parametrize("name", SCALAR)
+def test_construct_with_int_and_tuple_exposes_data_shape(name):
+    sde_int = make_sde(name, data_dim=2)
+    assert sde_int.data_shape == (2,)
+    assert sde_int.data_dim == 2  # crudo (backward-compat: meta + MLP 2D)
+    sde_flat = make_sde(name, data_dim=5)
+    assert sde_flat.data_shape == (5,) and sde_flat.data_dim == 5
+    sde_img = make_sde(name, data_dim=IMG)
+    assert sde_img.data_shape == IMG
+    assert sde_img.data_dim == IMG  # tupla cruda conservada
+
+
+@pytest.mark.parametrize("bad", [0, -1, (), (3, 0, 8), (0,), (3, -1, 8)])
+def test_invalid_shape_raises(bad):
+    with pytest.raises(ValueError):
+        make_sde("vp", data_dim=bad)
+
+
+@pytest.mark.parametrize("name", SCALAR)
+def test_nd_perturb_shapes_dtype_finite(name):
+    sde = make_sde(name, data_dim=IMG)
+    x0 = torch.randn(B, *IMG)
+    t = torch.rand(B)
+    x_t, eps = sde.perturb(x0, t, generator=torch.Generator().manual_seed(0))
+    assert x_t.shape == (B, *IMG) and eps.shape == (B, *IMG)
+    assert x_t.dtype == torch.float32 and eps.dtype == torch.float32
+    assert torch.all(torch.isfinite(x_t)) and torch.all(torch.isfinite(eps))
+
+
+@pytest.mark.parametrize("name", SCALAR)
+def test_nd_score_target_shapes_finite(name):
+    sde = make_sde(name, data_dim=IMG)
+    x0 = torch.randn(B, *IMG)
+    t = torch.rand(B)
+    x_t, eps = sde.perturb(x0, t, generator=torch.Generator().manual_seed(1))
+    score, weight = sde.score_target(x0, t, eps)
+    assert score.shape == (B, *IMG)
+    assert torch.all(torch.isfinite(score))
+    # peso por-muestra que broadcastea contra el estado (rank-matched).
+    assert weight.shape[0] == B
+    assert (score * weight).shape == (B, *IMG)
+
+
+@pytest.mark.parametrize("name", SCALAR)
+def test_nd_marginal_and_sde_broadcast_finite(name):
+    sde = make_sde(name, data_dim=IMG)
+    x0 = torch.randn(B, *IMG)
+    t = torch.rand(B)
+    mean, std = sde.marginal_prob(x0, t)
+    assert mean.shape == (B, *IMG)
+    assert std.shape[0] == B
+    assert (mean + std).shape == (B, *IMG)  # coeficiente de t broadcastea sin error
+    assert torch.all(torch.isfinite(mean)) and torch.all(torch.isfinite(std))
+    drift, diffusion = sde.sde(x0, t)
+    assert drift.shape == (B, *IMG)
+    assert (drift + diffusion).shape == (B, *IMG)
+    assert torch.all(torch.isfinite(drift)) and torch.all(torch.isfinite(diffusion))
+
+
+@pytest.mark.parametrize("name", SCALAR)
+def test_nd_t_as_B_and_B1_equal(name):
+    sde = make_sde(name, data_dim=IMG)
+    x0 = torch.randn(B, *IMG)
+    t = torch.rand(B)
+    m1, s1 = sde.marginal_prob(x0, t)
+    m2, s2 = sde.marginal_prob(x0, t.reshape(B, 1))
+    assert torch.equal(m1, m2) and torch.equal(s1, s2)
+    d1, g1 = sde.sde(x0, t)
+    d2, g2 = sde.sde(x0, t.reshape(B, 1))
+    assert torch.equal(d1, d2) and torch.equal(g1, g2)
+
+
+@pytest.mark.parametrize("name", SCALAR)
+def test_2d_invariance_after_generalization(name):
+    # La generalización N-D no cambia números ni shapes en 2D (mismo seed).
+    sde = make_sde(name)
+    x0, t = _x0_t()
+    mean, std = sde.marginal_prob(x0, t)
+    assert mean.shape == (B, 2) and std.shape == (B, 1)
+    x_t, eps = sde.perturb(x0, t, generator=torch.Generator().manual_seed(42))
+    assert torch.allclose(x_t, mean + std * eps)  # reconstrucción escalar-gaussiana
+    drift, diffusion = sde.sde(x0, t)
+    assert drift.shape == (B, 2) and diffusion.shape == (B, 1)

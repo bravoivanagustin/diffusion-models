@@ -1,6 +1,6 @@
 # Implementation Plan
 
-- [ ] 1. Fundación: `sde` sobre event shapes arbitrarios (expansión rank-aware + geometría del dato)
+- [x] 1. Fundación: `sde` sobre event shapes arbitrarios (expansión rank-aware + geometría del dato)
   - Hacer `_expand_t` **rank-aware**: reshape `t` a `(B, 1, …, 1)` con tantos `1` como dimensiones de evento tenga el estado de referencia (para rango 2 devuelve `(B, 1)`, idéntico a hoy).
   - Actualizar **en el mismo paso** las llamadas de la familia escalar (VP/VE/sub-VP, en `sde`/`marginal_prob`) para pasar el tensor de referencia, de modo que la firma nueva y sus usos aterricen juntos y la suite quede en verde. Sin cambios de fórmula.
   - Generalizar el constructor de la SDE para aceptar la geometría del dato como un entero (dato plano) o una forma multidimensional; exponer la forma de evento normalizada para los consumidores y conservar el valor crudo para el round-trip de metadata; validar que toda dimensión sea ≥ 1.
