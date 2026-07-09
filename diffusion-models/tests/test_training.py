@@ -35,6 +35,23 @@ def _small_net(sde) -> ScoreMLP:
     return ScoreMLP(data_dim=sde.data_dim, hidden_dim=64, num_blocks=2)
 
 
+class _DummyScoreNet(torch.nn.Module):
+    """Red de score mínima N-D: devuelve el estado escalado por un parámetro entrenable.
+
+    Respeta el contrato ``(x, t) -> score`` con salida de la **misma shape** que ``x`` (funciona
+    con cualquier rango, incluido ``(B, C, H, W)``) y expone un parámetro para que la pérdida
+    tenga camino de gradiente. Sustituye a la U-Net para ejercitar ``dsm_loss`` sobre un batch
+    tipo-imagen sin depender de la arquitectura convolucional.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:  # noqa: ARG002
+        return self.scale * x
+
+
 def _data(dist, n=256, batch_size=64, *, shuffle=True):
     """Fuente infinita de tensores crudos que consume ``train`` (loader finito envuelto)."""
     return infinite_bare(dist.dataloader(n, batch_size, shuffle=shuffle))
@@ -67,6 +84,36 @@ def test_dsm_loss_escalar_finito_con_gradiente(name):
     assert loss.requires_grad
     loss.backward()
     grads = [p.grad for p in net.parameters()]
+    assert all(g is not None and torch.all(torch.isfinite(g)) for g in grads)
+
+
+@pytest.mark.parametrize("name", SDE_NAMES)
+def test_dsm_loss_nd_safe_sobre_batch_tipo_imagen(name):
+    """La pérdida DSM broadcastea el peso por muestra sobre un batch tipo-imagen (5.3).
+
+    Con una SDE de forma de evento ``(3, 8, 8)`` el peso ``λ(t) = std²`` sale ``(B, 1, 1, 1)``
+    (rank-matched vía ``_expand_t``) y broadcastea contra el error ``(B, 3, 8, 8)`` sin error de
+    shape: la pérdida es un escalar finito y diferenciable, con gradiente en la red. Confirma
+    que ``dsm_loss`` es **N-D-safe sin cambios** en ``losses.py`` (el peso ya queda rank-matched;
+    un peso plano ``(B, 1)`` reventaría el broadcasting contra ``(B, 3, 8, 8)``).
+
+    Se usa una red dummy que devuelve la shape del estado (no la U-Net) para aislar el
+    broadcasting de la pérdida de la arquitectura. Parametrizado por las 3 SDEs.
+    """
+    event_shape = (3, 8, 8)
+    sde = make_sde(name, data_dim=event_shape)
+    net = _DummyScoreNet()
+    x0 = torch.randn(4, *event_shape)
+    t = torch.rand(4) * sde.T
+
+    loss = dsm_loss(net, sde, x0, t)
+
+    assert loss.ndim == 0  # escalar 0-dim: .mean() colapsó todas las dims de evento
+    assert torch.isfinite(loss)
+    assert loss.requires_grad
+    loss.backward()
+    grads = [p.grad for p in net.parameters()]
+    assert grads  # la red dummy expone parámetros (camino de gradiente real)
     assert all(g is not None and torch.all(torch.isfinite(g)) for g in grads)
 
 
@@ -404,3 +451,27 @@ def test_load_config_yaml_y_build_run(tmp_path):
     assert spec.config.num_steps == 2
     batch = next(iter(spec.data))
     assert batch.shape == (64, 2)  # batch_size del bloque 'data'
+
+
+def test_build_run_2d_entrena_end_to_end_tras_el_gate():
+    """El camino config-driven 2D corre end-to-end tras el gate de configuración (4, 5.1).
+
+    Compone ``build_run`` (que aplica el gate ``setdefault('data_dim', ...)`` solo para el
+    entero 2D) con ``train`` sobre el ``RunSpec`` resultante: la red default (MLP dimensionado
+    desde la SDE) entrena sin regresión y produce un ``history`` finito con ``data_dim`` entero.
+    Ningún otro test corre ``train`` sobre la salida de ``build_run``; esto cierra el path
+    config→entrenamiento del toy 2D."""
+    raw = {
+        "sde": {"name": "vp"},  # data_dim entero (2) -> el gate SÍ inyecta al MLP
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 2, "seed": 0},
+    }
+    spec = build_run(raw)
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+
+    assert isinstance(result, TrainResult)
+    assert result.net is spec.model  # entrena la red que armó build_run (default MLP)
+    assert result.data_dim == spec.sde.data_dim == 2  # dato plano 2D, sin regresión
+    assert result.history
+    assert all(math.isfinite(v) for v in result.history)

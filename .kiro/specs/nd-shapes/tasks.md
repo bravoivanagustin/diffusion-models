@@ -40,7 +40,7 @@
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 4.1, 4.2, 4.3, 5.2_
   - _Boundary: tests/test_samplers.py_
 
-- [ ] 4.3 (P) Tests de la pérdida DSM N-D y no-regresión config-driven 2D
+- [x] 4.3 (P) Tests de la pérdida DSM N-D y no-regresión config-driven 2D
   - Verificar que la pérdida DSM sobre un batch tipo-imagen (p. ej. `(B, 3, 8, 8)`) con una red dummy que devuelve la shape del estado produce un escalar finito sin error de broadcasting (se espera **sin cambios** en la pérdida; si el peso no quedara rank-matched, el ajuste es un reshape de una línea). Confirmar que el camino de entrenamiento config-driven 2D sigue en verde tras el gate de configuración.
   - Observable: los tests de training corren en verde, incluyendo el caso DSM tipo-imagen y el config-driven 2D sin regresión.
   - _Depends: 1, 3_
