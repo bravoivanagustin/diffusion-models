@@ -70,6 +70,50 @@ class TrainResult:
     data_dim: int | tuple[int, ...] = 0
 
 
+@dataclass
+class ResumeState:
+    """Estado en memoria necesario para **reanudar** una corrida desde un checkpoint intermedio.
+
+    Agrupa lo que :func:`train` no puede recuperar de los pesos: el estado del optimizador (los
+    momentos de Adam), el número de paso ya alcanzado y el **azar** del loop —el RNG global de
+    torch y el estado del ``generator`` del ruido del kernel / muestreo de ``t``—. El ``history``
+    viaja acá en memoria (para poder continuar la curva al reanudar), pero **no** se persiste en el
+    sidecar: ya vive en el ``meta`` del checkpoint de pesos (:func:`save_checkpoint`) y duplicarlo
+    sería redundante (ver :func:`save_resume_state`); al cargar se rellena desde ese ``meta``.
+
+    Attributes:
+        optimizer_state: ``optimizer.state_dict()`` (estado de Adam).
+        start_step: Pasos ya completados (= ``N`` del nombre ``…_stepNNNNN``).
+        torch_rng_state: ``torch.get_rng_state()`` (RNG global de torch).
+        generator_state: ``generator.get_state()`` (RNG del ruido del kernel / muestreo de ``t``).
+        history: Pérdida per-step hasta ``start_step`` (se rellena desde el ``meta`` al cargar).
+    """
+
+    optimizer_state: dict
+    start_step: int
+    torch_rng_state: torch.Tensor
+    generator_state: torch.Tensor
+    history: list[float]
+
+
+@dataclass
+class TrainSnapshot:
+    """Envoltorio del estado que viaja junto a los pesos en cada checkpoint intermedio.
+
+    Agrupa el :class:`TrainResult` (pesos + history, lo que consume :func:`save_checkpoint`) y el
+    :class:`ResumeState` (lo que consume :func:`save_resume_state` para el sidecar), de modo que el
+    caller pueda persistir ambos artefactos —el checkpoint de pesos y el sidecar de resume— desde
+    un único snapshot del loop.
+
+    Attributes:
+        result: Pesos + history del punto de checkpoint (para el checkpoint de pesos).
+        resume: Estado para reanudar (para el sidecar ``…_resume.pt``).
+    """
+
+    result: TrainResult
+    resume: ResumeState
+
+
 def train(
     sde: ForwardSDE,
     model: ScoreModel,
@@ -257,3 +301,73 @@ def load_checkpoint(
     # weights_only=False: es nuestro propio checkpoint (incluye un dict de metadata).
     blob = torch.load(path, map_location=map_location, weights_only=False)
     return blob["model_state"], blob["meta"]
+
+
+# --------------------------------------------------- sidecar de resume (C1)
+
+# Campos obligatorios de un ``ResumeState`` a persistir: sin cualquiera de ellos la reanudación
+# es imposible, así que se falla antes de escribir (1.4). El ``history`` queda fuera a propósito
+# (vive en el ``meta`` del checkpoint de pesos; no se duplica, 1.3).
+_REQUIRED_RESUME_FIELDS = ("optimizer_state", "start_step", "torch_rng_state", "generator_state")
+
+
+def save_resume_state(
+    path: str | pathlib.Path, resume: ResumeState
+) -> pathlib.Path:
+    """Persiste el **sidecar de resume** de un checkpoint (``torch.save``), sin el ``history``.
+
+    El sidecar es un archivo aparte del checkpoint de pesos: guarda solo lo que ese no tiene —el
+    estado del optimizador, el paso alcanzado y el azar (RNG global de torch + estado del
+    ``generator``)—. El ``history`` se **omite** a propósito: ya está en el ``meta`` del checkpoint
+    de pesos (:func:`save_checkpoint`) y se recupera de ahí al reanudar (1.3). El checkpoint de
+    pesos no se toca ni cambia de formato/tamaño (1.2).
+
+    Args:
+        path: Ruta de salida del sidecar (se crean los directorios intermedios). Convención de
+            nombre: ``X_stepNNNNN.resume.pt`` hermano de ``X_stepNNNNN.pt``.
+        resume: Estado a persistir. Debe tener el optimizador, el paso y ambos estados de RNG
+            presentes (no ``None``).
+
+    Returns:
+        La ruta donde se guardó (como :class:`pathlib.Path`).
+
+    Raises:
+        ValueError: Si falta alguno de ``optimizer_state`` / ``start_step`` / ``torch_rng_state``
+            / ``generator_state`` (estado incompleto). No se escribe un sidecar parcial (1.4).
+    """
+    missing = [name for name in _REQUIRED_RESUME_FIELDS if getattr(resume, name) is None]
+    if missing:
+        raise ValueError(
+            "Estado de resume incompleto: falta(n) "
+            f"{', '.join(missing)}. No se persiste un sidecar parcial "
+            "(se requieren optimizer_state, start_step, torch_rng_state y generator_state)."
+        )
+
+    out = pathlib.Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    blob = {
+        "optimizer_state": resume.optimizer_state,
+        "step": resume.start_step,  # el sidecar usa la clave 'step' (= start_step)
+        "torch_rng_state": resume.torch_rng_state,
+        "generator_state": resume.generator_state,
+        # NB: 'history' NO se persiste acá (vive en el meta del checkpoint de pesos; 1.3).
+    }
+    torch.save(blob, out)
+    return out
+
+
+def load_resume_state(
+    path: str | pathlib.Path, *, map_location: torch.device | str = "cpu"
+) -> dict:
+    """Carga un sidecar de :func:`save_resume_state` como ``dict``.
+
+    Args:
+        path: Ruta del sidecar ``…_resume.pt``.
+        map_location: Dispositivo donde cargar los tensores (default ``"cpu"``).
+
+    Returns:
+        ``{optimizer_state, step, torch_rng_state, generator_state}`` (sin ``history``: se toma del
+        ``meta`` del checkpoint de pesos al reanudar).
+    """
+    # weights_only=False: es nuestro propio archivo (incluye el state_dict del optimizador).
+    return torch.load(path, map_location=map_location, weights_only=False)

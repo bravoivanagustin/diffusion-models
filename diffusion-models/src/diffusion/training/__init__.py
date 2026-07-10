@@ -31,7 +31,17 @@ from __future__ import annotations
 
 from .config import RunSpec, build_run, load_config
 from .losses import dsm_loss, sample_timesteps
-from .trainer import TrainConfig, TrainResult, load_checkpoint, save_checkpoint, train
+from .trainer import (
+    ResumeState,
+    TrainConfig,
+    TrainResult,
+    TrainSnapshot,
+    load_checkpoint,
+    load_resume_state,
+    save_checkpoint,
+    save_resume_state,
+    train,
+)
 
 __all__ = [
     "dsm_loss",
@@ -41,6 +51,10 @@ __all__ = [
     "train",
     "save_checkpoint",
     "load_checkpoint",
+    "ResumeState",
+    "TrainSnapshot",
+    "save_resume_state",
+    "load_resume_state",
     "RunSpec",
     "load_config",
     "build_run",
