@@ -34,8 +34,10 @@ from .losses import dsm_loss, sample_timesteps
 from .resume import (
     ResumePlan,
     discover_snapshots,
+    load_resume,
     resolve_resume,
     resume_sidecar_path,
+    validate_compatible,
 )
 from .trainer import (
     ResumeState,
@@ -65,6 +67,8 @@ __all__ = [
     "resolve_resume",
     "discover_snapshots",
     "resume_sidecar_path",
+    "validate_compatible",
+    "load_resume",
     "RunSpec",
     "load_config",
     "build_run",

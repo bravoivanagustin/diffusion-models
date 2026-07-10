@@ -10,9 +10,12 @@ snapshots hermanos son ``X_stepNNNNN.pt`` (periódicos) / ``X_best.pt`` (mejor p
 snapshot periódico lleva además un *sidecar* de resume ``X_stepNNNNN.resume.pt`` (el estado del
 optimizador + paso + azar; ver :mod:`diffusion.training.trainer`).
 
-Este módulo solo mira el filesystem por **existencia/glob** (no lo muta) y no importa torch: es
-la **política** de decisión. La carga y validación del punto elegido (``load_resume`` /
-``validate_compatible``, que sí tocan torch y el ``trainer``) llegan en una tarea posterior.
+La **política de decisión** (``discover_snapshots`` / ``resolve_resume``) solo mira el filesystem por
+**existencia/glob** (no lo muta) y no importa torch. La **carga y validación** del punto elegido
+(``load_resume`` / ``validate_compatible``) completan el resolver: ``load_resume`` arma el estado de
+resume desde el checkpoint de pesos + su *sidecar* (usa el ``trainer`` vía **import diferido**, para no
+arrastrar torch al importar el módulo), y ``validate_compatible`` es una comparación **pura** de
+metadata (SDE, ``data_dim`` y receta de red) que no toca torch.
 """
 
 from __future__ import annotations
@@ -20,6 +23,12 @@ from __future__ import annotations
 import pathlib
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # solo para anotaciones; en runtime load_resume hace import diferido del trainer
+    import torch
+
+    from .trainer import ResumeState
 
 # Sufijo de un snapshot periódico: ``…_stepNNNNN.pt``. El grupo captura el entero del paso. Se
 # ancla al final (``$``) para NO matchear los sidecars ``…_stepNNNNN.resume.pt`` (tienen
@@ -199,3 +208,136 @@ def _unresolved_message(
         f"No se pudo resolver --resume-from={resume_from!r} "
         f"(no es una ruta existente ni un paso descubierto). {disponibles}"
     )
+
+
+# ------------------------------------------- carga y validación del punto (C3)
+
+
+def validate_compatible(
+    meta: dict,
+    *,
+    sde_name: str,
+    model_spec: dict | None,
+    data_dim,
+) -> None:
+    """Valida que el ``meta`` de un checkpoint sea **compatible** con la corrida actual (2.5).
+
+    Reanudar solo tiene sentido si el checkpoint elegido corresponde a la MISMA corrida: la misma
+    SDE (Eje 1), la misma forma del dato (``data_dim``) y la misma receta de red. Cualquier
+    diferencia significaría cargar el optimizador/azar sobre un estado que no corresponde, así que
+    se falla antes de reanudar. La comparación es por **igualdad exacta** (no hay tolerancia):
+
+    - ``meta["sde_name"] == sde_name`` — misma SDE.
+    - ``meta["data_dim"] == data_dim`` — misma dimensión/forma de evento (un ``int`` para el toy 2D
+      o una tupla para imágenes; se comparan por igualdad, así que un ``int`` y una tupla nunca
+      matchean).
+    - ``meta.get("model") == model_spec`` — misma receta de red ``{name, kwargs}``. Ambos pueden ser
+      ``None`` (checkpoint sin receta + corrida sin receta = match); si uno está y el otro no →
+      mismatch.
+
+    Args:
+        meta: Metadata del checkpoint de pesos (de :func:`~diffusion.training.load_checkpoint`).
+        sde_name: Nombre de la SDE de la corrida actual.
+        model_spec: Receta de red ``{name, kwargs}`` de la corrida actual (o ``None`` si el
+            checkpoint no llevaba receta).
+        data_dim: ``data_dim`` de la corrida actual (``int`` o tupla; se compara por igualdad).
+
+    Returns:
+        ``None`` si TODO coincide (no levanta).
+
+    Raises:
+        ValueError: Si difiere la SDE, el ``data_dim`` o la receta de red; el mensaje detalla qué
+            no coincide (checkpoint vs corrida) (2.5).
+    """
+    mismatches: list[str] = []
+    if meta.get("sde_name") != sde_name:
+        mismatches.append(
+            f"SDE (checkpoint={meta.get('sde_name')!r} vs corrida={sde_name!r})"
+        )
+    if meta.get("data_dim") != data_dim:
+        mismatches.append(
+            f"data_dim (checkpoint={meta.get('data_dim')!r} vs corrida={data_dim!r})"
+        )
+    if meta.get("model") != model_spec:
+        mismatches.append(
+            f"receta de red (checkpoint={meta.get('model')!r} vs corrida={model_spec!r})"
+        )
+    if mismatches:
+        raise ValueError(
+            "El checkpoint elegido es incompatible con la corrida actual y no se puede reanudar "
+            "desde un estado que no corresponde. Difiere: " + "; ".join(mismatches) + "."
+        )
+
+
+def load_resume(
+    weights_path: pathlib.Path,
+    *,
+    expected: dict,
+    map_location: torch.device | str = "cpu",
+) -> tuple[dict, dict, ResumeState]:
+    """Carga un punto de reanudación (pesos + sidecar) y arma el :class:`ResumeState` a reanudar.
+
+    Reúne los dos artefactos de un snapshot —el checkpoint de **pesos** (``X_stepNNNNN.pt``) y su
+    **sidecar** de resume (``X_stepNNNNN.resume.pt``)— en un estado listo para
+    ``model.load_state_dict(state_dict)`` + ``train(resume=...)``. El ``history`` se toma del ``meta``
+    del checkpoint de PESOS (el sidecar no lo persiste, 1.3).
+
+    Flujo (falla temprano):
+
+    1. Carga ``(state_dict, meta)`` del checkpoint de pesos.
+    2. Valida compatibilidad **antes** de tocar el sidecar (SDE / ``data_dim`` / receta de red vía
+       :func:`validate_compatible`, 2.5) — un config incompatible falla acá.
+    3. Exige el sidecar hermano (:func:`resume_sidecar_path`); si falta → error claro que lo nombra
+       (3.6). Sin él no hay optimizador/paso/azar para reanudar.
+    4. Carga el sidecar y arma el :class:`ResumeState` (optimizador + paso + azar del sidecar;
+       ``history`` del ``meta``, 1.3).
+
+    Args:
+        weights_path: Ruta del checkpoint de pesos elegido (``…_stepNNNNN.pt``).
+        expected: Metadata esperada de la corrida actual para validar compatibilidad: un ``dict`` con
+            ``{"sde_name", "model_spec", "data_dim"}`` (se pasa como ``**expected`` a
+            :func:`validate_compatible`).
+        map_location: Dispositivo donde cargar los tensores de pesos y del sidecar (default
+            ``"cpu"``).
+
+    Returns:
+        ``(state_dict, meta, resume)``: el ``state_dict`` de la red (a cargar en el modelo), el
+        ``meta`` del checkpoint de pesos y el :class:`ResumeState` listo para ``train(resume=...)``.
+
+    Raises:
+        ValueError: Si el checkpoint es incompatible con la corrida (SDE / ``data_dim`` / receta;
+            2.5).
+        FileNotFoundError: Si falta el sidecar de resume del checkpoint elegido; el mensaje nombra el
+            artefacto faltante (3.6).
+    """
+    # Import diferido: mantiene el módulo (discover_snapshots/resolve_resume) libre de torch al
+    # importar; la carga sí necesita el trainer (dirección de dependencia permitida: resume→trainer).
+    from .trainer import ResumeState, load_checkpoint, load_resume_state
+
+    weights_path = pathlib.Path(weights_path)
+
+    # 1) pesos + meta del checkpoint elegido.
+    state_dict, meta = load_checkpoint(weights_path, map_location=map_location)
+
+    # 2) compatibilidad EXACTA contra el meta, ANTES de exigir el sidecar (2.5).
+    validate_compatible(meta, **expected)
+
+    # 3) el sidecar es OBLIGATORIO: sin él no se puede reanudar (3.6).
+    sidecar = resume_sidecar_path(weights_path)
+    if not sidecar.exists():
+        raise FileNotFoundError(
+            f"Falta el sidecar de resume esperado: {sidecar}. Sin el estado del "
+            f"optimizador/paso/azar no se puede reanudar desde {weights_path.name} "
+            "(¿la corrida original corrió con checkpoint_every>0?)."
+        )
+
+    # 4) estado del sidecar (optimizador + paso + azar; sin history) → ResumeState.
+    sc = load_resume_state(sidecar, map_location=map_location)
+    resume = ResumeState(
+        optimizer_state=sc["optimizer_state"],
+        start_step=sc["step"],
+        torch_rng_state=sc["torch_rng_state"],
+        generator_state=sc["generator_state"],
+        history=meta["history"],  # history del checkpoint de PESOS, no del sidecar (1.3)
+    )
+    return state_dict, meta, resume

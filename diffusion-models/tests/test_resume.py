@@ -27,12 +27,14 @@ from diffusion.training import (
     TrainSnapshot,
     discover_snapshots,
     load_checkpoint,
+    load_resume,
     load_resume_state,
     resolve_resume,
     resume_sidecar_path,
     save_checkpoint,
     save_resume_state,
     train,
+    validate_compatible,
 )
 
 SIDECAR_KEYS = {"optimizer_state", "step", "torch_rng_state", "generator_state"}
@@ -708,3 +710,244 @@ def test_resume_sidecar_path_convencion(tmp_path):
     """``X_stepNNNNN.pt`` → ``X_stepNNNNN.resume.pt`` (sidecar hermano) (Data Models)."""
     weights = tmp_path / f"{_STEM}_step00300.pt"
     assert resume_sidecar_path(weights) == tmp_path / f"{_STEM}_step00300.resume.pt"
+
+
+# =============================================================================
+# Task 3.2 — Carga y validación del punto de reanudación (load_resume /
+#            validate_compatible)
+# =============================================================================
+#
+# Carga los pesos + el sidecar del checkpoint elegido y arma el ResumeState listo para reanudar,
+# tomando el ``history`` del ``meta`` del checkpoint de PESOS (no del sidecar, que no lo persiste)
+# (1.3). Exige el sidecar (falta → error claro, 3.6) y valida compatibilidad EXACTA —SDE,
+# ``data_dim`` y receta de red— contra el ``meta`` del checkpoint (2.5).
+
+# Receta de red consistente con ``_net_with_optimizer_state`` (ScoreMLP 2D chico).
+_MODEL_SPEC = {"name": "mlp", "kwargs": {"data_dim": 2, "hidden_dim": 16, "num_blocks": 1}}
+
+
+def _build_checkpoint_and_sidecar(
+    tmp_path,
+    *,
+    sde_name="vp",
+    data_dim=2,
+    model_spec=None,
+    history=None,
+    start_step=5,
+    with_sidecar=True,
+):
+    """Arma un checkpoint de pesos real + (opcional) su sidecar hermano con los helpers commiteados.
+
+    Devuelve ``(weights, sidecar, saved)`` donde ``saved`` es el :class:`ResumeState` que se
+    persistió (o ``None`` si ``with_sidecar=False``), para comparar contra lo que ``load_resume``
+    reconstruye.
+    """
+    if history is None:
+        history = [1.0, 0.5, 0.25, 0.2, 0.1]
+    net, opt = _net_with_optimizer_state()
+    result = TrainResult(
+        net=net, history=list(history), sde_name=sde_name, data_dim=data_dim
+    )
+    weights = tmp_path / f"{sde_name}_gaussian_step{start_step:05d}.pt"
+    save_checkpoint(result, weights, model_spec=model_spec)
+    sidecar = resume_sidecar_path(weights)
+    saved = None
+    if with_sidecar:
+        saved = _resume_state(opt, start_step=start_step, history=history)
+        save_resume_state(sidecar, saved)
+    return weights, sidecar, saved
+
+
+def _meta(*, sde_name="vp", data_dim=2, model=_MODEL_SPEC):
+    """``meta`` sintético al estilo :func:`save_checkpoint` (la clave ``model`` es opcional)."""
+    meta = {"sde_name": sde_name, "data_dim": data_dim, "history": [1.0]}
+    if model is not None:
+        meta["model"] = model
+    return meta
+
+
+# ------------------------------------------------- load_resume happy path (1.3)
+
+
+def test_load_resume_happy_path(tmp_path):
+    """Cargar un punto válido entrega ``(state_dict, meta, ResumeState)`` listo para reanudar.
+
+    El ``history`` del :class:`ResumeState` viene del ``meta`` del checkpoint de PESOS (1.3) —el
+    sidecar no lo persiste—; el paso, el optimizador y el azar vienen del sidecar.
+    """
+    history = [1.0, 0.5, 0.25, 0.2, 0.1]
+    weights, sidecar, saved = _build_checkpoint_and_sidecar(
+        tmp_path, model_spec=_MODEL_SPEC, history=history, start_step=5
+    )
+    expected = {"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+
+    state_dict, meta, resume = load_resume(weights, expected=expected)
+
+    assert isinstance(resume, ResumeState)
+    # (1.3) history del meta de los PESOS, no del sidecar.
+    assert resume.history == history
+    assert resume.history == meta["history"]
+    # paso y azar reconstruidos desde el sidecar.
+    assert resume.start_step == 5
+    assert torch.equal(resume.torch_rng_state, saved.torch_rng_state)
+    assert torch.equal(resume.generator_state, saved.generator_state)
+    # el state_dict es el de la red guardada (claves de un ScoreMLP; no vacío).
+    ref_net = ScoreMLP(data_dim=2, hidden_dim=16, num_blocks=1)
+    assert state_dict.keys() == ref_net.state_dict().keys()
+    # el meta devuelto es el del checkpoint de pesos.
+    assert meta["sde_name"] == "vp"
+    assert meta["data_dim"] == 2
+    # el optimizer_state (del sidecar) carga en un Adam fresco y trae momentos poblados.
+    fresh = torch.optim.Adam(ref_net.parameters(), lr=1e-3)
+    fresh.load_state_dict(resume.optimizer_state)
+    assert fresh.state_dict()["state"]  # Adam ya tenía estado => round-trip real
+
+
+def test_load_resume_history_del_meta_no_del_sidecar(tmp_path):
+    """El ``history`` reconstruido es exactamente el del ``meta`` del checkpoint de pesos (1.3).
+
+    Se guarda un ``history`` en el checkpoint de pesos y NADA de history en el sidecar (por diseño);
+    ``load_resume`` debe rellenar el ``ResumeState`` desde el ``meta``.
+    """
+    history = [3.0, 2.0, 1.0]
+    weights, sidecar, _ = _build_checkpoint_and_sidecar(
+        tmp_path, model_spec=_MODEL_SPEC, history=history, start_step=3
+    )
+    # confirmamos que el sidecar NO persistió history (contrato del sidecar).
+    assert "history" not in load_resume_state(sidecar)
+
+    _, meta, resume = load_resume(
+        weights, expected={"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+    )
+    assert resume.history == history == meta["history"]
+
+
+# ------------------------------------------------ sidecar faltante (3.6)
+
+
+def test_load_resume_sidecar_faltante_error_claro(tmp_path):
+    """Pesos presentes pero SIN sidecar → error claro que NOMBRA el artefacto faltante (3.6)."""
+    weights, sidecar, _ = _build_checkpoint_and_sidecar(
+        tmp_path, model_spec=_MODEL_SPEC, with_sidecar=False
+    )
+    assert not sidecar.exists()
+    expected = {"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+
+    with pytest.raises((FileNotFoundError, ValueError)) as exc:
+        load_resume(weights, expected=expected)
+
+    assert sidecar.name in str(exc.value)  # el mensaje identifica el sidecar faltante
+
+
+# ------------------------------------------------ validate_compatible (2.5)
+
+
+def test_validate_compatible_match_no_levanta():
+    """``meta`` idéntico a la corrida (SDE + data_dim + receta) → no levanta, devuelve ``None``."""
+    assert (
+        validate_compatible(_meta(), sde_name="vp", model_spec=_MODEL_SPEC, data_dim=2)
+        is None
+    )
+
+
+def test_validate_compatible_sde_difiere():
+    """SDE distinta entre ``meta`` y la corrida → ``ValueError`` (2.5)."""
+    with pytest.raises(ValueError):
+        validate_compatible(
+            _meta(sde_name="vp"), sde_name="ve", model_spec=_MODEL_SPEC, data_dim=2
+        )
+
+
+def test_validate_compatible_data_dim_int_difiere():
+    """``data_dim`` int distinto (2 vs 4) → ``ValueError`` (2.5)."""
+    with pytest.raises(ValueError):
+        validate_compatible(
+            _meta(data_dim=2), sde_name="vp", model_spec=_MODEL_SPEC, data_dim=4
+        )
+
+
+def test_validate_compatible_data_dim_int_vs_tupla_difiere():
+    """``data_dim`` int vs tupla (2 vs (1, 28, 28)) → ``ValueError`` (2.5).
+
+    La comparación es por igualdad, así que un entero y una forma de evento nunca matchean.
+    """
+    with pytest.raises(ValueError):
+        validate_compatible(
+            _meta(data_dim=2), sde_name="vp", model_spec=_MODEL_SPEC, data_dim=(1, 28, 28)
+        )
+
+
+def test_validate_compatible_data_dim_tupla_match():
+    """``data_dim`` tupla igual (forma de evento de imágenes) → no levanta."""
+    assert (
+        validate_compatible(
+            _meta(data_dim=(1, 28, 28)),
+            sde_name="vp",
+            model_spec=_MODEL_SPEC,
+            data_dim=(1, 28, 28),
+        )
+        is None
+    )
+
+
+def test_validate_compatible_model_spec_difiere():
+    """Receta de red distinta (kwargs distintos) → ``ValueError`` (2.5)."""
+    otro = {"name": "mlp", "kwargs": {"data_dim": 2, "hidden_dim": 128, "num_blocks": 4}}
+    with pytest.raises(ValueError):
+        validate_compatible(
+            _meta(model=_MODEL_SPEC), sde_name="vp", model_spec=otro, data_dim=2
+        )
+
+
+def test_validate_compatible_ambos_model_none_ok():
+    """``model_spec=None`` y ``meta`` sin clave ``model`` → match (``None == None``) (2.5)."""
+    meta = _meta(model=None)  # sin clave 'model'
+    assert "model" not in meta
+    assert (
+        validate_compatible(meta, sde_name="vp", model_spec=None, data_dim=2) is None
+    )
+
+
+def test_validate_compatible_receta_presente_vs_ausente_difiere():
+    """Uno con receta y el otro sin → mismatch en ambos sentidos (2.5)."""
+    # meta CON receta, corrida SIN.
+    with pytest.raises(ValueError):
+        validate_compatible(
+            _meta(model=_MODEL_SPEC), sde_name="vp", model_spec=None, data_dim=2
+        )
+    # meta SIN receta, corrida CON.
+    with pytest.raises(ValueError):
+        validate_compatible(
+            _meta(model=None), sde_name="vp", model_spec=_MODEL_SPEC, data_dim=2
+        )
+
+
+# ------------------------------ load_resume integra la validación (2.5)
+
+
+def test_load_resume_incompatible_levanta(tmp_path):
+    """Un ``expected`` incompatible con el ``meta`` (SDE distinta) → ``ValueError`` (2.5)."""
+    weights, _sidecar, _ = _build_checkpoint_and_sidecar(
+        tmp_path, sde_name="vp", model_spec=_MODEL_SPEC, start_step=5
+    )
+    expected = {"sde_name": "ve", "model_spec": _MODEL_SPEC, "data_dim": 2}
+
+    with pytest.raises(ValueError):
+        load_resume(weights, expected=expected)
+
+
+def test_load_resume_valida_antes_de_exigir_el_sidecar(tmp_path):
+    """La compatibilidad se chequea ANTES de exigir el sidecar (2.5 precede a 3.6).
+
+    Con un ``expected`` incompatible y sin sidecar, ``load_resume`` falla por incompatibilidad
+    —no por el sidecar faltante— (el mensaje no nombra el sidecar).
+    """
+    weights, sidecar, _ = _build_checkpoint_and_sidecar(
+        tmp_path, sde_name="vp", model_spec=_MODEL_SPEC, with_sidecar=False
+    )
+    expected = {"sde_name": "ve", "model_spec": _MODEL_SPEC, "data_dim": 2}
+
+    with pytest.raises(ValueError) as exc:
+        load_resume(weights, expected=expected)
+
+    assert sidecar.name not in str(exc.value)  # falló por compat, no por el sidecar
