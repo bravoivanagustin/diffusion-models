@@ -367,3 +367,139 @@ def test_resume_none_entrena_normal():
     assert len(result.history) == 5
     assert result.net is net
     assert result.sde_name == "vp"
+
+
+# =============================================================================
+# Task 2.2 — Equivalencia de la reanudación (gate de fidelidad, 2.6 / 2.1)
+# =============================================================================
+#
+# Se remueve el confundidor del ORDEN DE DATOS con una fuente de **orden fijo**: un iterador
+# infinito que yield-ea el MISMO batch en cada paso. Como ``train`` reconstruye ``iter(data)``
+# por llamada y una corrida reanudada itera ``range(start_step, num_steps)`` sobre un iterador
+# fresco, una fuente constante garantiza dato idéntico en cada paso tanto para la corrida
+# ininterrumpida como para la reanudada. (Una fuente barajada/posicional divergiría — esa
+# divergencia es la R2.6 relajada y aceptada; el test la controla a propósito para aislar y
+# probar exactamente la restauración de optimizador + azar + paso.)
+
+_N = 6  # paso del checkpoint intermedio
+_TOTAL = 2 * _N  # total de la corrida (num_steps): el snapshot en _N cae ANTES del último paso
+
+
+def _const_source(batch):
+    """Fuente infinita de ORDEN FIJO: yield-ea el MISMO batch en cada paso (resume-invariante)."""
+    while True:
+        yield batch
+
+
+def _fixed_batch(n=64, dim=2, seed=1234):
+    """Batch fijo, con un ``Generator`` propio para NO tocar el RNG global de torch.
+
+    El batch se crea antes de ``train``; usar un generador aparte evita perturbar el RNG global
+    que la corrida ininterrumpida siembra (``config.seed``) y que la reanudada restaura.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(n, dim, generator=gen)
+
+
+def _equiv_net() -> ScoreMLP:
+    """Red chica y determinística, misma arquitectura para A / B / contraste."""
+    return ScoreMLP(data_dim=2, hidden_dim=32, num_blocks=1)
+
+
+def _weights_allclose(a, b) -> bool:
+    """``True`` si TODO el ``state_dict`` de ``a`` y ``b`` es ``allclose`` (tolerancia tight, default)."""
+    sda, sdb = a.state_dict(), b.state_dict()
+    assert sda.keys() == sdb.keys()
+    return all(torch.allclose(sda[k], sdb[k]) for k in sda)
+
+
+def _run_uninterrupted():
+    """Corrida A: entrena ininterrumpido hasta ``_TOTAL`` sobre la fuente de orden fijo.
+
+    Devuelve ``(sde, batch, result_a, net_a, snap_N)`` donde ``snap_N`` es el
+    :class:`TrainSnapshot` **congelado** (``deepcopy``) del paso ``_N``: el loop sigue mutando los
+    pesos y el estado del optimizador in-place después del snapshot, así que hay que congelarlo
+    para reanudar desde ese punto exacto.
+    """
+    sde = make_sde("vp")
+    batch = _fixed_batch()
+    frozen: dict[str, TrainSnapshot] = {}
+
+    def capture(tag, snap):
+        frozen[tag] = copy.deepcopy(snap)
+
+    net_a = _equiv_net()
+    result_a = train(
+        sde,
+        net_a,
+        _const_source(batch),
+        TrainConfig(num_steps=_TOTAL, checkpoint_every=_N, seed=0),
+        on_checkpoint=capture,
+    )
+    return sde, batch, result_a, net_a, frozen[f"step{_N:05d}"]
+
+
+def test_resume_equivalente_a_corrida_ininterrumpida():
+    """Gate de fidelidad (2.6, 2.1): con orden fijo, reanudar equivale a no interrumpir.
+
+    - A: corrida entera hasta ``_TOTAL`` con snapshot en el paso ``_N``.
+    - B: red **fresca** con los pesos del paso ``_N`` cargados, reanudada con ``resume=snap.resume``
+      hasta ``_TOTAL`` sobre la misma fuente de orden fijo.
+
+    Removido el confundidor del orden de datos, restaurar optimizador + azar + paso hace que B
+    reproduzca A: pesos ``allclose`` (tolerancia tight) e ``history`` idéntico paso a paso.
+    """
+    sde, batch, result_a, net_a, snap = _run_uninterrupted()
+
+    # El snapshot es del paso _N: history de largo _N y start_step == _N; A cubrió _TOTAL.
+    assert snap.resume.start_step == _N
+    assert len(snap.resume.history) == _N
+    assert len(result_a.history) == _TOTAL
+
+    net_b = _equiv_net()
+    net_b.load_state_dict(snap.result.net.state_dict())  # pesos congelados del paso _N
+    result_b = train(
+        sde,
+        net_b,
+        _const_source(batch),  # misma fuente de orden fijo
+        TrainConfig(num_steps=_TOTAL, seed=0),  # num_steps = TOTAL a alcanzar
+        resume=snap.resume,
+    )
+
+    # Equivalencia de la curva completa (2.3) y de los pesos finales (2.1, 2.6).
+    assert result_b.history == result_a.history
+    assert _weights_allclose(net_a, net_b)
+
+
+def test_resume_sin_restaurar_optimizador_difiere():
+    """Contraste (2.1): reanudar SIN restaurar el optimizador rompe la equivalencia.
+
+    Idéntico a la reanudación fiel salvo que el ``optimizer_state`` se reemplaza por el de un
+    ``Adam`` fresco (estado vacío = warm restart sin momentos). Con todo lo demás igual —pesos,
+    azar, paso y datos—, los pesos finales YA NO son ``allclose`` a A: demuestra que la
+    restauración del optimizador (los momentos de Adam) es lo que hace fiel a la reanudación.
+    """
+    sde, batch, result_a, net_a, snap = _run_uninterrupted()
+
+    cfg = TrainConfig(num_steps=_TOTAL, seed=0)
+    net_c = _equiv_net()
+    net_c.load_state_dict(snap.result.net.state_dict())  # mismos pesos del paso _N que B
+
+    # Optimizador SIN restaurar: estado vacío de un Adam fresco (mismo lr que la corrida, para que
+    # la ÚNICA diferencia con la reanudación fiel sea la ausencia de momentos).
+    fresh_opt = torch.optim.Adam(net_c.parameters(), lr=cfg.lr)
+    no_opt_resume = ResumeState(
+        optimizer_state=fresh_opt.state_dict(),  # estado vacío => warm restart, sin momentos
+        start_step=snap.resume.start_step,
+        torch_rng_state=snap.resume.torch_rng_state,
+        generator_state=snap.resume.generator_state,
+        history=list(snap.resume.history),
+    )
+
+    result_c = train(sde, net_c, _const_source(batch), cfg, resume=no_opt_resume)
+
+    # Sin restaurar el optimizador los pesos finales difieren de A (la restauración importa)...
+    assert not _weights_allclose(net_a, net_c)
+    # ...y la curva diverge, aunque conserve el prefijo previo (el 1.er loss es pre-update, igual).
+    assert result_c.history != result_a.history
+    assert result_c.history[:_N] == result_a.history[:_N]
