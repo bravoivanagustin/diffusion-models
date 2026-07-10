@@ -11,6 +11,7 @@ Torch es dependencia dura del módulo (igual que en `test_training.py`), así qu
 from __future__ import annotations
 
 import copy
+import pathlib
 
 import pytest
 
@@ -951,3 +952,225 @@ def test_load_resume_valida_antes_de_exigir_el_sidecar(tmp_path):
         load_resume(weights, expected=expected)
 
     assert sidecar.name not in str(exc.value)  # falló por compat, no por el sidecar
+
+
+# =============================================================================
+# Task 4 — Orquestación del CLI de entrenamiento (integración)
+# =============================================================================
+#
+# Tests de nivel CLI de ``scripts/train.py`` (que no es un módulo del paquete): se carga su
+# ``main`` con ``importlib.util.spec_from_file_location`` (el script auto-inyecta ``src`` en
+# ``sys.path``) y se lo invoca con ``main(argv=[...])``. Se usan configs YAML mínimos en
+# ``tmp_path`` (``num_steps`` chico, ``checkpoint_every`` > 0, ``out.checkpoint`` bajo
+# ``tmp_path``) para correr en segundos de CPU y ejercitar el wiring skip/resume/fresh, el
+# callback corregido (pesos + sidecar) y el reporte de la acción.
+
+import importlib.util
+
+yaml = pytest.importorskip("yaml")
+
+_TRAIN_SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "train.py"
+
+
+def _load_train_main():
+    """Carga ``main`` de ``scripts/train.py`` como función invocable (el script no es un módulo)."""
+    spec = importlib.util.spec_from_file_location("train_cli_under_test", _TRAIN_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.main
+
+
+def _write_cli_config(
+    tmp_path,
+    *,
+    num_steps=6,
+    checkpoint_every=2,
+    with_checkpoint=True,
+    with_loss_curve=False,
+):
+    """Escribe un ``.yaml`` mínimo (ScoreMLP chico) y devuelve ``(config_path, ckpt_path)``.
+
+    Rutas de salida absolutas bajo ``tmp_path`` (posix, que pathlib maneja en Windows) para no
+    depender del cwd. ``ckpt_path`` es ``None`` si ``with_checkpoint=False``.
+    """
+    run_dir = tmp_path / "run"
+    ckpt = run_dir / "vp_gaussian.pt"
+    out: dict = {}
+    if with_checkpoint:
+        out["checkpoint"] = ckpt.as_posix()
+    if with_loss_curve:
+        out["loss_curve"] = (run_dir / "vp_gaussian_loss.png").as_posix()
+    cfg = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {
+            "num_steps": num_steps,
+            "lr": 0.002,
+            "seed": 0,
+            "checkpoint_every": checkpoint_every,
+        },
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1},
+        "out": out,
+    }
+    config_path = tmp_path / "config.yaml"
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+    return str(config_path), (ckpt if with_checkpoint else None)
+
+
+# ---------------------------------------- corrida fresca: final + snapshot + sidecar (1.1)
+
+
+def test_cli_fresh_crea_final_snapshot_y_sidecar(tmp_path):
+    """Corrida fresca con checkpointing intermedio: crea el final ``.pt``, al menos un snapshot
+    ``…_stepNNNNN.pt`` y su sidecar ``…_stepNNNNN.resume.pt`` (prueba la corrección del callback,
+    1.1).
+    """
+    cfg, ckpt = _write_cli_config(tmp_path, num_steps=6, checkpoint_every=2)
+    main = _load_train_main()
+
+    rc = main(["--config", cfg])
+
+    assert rc == 0
+    assert ckpt.exists()  # checkpoint final (3.9)
+    snaps = discover_snapshots(ckpt)  # excluye final/best/sidecars
+    assert snaps, "debería haber al menos un snapshot intermedio"
+    step, snap_path = snaps[-1]
+    sidecar = resume_sidecar_path(snap_path)
+    assert sidecar.exists(), "el callback debe persistir el sidecar de resume junto a los pesos"
+    # el sidecar es cargable y trae el estado de resume (paso + azar + optimizador).
+    sc = load_resume_state(sidecar)
+    assert sc["step"] == step
+    assert set(sc) == SIDECAR_KEYS
+
+
+# ---------------------------------------------------- skip si el final existe (3.1) + force (3.2)
+
+
+def test_cli_skip_si_final_existe_y_force_reentrena(tmp_path, capsys):
+    """Con el final presente la corrida se saltea sin sobrescribir (3.1); ``--force`` reentrena
+    (reanudando desde el snapshot más nuevo) y sí reescribe el final (3.2).
+    """
+    cfg, ckpt = _write_cli_config(tmp_path, num_steps=6, checkpoint_every=2)
+    main = _load_train_main()
+    assert main(["--config", cfg]) == 0
+    assert ckpt.exists()
+
+    # Sentinela robusto (independiente de la resolución de mtime): si el skip NO reentrena, estos
+    # bytes sobreviven; si el force reentrena, se sobrescriben con un checkpoint real.
+    sentinel = b"SENTINEL-NO-TOCAR"
+    ckpt.write_bytes(sentinel)
+    capsys.readouterr()  # limpiar
+
+    # (3.1) re-correr con el final presente => skip, salida 0, sin tocar el archivo.
+    rc = main(["--config", cfg])
+    assert rc == 0
+    assert ckpt.read_bytes() == sentinel  # NO se sobrescribió
+    out_skip = capsys.readouterr().out
+    assert "--force" in out_skip and ("complet" in out_skip.lower())
+
+    # (3.2) --force => reentrena (reanuda desde el más nuevo) y reescribe el final.
+    rc = main(["--config", cfg, "--force"])
+    assert rc == 0
+    assert ckpt.read_bytes() != sentinel  # se sobrescribió con un checkpoint real
+    out_force = capsys.readouterr().out
+    assert "ya completa" not in out_force.lower()  # NO se salteó
+    assert "reanud" in out_force.lower()  # force reanuda desde el snapshot más nuevo (3.2/3.3)
+    # sigue siendo un checkpoint válido que cubre toda la corrida.
+    _, meta = load_checkpoint(ckpt)
+    assert len(meta["history"]) == 6
+
+
+# ---------------------------------------------- auto-resume desde el más nuevo (3.3, 3.8, 3.9)
+
+
+def test_cli_auto_resume_recrea_final(tmp_path, capsys):
+    """Corrida interrumpida simulada (snapshots + sidecars, sin final): re-correr auto-reanuda
+    desde el snapshot más nuevo, reporta la acción (3.8) y recrea el final cubriendo toda la
+    corrida (3.3, 3.9).
+    """
+    cfg, ckpt = _write_cli_config(
+        tmp_path, num_steps=6, checkpoint_every=2, with_loss_curve=True
+    )
+    main = _load_train_main()
+    assert main(["--config", cfg]) == 0
+    snaps = discover_snapshots(ckpt)
+    assert snaps
+    newest_step = snaps[-1][0]
+
+    # Simular la interrupción: se borra el final pero quedan los snapshots + sidecars.
+    ckpt.unlink()
+    loss_curve = ckpt.parent / "vp_gaussian_loss.png"
+    if loss_curve.exists():
+        loss_curve.unlink()
+    assert not ckpt.exists()
+    capsys.readouterr()  # limpiar
+
+    rc = main(["--config", cfg])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "reanud" in out.lower()  # reporta la acción de resume (3.8)
+    assert f"paso {newest_step}" in out  # y el origen (paso del snapshot elegido)
+    assert ckpt.exists()  # final recreado (3.9)
+    _, meta = load_checkpoint(ckpt)
+    assert len(meta["history"]) == 6  # la curva/historia cubren toda la corrida (3.9)
+    assert loss_curve.exists()  # y la curva de pérdida se reescribe sobre toda la corrida (3.9)
+
+
+# ------------------------------------------------ advertencia sin puntos de reanudación (1.5)
+
+
+def test_cli_advierte_sin_puntos_de_reanudacion(tmp_path, capsys):
+    """Con ``checkpoint_every=0`` el CLI advierte que la corrida NO dejará puntos de reanudación
+    (1.5).
+    """
+    cfg, _ = _write_cli_config(tmp_path, num_steps=4, checkpoint_every=0)
+    main = _load_train_main()
+
+    rc = main(["--config", cfg])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "checkpoint_every" in out
+    assert "reanud" in out.lower()
+
+
+# ------------------------------------------------ --resume-from por paso puntual (3.5)
+
+
+def test_cli_resume_from_step_selecciona_snapshot(tmp_path, capsys):
+    """``--resume-from N`` reanuda desde ese snapshot puntual (no el más nuevo) y completa (3.5)."""
+    cfg, ckpt = _write_cli_config(tmp_path, num_steps=6, checkpoint_every=2)
+    main = _load_train_main()
+    assert main(["--config", cfg]) == 0
+    ckpt.unlink()  # sin final, para que la acción sea claramente un resume
+    snaps = discover_snapshots(ckpt)
+    assert len(snaps) >= 2
+    chosen_step = snaps[0][0]  # el MÁS VIEJO, distinto del auto (más nuevo)
+    capsys.readouterr()
+
+    rc = main(["--config", cfg, "--resume-from", str(chosen_step)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert f"paso {chosen_step}" in out  # reanudó desde el snapshot elegido, no el más nuevo
+    assert ckpt.exists()
+    _, meta = load_checkpoint(ckpt)
+    assert len(meta["history"]) == 6
+
+
+# ------------------------------------------------ --resume-from inexistente => error limpio (3.7)
+
+
+def test_cli_resume_from_inexistente_error_exit_2(tmp_path, capsys):
+    """``--resume-from`` con un paso inexistente => salida 2 (error limpio); lista disponibles."""
+    cfg, ckpt = _write_cli_config(tmp_path, num_steps=6, checkpoint_every=2)
+    main = _load_train_main()
+    assert main(["--config", cfg]) == 0
+    ckpt.unlink()
+    capsys.readouterr()
+
+    rc = main(["--config", cfg, "--resume-from", "99999"])
+
+    assert rc == 2  # ValueError mapeado a exit code 2 (patrón del script)

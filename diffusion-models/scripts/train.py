@@ -27,7 +27,16 @@ _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from diffusion.training import build_run, load_config, save_checkpoint, train
+from diffusion.training import (
+    build_run,
+    load_config,
+    load_resume,
+    resolve_resume,
+    resume_sidecar_path,
+    save_checkpoint,
+    save_resume_state,
+    train,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint-every", type=int, default=None,
                    help="Override de cada cuántos pasos guardar un snapshot intermedio "
                         "(0 = solo el checkpoint final; requiere 'out.checkpoint').")
+    p.add_argument("--force", action="store_true",
+                   help="Reentrenar aunque el checkpoint final ya exista (saltea el skip). "
+                        "Si hay snapshots intermedios, reanuda desde el más nuevo.")
+    p.add_argument("--resume-from", type=str, default=None, metavar="PATH_O_STEP",
+                   help="Reanudar desde un checkpoint puntual: la ruta de un snapshot "
+                        "'…_stepNNNNN.pt' o su número de paso (en vez del más nuevo automático).")
     p.add_argument("--quiet", action="store_true",
                    help="No imprimir el progreso por paso.")
     return p
@@ -97,29 +112,84 @@ def main(argv=None) -> int:
     elif spec.config.log_every == 0:
         spec.config.log_every = max(1, spec.config.num_steps // 10)
 
-    # Callback de checkpointing intermedio: solo si hay una ruta base de checkpoint. Deriva
-    # rutas hermanas (…_stepNNNNN.pt / …_best.pt) del checkpoint final y reusa save_checkpoint;
-    # así train() sigue sin tocar el filesystem (decide *cuándo*, esto decide *dónde*).
-    on_checkpoint = None
-    if spec.checkpoint is not None:
-        base = spec.checkpoint
-
-        def on_checkpoint(tag, snapshot):
-            tagged = base.with_stem(f"{base.stem}_{tag}")
-            save_checkpoint(snapshot, tagged, model_spec=spec.model_spec)
-            print(f"Checkpoint ({tag}) -> {tagged}")
-    elif spec.config.checkpoint_every > 0:
-        print(
-            "nota: 'train.checkpoint_every' > 0 pero falta 'out.checkpoint'; "
-            "no se guardarán snapshots intermedios."
+    # --- Resolución de resume (skip / resume / fresh) a partir del .yaml y los flags ---
+    # resolve_resume solo mira el filesystem (no entrena ni escribe); --resume-from inexistente
+    # levanta ValueError que se mapea a exit 2 (patrón del script).
+    try:
+        plan = resolve_resume(
+            spec.checkpoint, force=args.force, resume_from=args.resume_from
         )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if plan.action == "skip":
+        # El checkpoint final ya existe: corrida completa. No se sobrescribe nada (3.1).
+        print(
+            f"Corrida ya completa: el checkpoint final '{spec.checkpoint}' ya existe; "
+            "nada que entrenar (usá --force para reentrenar)."
+        )
+        return 0
+
+    # --- Callback de checkpointing intermedio + advertencias sobre puntos de reanudación ---
+    # El callback deriva rutas hermanas (…_stepNNNNN.pt / …_best.pt) del checkpoint final y
+    # persiste AMBOS artefactos: los pesos (save_checkpoint) y el sidecar de resume
+    # (save_resume_state), así una interrupción deja un punto reanudable (1.1). train() sigue sin
+    # tocar el filesystem: decide *cuándo*; esto decide *dónde/cómo*.
+    on_checkpoint = None
+    if spec.config.checkpoint_every > 0:
+        if spec.checkpoint is not None:
+            base = spec.checkpoint
+
+            def on_checkpoint(tag, snapshot):
+                tagged = base.with_stem(f"{base.stem}_{tag}")
+                save_checkpoint(snapshot.result, tagged, model_spec=spec.model_spec)
+                save_resume_state(resume_sidecar_path(tagged), snapshot.resume)
+                print(f"Checkpoint ({tag}) -> {tagged}  (+ sidecar de resume)")
+        else:
+            print(
+                "nota: 'train.checkpoint_every' > 0 pero falta 'out.checkpoint'; "
+                "no se guardarán snapshots intermedios."
+            )
+    else:
+        # Sin snapshots periódicos no hay puntos de reanudación: la resumabilidad requiere
+        # checkpoint_every>0 (1.5).
+        print(
+            "advertencia: 'train.checkpoint_every' = 0: esta corrida no dejará puntos de "
+            "reanudación (sin snapshots intermedios ni sidecars de resume). Para poder reanudar "
+            "una corrida larga interrumpida, seteá 'train.checkpoint_every' > 0 con 'out.checkpoint'."
+        )
+
+    # --- Aplicar el plan: reanudar (cargar pesos + estado) o empezar de cero; reportar (3.8) ---
+    resume = None
+    if plan.action == "resume":
+        expected = {
+            "sde_name": spec.sde.name,
+            "model_spec": spec.model_spec,
+            "data_dim": spec.sde.data_dim,
+        }
+        try:
+            state_dict, _meta, resume = load_resume(plan.weights_path, expected=expected)
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        spec.model.load_state_dict(state_dict)
+        print(
+            f"Acción: reanudando desde {plan.weights_path} (paso {resume.start_step}) "
+            f"hasta num_steps={spec.config.num_steps}."
+        )
+    else:  # fresh
+        print("Acción: entrenando desde cero.")
 
     print(
         f"Entrenando sde={spec.sde.name} (data_dim={spec.sde.data_dim}) "
         f"con {type(spec.model).__name__}: pasos={spec.config.num_steps} "
         f"device={spec.config.device}"
     )
-    result = train(spec.sde, spec.model, spec.data, spec.config, on_checkpoint=on_checkpoint)
+    result = train(
+        spec.sde, spec.model, spec.data, spec.config,
+        on_checkpoint=on_checkpoint, resume=resume,
+    )
     hist = result.history
     k = max(1, len(hist) // 20)  # media de extremos: la pérdida per-step es ruidosa
     ini, fin = sum(hist[:k]) / k, sum(hist[-k:]) / k
