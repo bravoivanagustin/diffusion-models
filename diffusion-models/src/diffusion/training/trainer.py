@@ -121,49 +121,88 @@ def train(
     config: TrainConfig,
     *,
     generator: torch.Generator | None = None,
-    on_checkpoint: Callable[[str, TrainResult], None] | None = None,
+    on_checkpoint: Callable[[str, TrainSnapshot], None] | None = None,
+    resume: ResumeState | None = None,
 ) -> TrainResult:
     """Entrena la red ``model`` para aproximar el score de ``sde`` por DSM.
 
     Loop **por pasos** y agnóstico a la red: usa la ``model`` recibida (no construye ninguna ni
     ramifica por su tipo) y consume ``data`` con ``next()`` — un batch por paso.
 
+    Es **reanudable**: sin ``resume`` entrena desde cero (paso 0, optimizador nuevo, azar
+    sembrado con ``config.seed``); con un :class:`ResumeState` continúa una corrida previa —
+    restaura el optimizador y el azar, arranca en el paso guardado y sigue el ``history``— hasta
+    completar ``config.num_steps`` (interpretado como el **total** a alcanzar, no como pasos
+    adicionales).
+
     Args:
         sde: Proceso forward (define el kernel y el target del score). Su ``data_dim`` queda
             registrado en el resultado (lo usa el checkpoint).
         model: Red de score ya construida (cualquier :class:`ScoreModel`). Se mueve al
-            dispositivo de forma idempotente y se pone en modo entrenamiento.
+            dispositivo de forma idempotente y se pone en modo entrenamiento. Al reanudar, el
+            caller ya le cargó los pesos del checkpoint elegido.
         data: Iterador/iterable **infinito** que yield-ea tensores crudos ``(B, ...)`` (p. ej.
             ``infinite_bare(distribution.dataloader(...))``). Se le pide un batch por paso.
-        config: Hiperparámetros del loop de entrenamiento.
-        generator: Generador opcional para el ruido del kernel / muestreo de ``t``. Si es
-            ``None`` se crea uno sembrado con ``config.seed``.
+        config: Hiperparámetros del loop de entrenamiento. ``num_steps`` es el **total** de la
+            corrida (al reanudar se corren solo los pasos restantes).
+        generator: Generador opcional para el ruido del kernel / muestreo de ``t``. Sin
+            ``resume`` se crea (si es ``None``) sembrado con ``config.seed``; con ``resume`` se
+            crea si hace falta el objeto pero su estado se **restaura** desde el ``ResumeState``
+            (no se re-siembra).
         on_checkpoint: Callback **opcional** de checkpointing intermedio. Se invoca con
             ``(tag, snapshot)`` donde ``tag`` es ``"step{N:05d}"`` (snapshot periódico cada
             ``config.checkpoint_every`` pasos) o ``"best"`` (nueva pérdida mínima de intervalo),
-            y ``snapshot`` es un :class:`TrainResult` con la red en ese punto. El loop decide
-            **cuándo** llamar; el callback decide **cómo/dónde** persistir — ``train`` no toca el
-            filesystem. Sin este callback (o con ``checkpoint_every=0``) solo se entrena; el
-            checkpoint final lo guarda el caller con :func:`save_checkpoint`.
+            y ``snapshot`` es un :class:`TrainSnapshot` — el :class:`TrainResult` con la red en
+            ese punto **más** el :class:`ResumeState` (optimizador + paso + azar + history) para
+            poder reanudar. El loop decide **cuándo** llamar; el callback decide **cómo/dónde**
+            persistir — ``train`` no toca el filesystem. Sin este callback (o con
+            ``checkpoint_every=0``) solo se entrena; el checkpoint final lo guarda el caller con
+            :func:`save_checkpoint`.
+        resume: Estado de resume **opcional**. Si es ``None`` (default) el loop entrena desde
+            cero (sin regresión). Si se provee, restaura el optimizador (``load_state_dict``) y el
+            azar (``torch.set_rng_state`` + ``generator.set_state``) **sin re-sembrar**, arranca
+            en ``resume.start_step``, continúa ``resume.history`` e itera
+            ``range(start_step, num_steps)``. Si ``start_step >= num_steps`` no corre ningún paso
+            y devuelve el resultado ya completo.
 
     Returns:
         :class:`TrainResult` con la red entrenada, la historia de pérdida (**serie per-step
-        completa**: una entrada por paso, ``len(history) == num_steps``), el ``config`` usado,
-        el nombre de la SDE y su ``data_dim``.
+        completa**: una entrada por paso, ``len(history) == num_steps`` cuando
+        ``start_step < num_steps``; el ``history`` previo intacto en el caso no-op), el ``config``
+        usado, el nombre de la SDE y su ``data_dim``.
     """
     device = torch.device(config.device)
-    if config.seed is not None:
-        torch.manual_seed(config.seed)
-    if generator is None:
-        generator = torch.Generator(device=device)
+    if resume is None:
+        # Corrida desde cero: siembra el azar con config.seed (comportamiento histórico).
         if config.seed is not None:
-            generator.manual_seed(config.seed)
+            torch.manual_seed(config.seed)
+        if generator is None:
+            generator = torch.Generator(device=device)
+            if config.seed is not None:
+                generator.manual_seed(config.seed)
+    elif generator is None:
+        # Reanudación: NO se re-siembra; el estado del generator se restaura más abajo desde el
+        # ResumeState. Igual hay que crear el objeto si el caller no lo pasó.
+        generator = torch.Generator(device=device)
 
     net = model.to(device)  # idempotente: no falla si el caller ya la movió
     net.train()
 
     data_iter = iter(data)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.lr)
+
+    # Estado inicial del loop: desde cero o restaurado de un ResumeState.
+    if resume is None:
+        start_step = 0
+        history: list[float] = []
+    else:
+        # Restaurar optimizador y azar antes de continuar (2.1). El load_state_dict actúa además
+        # de guard de compatibilidad: levanta si las shapes del optimizador no corresponden (2.5).
+        optimizer.load_state_dict(resume.optimizer_state)
+        torch.set_rng_state(resume.torch_rng_state)
+        generator.set_state(resume.generator_state)
+        start_step = resume.start_step
+        history = list(resume.history)  # continuar la curva previa (2.3)
 
     # ``history`` guarda la pérdida de CADA paso (serie completa, la fuente de verdad). ``log_every``
     # gobierna solo el print de consola, desacoplado. Para el "best" se usa una cadencia interna
@@ -176,11 +215,8 @@ def train(
     do_checkpoints = on_checkpoint is not None and config.checkpoint_every > 0
     best_loss = float("inf")
 
-    history: list[float] = []
-
-    def _snapshot() -> TrainResult:
-        # Foto del estado actual para que el callback la persista (lee la red viva vía state_dict
-        # dentro del callback, así que refleja los pesos de este paso).
+    def _result() -> TrainResult:
+        # Foto del TrainResult actual (pesos vía la red viva + copia del history).
         return TrainResult(
             net=net,
             history=list(history),
@@ -189,7 +225,24 @@ def train(
             data_dim=sde.data_dim,
         )
 
-    for step in range(config.num_steps):
+    def _snapshot(completed_steps: int) -> TrainSnapshot:
+        # Foto completa para que el callback persista pesos y sidecar: el TrainResult (pesos +
+        # history) más el ResumeState del momento (optimizador + paso + azar + history). El azar
+        # se lee DESPUÉS del paso, así que reanudar desde acá continúa el mismo stream (2.6).
+        return TrainSnapshot(
+            result=_result(),
+            resume=ResumeState(
+                optimizer_state=optimizer.state_dict(),
+                start_step=completed_steps,  # pasos ya completados (= N del tag step{N:05d})
+                torch_rng_state=torch.get_rng_state(),
+                generator_state=generator.get_state(),
+                history=list(history),
+            ),
+        )
+
+    # ``num_steps`` es el TOTAL a alcanzar: se corren solo los pasos restantes (2.2). Si el paso
+    # inicial ya lo alcanzó/superó, el rango es vacío y no se ejecuta ningún paso (no-op, 2.4).
+    for step in range(start_step, config.num_steps):
         x0 = next(data_iter).to(device)
         t = sample_timesteps(
             x0.shape[0], sde.T, config.t_eps, generator=generator, device=device
@@ -209,7 +262,7 @@ def train(
         # no tenga que ser múltiplo de nada. El último paso lo cubre el checkpoint final del
         # caller, así que se excluye acá.
         if do_checkpoints and not is_last and (step + 1) % config.checkpoint_every == 0:
-            on_checkpoint(f"step{step + 1:05d}", _snapshot())
+            on_checkpoint(f"step{step + 1:05d}", _snapshot(step + 1))
 
         # Best-so-far sobre una media de ventana (suavizada; la pérdida de un paso suelto es muy
         # ruidosa por el t aleatorio), a una cadencia interna desacoplada de log_every/history.
@@ -218,7 +271,7 @@ def train(
             window_mean = sum(window) / len(window)
             if window_mean < best_loss:
                 best_loss = window_mean
-                on_checkpoint("best", _snapshot())
+                on_checkpoint("best", _snapshot(step + 1))
 
         # Print de progreso (solo consola, desacoplado del history): media móvil de los últimos
         # log_every pasos, más legible que un paso suelto.

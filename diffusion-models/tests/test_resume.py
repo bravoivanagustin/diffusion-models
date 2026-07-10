@@ -10,23 +10,37 @@ Torch es dependencia dura del módulo (igual que en `test_training.py`), así qu
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
+from diffusion.data_generation import infinite_bare, make_distribution
 from diffusion.models import ScoreMLP
 from diffusion.sde import make_sde
 from diffusion.training import (
     ResumeState,
+    TrainConfig,
     TrainResult,
     TrainSnapshot,
     load_checkpoint,
     load_resume_state,
     save_checkpoint,
     save_resume_state,
+    train,
 )
 
 SIDECAR_KEYS = {"optimizer_state", "step", "torch_rng_state", "generator_state"}
+
+
+def _small_net(sde) -> ScoreMLP:
+    return ScoreMLP(data_dim=sde.data_dim, hidden_dim=64, num_blocks=2)
+
+
+def _data(dist, n=256, batch_size=64, *, shuffle=True):
+    """Fuente infinita de tensores crudos que consume ``train`` (loader finito envuelto)."""
+    return infinite_bare(dist.dataloader(n, batch_size, shuffle=shuffle))
 
 
 def _net_with_optimizer_state():
@@ -193,3 +207,163 @@ def test_trainsnapshot_envuelve_result_y_resume():
 
     assert snap.result is result
     assert snap.resume is resume
+
+
+# =============================================================================
+# Task 2.1 — Reanudación del loop de entrenamiento (`train(resume=...)`)
+# =============================================================================
+
+
+# --------------------------------------------- corre solo los restantes (2.2, 2.3)
+
+
+def test_resume_corre_solo_los_pasos_restantes():
+    """Reanudar desde el paso N con ``num_steps`` total corre solo los pasos restantes (2.2)
+    y continúa el ``history`` previo hasta cubrir toda la corrida (2.3).
+
+    Se corre una corrida fresca hasta 4 pasos con snapshot en el paso 2 y se **congela** ese
+    snapshot (``deepcopy``): así los pesos y el estado del optimizador quedan fijos en el paso 2
+    (las corridas siguientes del loop mutarían los tensores in-place). Reanudando desde ese
+    snapshot con ``num_steps=4`` el loop itera ``range(2, 4)`` → 2 pasos nuevos, y el ``history``
+    final mide 4 arrancando por los 2 previos.
+    """
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+
+    frozen: dict[str, TrainSnapshot] = {}
+
+    def capture(tag, snap):
+        # deepcopy: congela pesos + optimizer_state en el paso del snapshot (el loop sigue
+        # mutando esos tensores in-place después).
+        frozen[tag] = copy.deepcopy(snap)
+
+    net = _small_net(sde)
+    train(
+        sde,
+        net,
+        _data(dist),
+        TrainConfig(num_steps=4, checkpoint_every=2, seed=0),
+        on_checkpoint=capture,
+    )
+
+    snap = frozen["step00002"]
+    assert snap.resume.start_step == 2
+    assert len(snap.resume.history) == 2  # history del paso 2
+
+    result = train(
+        sde,
+        snap.result.net,  # pesos congelados del paso 2
+        _data(dist),
+        TrainConfig(num_steps=4, seed=0),  # num_steps = TOTAL a alcanzar
+        resume=snap.resume,
+    )
+
+    assert len(result.history) == 4  # 2 previos + 2 nuevos == num_steps total (2.3)
+    assert len(result.history) - len(snap.resume.history) == 2  # corrió exactamente 2 pasos (2.2)
+    assert result.history[:2] == snap.resume.history  # continuó el history previo, no lo reinició
+
+
+# ----------------------------------------------------- no-op si ya completo (2.4)
+
+
+@pytest.mark.parametrize("start_step", [4, 5, 10])
+def test_resume_no_op_si_ya_completo(start_step):
+    """Si el paso inicial ya alcanzó/superó ``num_steps``, no se corre ningún paso (2.4).
+
+    El resultado devuelve el ``history`` previo sin cambios (ni un append más).
+    """
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    net = _small_net(sde)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    prior_history = [1.0, 0.5, 0.25, 0.2]
+
+    resume = ResumeState(
+        optimizer_state=opt.state_dict(),
+        start_step=start_step,
+        torch_rng_state=torch.get_rng_state(),
+        generator_state=torch.Generator().manual_seed(0).get_state(),
+        history=list(prior_history),
+    )
+
+    result = train(
+        sde, net, _data(dist), TrainConfig(num_steps=4, seed=0), resume=resume
+    )
+
+    assert result.history == prior_history  # sin pasos nuevos: history intacto
+    assert len(result.history) == len(prior_history)
+
+
+# --------------------------------------- contrato del callback: TrainSnapshot (1.1)
+
+
+def test_on_checkpoint_recibe_trainsnapshot_con_resume_state():
+    """Con ``checkpoint_every>0`` el callback recibe un :class:`TrainSnapshot` cuyo ``.result`` es
+    un :class:`TrainResult` y cuyo ``.resume`` es un :class:`ResumeState` con el optimizador
+    poblado, ambos estados de azar y el paso actual (1.1).
+    """
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    calls: list[tuple[str, TrainSnapshot]] = []
+
+    net = _small_net(sde)
+    train(
+        sde,
+        net,
+        _data(dist),
+        TrainConfig(num_steps=9, checkpoint_every=3, seed=0),
+        on_checkpoint=lambda tag, snap: calls.append((tag, snap)),
+    )
+
+    assert calls  # se emitieron snapshots
+    for _tag, snap in calls:
+        assert isinstance(snap, TrainSnapshot)
+        assert isinstance(snap.result, TrainResult)
+        assert isinstance(snap.resume, ResumeState)
+        # optimizador poblado (Adam ya dio pasos → momentos presentes).
+        assert snap.resume.optimizer_state["state"]
+        # ambos estados de azar presentes como tensores.
+        assert isinstance(snap.resume.torch_rng_state, torch.Tensor)
+        assert isinstance(snap.resume.generator_state, torch.Tensor)
+
+    # Los snapshots periódicos llevan como paso los pasos ya completados (= N del tag).
+    periodic = {tag: snap for tag, snap in calls if tag.startswith("step")}
+    assert periodic["step00003"].resume.start_step == 3
+    assert periodic["step00006"].resume.start_step == 6
+    assert len(periodic["step00003"].resume.history) == 3  # history hasta el paso 3
+
+
+# ------------------------------------------------------------- gate: sin snapshots (1.5)
+
+
+def test_sin_checkpoint_every_no_emite_snapshots():
+    """Con ``checkpoint_every=0`` el callback NUNCA se invoca: no hay puntos de reanudación (1.5)."""
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    calls: list[str] = []
+
+    train(
+        sde,
+        _small_net(sde),
+        _data(dist),
+        TrainConfig(num_steps=6, seed=0),  # checkpoint_every=0 por defecto
+        on_checkpoint=lambda tag, snap: calls.append(tag),
+    )
+
+    assert calls == []
+
+
+# ------------------------------------------------------------- regresión resume=None
+
+
+def test_resume_none_entrena_normal():
+    """Sin ``resume`` (default) el loop entrena desde cero como siempre: ``len(history)==num_steps``."""
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    net = _small_net(sde)
+
+    result = train(sde, net, _data(dist), TrainConfig(num_steps=5, seed=0))
+
+    assert len(result.history) == 5
+    assert result.net is net
+    assert result.sde_name == "vp"

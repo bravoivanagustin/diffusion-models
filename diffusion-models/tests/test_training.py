@@ -19,6 +19,7 @@ from diffusion.training import (
     RunSpec,
     TrainConfig,
     TrainResult,
+    TrainSnapshot,
     build_run,
     dsm_loss,
     load_checkpoint,
@@ -374,7 +375,7 @@ def test_train_checkpoint_every_emite_periodicos_y_best():
     """
     sde = make_sde("vp")
     dist = make_distribution("gaussian", 2, seed=0)
-    calls: list[tuple[str, TrainResult]] = []
+    calls: list[tuple[str, TrainSnapshot]] = []
     net = _small_net(sde)
     result = train(
         sde,
@@ -388,8 +389,10 @@ def test_train_checkpoint_every_emite_periodicos_y_best():
     periodic = [t for t in tags if t.startswith("step")]
     assert periodic == ["step00003", "step00006"]  # múltiplos de 3, sin el último (9)
     assert "best" in tags  # al menos un mínimo de pérdida de intervalo registrado
-    # Cada snapshot es un TrainResult que apunta a la MISMA red que se está entrenando.
-    assert all(isinstance(snap, TrainResult) and snap.net is net for _, snap in calls)
+    # Cada snapshot es un TrainSnapshot cuyo TrainResult apunta a la MISMA red que se entrena.
+    assert all(
+        isinstance(snap, TrainSnapshot) and snap.result.net is net for _, snap in calls
+    )
     assert result.net is net
 
 
@@ -410,7 +413,8 @@ def test_train_checkpoints_intermedios_persisten_y_cargan(tmp_path):
     }
 
     def on_checkpoint(tag, snap):
-        save_checkpoint(snap, base.with_stem(f"{base.stem}_{tag}"), model_spec=model_spec)
+        # Nuevo contrato: snap es un TrainSnapshot; save_checkpoint consume su .result.
+        save_checkpoint(snap.result, base.with_stem(f"{base.stem}_{tag}"), model_spec=model_spec)
 
     train(
         sde,
