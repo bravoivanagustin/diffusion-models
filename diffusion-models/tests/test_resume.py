@@ -20,12 +20,16 @@ from diffusion.data_generation import infinite_bare, make_distribution
 from diffusion.models import ScoreMLP
 from diffusion.sde import make_sde
 from diffusion.training import (
+    ResumePlan,
     ResumeState,
     TrainConfig,
     TrainResult,
     TrainSnapshot,
+    discover_snapshots,
     load_checkpoint,
     load_resume_state,
+    resolve_resume,
+    resume_sidecar_path,
     save_checkpoint,
     save_resume_state,
     train,
@@ -503,3 +507,204 @@ def test_resume_sin_restaurar_optimizador_difiere():
     # ...y la curva diverge, aunque conserve el prefijo previo (el 1.er loss es pre-update, igual).
     assert result_c.history != result_a.history
     assert result_c.history[:_N] == result_a.history[:_N]
+
+
+# =============================================================================
+# Task 3.1 — Resolver de resume: descubrimiento + decisión skip/fresh/resume
+# =============================================================================
+#
+# Lógica **pura** de rutas/decisión (sin torch, sin entrenar): se simulan los checkpoints con
+# archivos ``.pt`` vacíos (``.touch()``) sobre ``tmp_path``. La convención de nombres es la del
+# CLI: el checkpoint final es ``X.pt`` y los snapshots hermanos ``X_stepNNNNN.pt`` / ``X_best.pt``
+# (más los sidecars ``X_stepNNNNN.resume.pt`` de la feature).
+
+_STEM = "vp_gaussian"
+
+
+def _final(tmp_path):
+    """Ruta del checkpoint final (``X.pt``); el caller decide si existe (``.touch()``) o no."""
+    return tmp_path / f"{_STEM}.pt"
+
+
+def _touch(tmp_path, name):
+    p = tmp_path / name
+    p.touch()
+    return p
+
+
+# ----------------------------------------------- discover_snapshots (3.3)
+
+
+def test_discover_snapshots_ordena_y_excluye(tmp_path):
+    """Descubre los ``X_stepNNNNN.pt`` hermanos, ordenados ASC por paso (3.3), excluyendo el
+    checkpoint final, el ``X_best.pt`` y los sidecars ``.resume.pt``; y sin colar snapshots de
+    OTRA corrida (distinto stem) en el mismo directorio.
+    """
+    final = _final(tmp_path)
+    final.touch()  # el final mismo NO es un snapshot
+    s2 = _touch(tmp_path, f"{_STEM}_step00002.pt")
+    s10 = _touch(tmp_path, f"{_STEM}_step00010.pt")
+    _touch(tmp_path, f"{_STEM}_best.pt")  # best: excluido
+    _touch(tmp_path, f"{_STEM}_step00010.resume.pt")  # sidecar: excluido
+    _touch(tmp_path, "ve_gaussian_step00003.pt")  # otra corrida: excluida (distinto stem)
+
+    snaps = discover_snapshots(final)
+
+    assert [step for step, _ in snaps] == [2, 10]  # ascendente, sin best/sidecar/otra corrida
+    assert snaps[0] == (2, s2)
+    assert snaps[1] == (10, s10)
+
+
+def test_discover_snapshots_vacio_sin_snapshots(tmp_path):
+    """Sin snapshots hermanos (aunque el directorio o el final existan) → lista vacía."""
+    final = _final(tmp_path)
+    final.touch()
+    assert discover_snapshots(final) == []
+
+
+def test_discover_snapshots_directorio_inexistente(tmp_path):
+    """Si el directorio del final no existe, no hay dónde buscar → lista vacía (sin excepción)."""
+    final = tmp_path / "no_existe" / f"{_STEM}.pt"
+    assert discover_snapshots(final) == []
+
+
+# --------------------------------------------------------- skip (3.1)
+
+
+def test_resolve_skip_si_final_existe(tmp_path):
+    """Final presente y sin ``force`` → acción ``skip`` (corrida ya completa) (3.1)."""
+    final = _final(tmp_path)
+    final.touch()
+
+    plan = resolve_resume(final)
+
+    assert isinstance(plan, ResumePlan)
+    assert plan.action == "skip"
+    assert plan.weights_path is None
+    assert plan.step is None
+
+
+# --------------------------------------------------------- force (3.2)
+
+
+def test_resolve_force_reanuda_desde_el_mas_nuevo(tmp_path):
+    """Con ``force`` el chequeo del final se saltea: existiendo snapshots, reanuda desde el más
+    nuevo en lugar de saltear (3.2)."""
+    final = _final(tmp_path)
+    final.touch()
+    _touch(tmp_path, f"{_STEM}_step00005.pt")
+    newest = _touch(tmp_path, f"{_STEM}_step00020.pt")
+
+    plan = resolve_resume(final, force=True)
+
+    assert plan.action == "resume"
+    assert plan.step == 20
+    assert plan.weights_path == newest
+
+
+def test_resolve_force_sin_snapshots_es_fresh(tmp_path):
+    """Con ``force`` pero sin snapshots (aunque el final exista) → ``fresh`` (reentrena de cero)."""
+    final = _final(tmp_path)
+    final.touch()
+
+    plan = resolve_resume(final, force=True)
+
+    assert plan.action == "fresh"
+
+
+# ------------------------------------------------ auto-resume más nuevo (3.3)
+
+
+def test_resolve_auto_resume_desde_el_mas_nuevo(tmp_path):
+    """Final ausente + snapshots presentes → ``resume`` desde el de mayor paso (3.3)."""
+    final = _final(tmp_path)  # NO existe
+    _touch(tmp_path, f"{_STEM}_step00003.pt")
+    _touch(tmp_path, f"{_STEM}_step00007.pt")
+    newest = _touch(tmp_path, f"{_STEM}_step00030.pt")
+
+    plan = resolve_resume(final)
+
+    assert plan.action == "resume"
+    assert plan.step == 30
+    assert plan.weights_path == newest
+
+
+# --------------------------------------------------------- fresh (3.4)
+
+
+def test_resolve_fresh_si_no_hay_nada(tmp_path):
+    """Final ausente y sin snapshots → ``fresh`` (desde cero) (3.4)."""
+    plan = resolve_resume(_final(tmp_path))
+    assert plan.action == "fresh"
+
+
+def test_resolve_fresh_si_final_none():
+    """``final_checkpoint=None`` → no hay dónde saltear ni buscar → ``fresh`` (3.4)."""
+    plan = resolve_resume(None)
+    assert plan.action == "fresh"
+
+
+# ------------------------------------------------ --resume-from (3.5)
+
+
+def test_resolve_resume_from_por_paso(tmp_path):
+    """``--resume-from`` por número de paso elige ese snapshot puntual, aun con el final presente
+    (el pedido explícito manda sobre el skip automático) (3.5)."""
+    final = _final(tmp_path)
+    final.touch()
+    chosen = _touch(tmp_path, f"{_STEM}_step00005.pt")
+    _touch(tmp_path, f"{_STEM}_step00010.pt")
+
+    plan = resolve_resume(final, resume_from="5")
+
+    assert plan.action == "resume"
+    assert plan.step == 5
+    assert plan.weights_path == chosen
+
+
+def test_resolve_resume_from_por_ruta(tmp_path):
+    """``--resume-from`` por ruta usa ese checkpoint y parsea su paso del nombre (3.5)."""
+    final = _final(tmp_path)
+    chosen = _touch(tmp_path, f"{_STEM}_step00010.pt")
+
+    plan = resolve_resume(final, resume_from=str(chosen))
+
+    assert plan.action == "resume"
+    assert plan.weights_path == chosen
+    assert plan.step == 10
+
+
+# ------------------------------------- --resume-from inexistente (3.7)
+
+
+def test_resolve_resume_from_paso_inexistente_lista_disponibles(tmp_path):
+    """``--resume-from`` con un paso inexistente → ``ValueError`` que lista los pasos disponibles
+    (3.7)."""
+    final = _final(tmp_path)
+    _touch(tmp_path, f"{_STEM}_step00002.pt")
+    _touch(tmp_path, f"{_STEM}_step00010.pt")
+
+    with pytest.raises(ValueError) as exc:
+        resolve_resume(final, resume_from="99")
+
+    msg = str(exc.value)
+    assert "2" in msg and "10" in msg  # lista los pasos disponibles
+
+
+def test_resolve_resume_from_ruta_inexistente_lista_disponibles(tmp_path):
+    """``--resume-from`` con una ruta inexistente → ``ValueError`` accionable (lista disponibles).
+    """
+    final = _final(tmp_path)
+    _touch(tmp_path, f"{_STEM}_step00002.pt")
+
+    with pytest.raises(ValueError, match="2"):
+        resolve_resume(final, resume_from=str(tmp_path / f"{_STEM}_step99999.pt"))
+
+
+# ------------------------------------- convención del sidecar
+
+
+def test_resume_sidecar_path_convencion(tmp_path):
+    """``X_stepNNNNN.pt`` → ``X_stepNNNNN.resume.pt`` (sidecar hermano) (Data Models)."""
+    weights = tmp_path / f"{_STEM}_step00300.pt"
+    assert resume_sidecar_path(weights) == tmp_path / f"{_STEM}_step00300.resume.pt"

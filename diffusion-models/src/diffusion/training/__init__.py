@@ -31,6 +31,12 @@ from __future__ import annotations
 
 from .config import RunSpec, build_run, load_config
 from .losses import dsm_loss, sample_timesteps
+from .resume import (
+    ResumePlan,
+    discover_snapshots,
+    resolve_resume,
+    resume_sidecar_path,
+)
 from .trainer import (
     ResumeState,
     TrainConfig,
@@ -55,6 +61,10 @@ __all__ = [
     "TrainSnapshot",
     "save_resume_state",
     "load_resume_state",
+    "ResumePlan",
+    "resolve_resume",
+    "discover_snapshots",
+    "resume_sidecar_path",
     "RunSpec",
     "load_config",
     "build_run",
