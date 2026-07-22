@@ -81,6 +81,7 @@ class ScoreMLP(nn.Module):
         hidden_dim: int = 256,
         num_blocks: int = 4,
         activation: str = "silu",
+        time_scale: float = 1.0,
     ) -> None:
         """Inicializa la red.
 
@@ -91,6 +92,13 @@ class ScoreMLP(nn.Module):
             num_blocks: Cantidad de bloques residuales.
             activation: Nombre de la activación (se pasa a cada bloque y a la
                 proyección de entrada).
+            time_scale: Factor de escala temporal; se pasa tal cual al
+                :class:`~diffusion.models.layers.SinusoidalEmbedding` (que lo
+                valida y lo aplica). Default ``1.0`` (comportamiento previo).
+
+        Raises:
+            ValueError: Si ``time_scale`` no es finito y positivo (la validación
+                la hace el embedding al construirse).
         """
         super().__init__()
         self.data_dim = int(data_dim)
@@ -98,7 +106,9 @@ class ScoreMLP(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.num_blocks = int(num_blocks)
 
-        self.time_embed = SinusoidalEmbedding(embed_dim)
+        self.time_embed = SinusoidalEmbedding(embed_dim, scale=time_scale)
+        #: Escala temporal (introspección): el valor ya validado por el embedding.
+        self.time_scale = self.time_embed.scale
         self.input_proj = nn.Linear(data_dim + embed_dim, hidden_dim)
         self.input_act = _make_activation(activation)
         self.blocks = nn.Sequential(

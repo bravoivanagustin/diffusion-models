@@ -538,3 +538,74 @@ def test_embedding_scale_no_new_params_or_buffers():
     assert list(emb.parameters()) == []
     assert list(dict(emb.named_buffers())) == ["denom"]
     assert emb.scale == 1000.0
+
+
+# --------------------------------- ScoreMLP: passthrough de time_scale (Req 2, 6.1)
+# Spec time-embedding-scale: la red 2D acepta `time_scale` en construcción, lo pasa
+# al embedding compartido (passthrough puro, sin re-validar ni re-aplicar la escala)
+# y lo expone como atributo de introspección. Default retrocompatible (1.0).
+
+
+def test_scoremlp_default_forward_identical_without_kwarg():
+    # Req 2.5: sin el kwarg y con time_scale=1.0 explícito, el forward es idéntico
+    # bit a bit (misma seed de init -> mismos pesos -> misma salida).
+    x, t = torch.randn(16, 2), torch.rand(16)
+    torch.manual_seed(0)
+    net_default = ScoreMLP().eval()
+    torch.manual_seed(0)
+    net_explicit = ScoreMLP(time_scale=1.0).eval()
+    with torch.no_grad():
+        assert torch.equal(net_default(x, t), net_explicit(x, t))
+
+
+def test_scoremlp_time_scale_passthrough_to_embedding():
+    # Req 2.1: el kwarg llega al embedding compartido y queda expuesto para
+    # introspección (self.time_scale coincide con la escala del embedding).
+    net = ScoreMLP(time_scale=1000.0)
+    assert net.time_scale == 1000.0
+    assert net.time_embed.scale == 1000.0
+    # Default: sin el kwarg, la escala es 1.0 (retrocompatible).
+    assert ScoreMLP().time_scale == 1.0
+
+
+def test_scoremlp_time_scale_changes_forward():
+    # Req 2.1: la escala se aplica de verdad — con los mismos pesos (misma seed),
+    # una escala distinta de 1.0 produce un forward distinto para t no trivial.
+    x, t = torch.randn(16, 2), torch.rand(16)
+    torch.manual_seed(0)
+    net_default = ScoreMLP().eval()
+    torch.manual_seed(0)
+    net_scaled = ScoreMLP(time_scale=1000.0).eval()
+    with torch.no_grad():
+        assert not torch.allclose(net_default(x, t), net_scaled(x, t))
+
+
+@pytest.mark.parametrize("time_scale", [0.0, float("nan")])
+def test_scoremlp_invalid_time_scale_raises(time_scale):
+    # Req 2.1 / 1.4: la validación fail-fast del embedding se propaga por la red
+    # (ValueError en construcción con el valor recibido; la red no la re-implementa).
+    with pytest.raises(ValueError, match=str(time_scale)):
+        ScoreMLP(time_scale=time_scale)
+
+
+def test_scoremlp_scaled_is_deterministic():
+    # Req 2.4: con la escala activa la red sigue determinística — dos forwards con
+    # los mismos insumos son bit a bit idénticos.
+    net = ScoreMLP(time_scale=1000.0).eval()
+    x, t = torch.randn(16, 2), torch.rand(16)
+    with torch.no_grad():
+        assert torch.equal(net(x, t), net(x, t))
+
+
+def test_scoremlp_time_scale_no_new_params_or_shapes():
+    # Req 2.4: el kwarg no agrega parámetros entrenables ni cambia el state_dict —
+    # mismo conteo y mismo set de claves con las mismas shapes con/sin kwarg.
+    net_default = ScoreMLP()
+    net_scaled = ScoreMLP(time_scale=1000.0)
+    n_default = sum(p.numel() for p in net_default.parameters() if p.requires_grad)
+    n_scaled = sum(p.numel() for p in net_scaled.parameters() if p.requires_grad)
+    assert n_default == n_scaled
+    sd_default = net_default.state_dict()
+    sd_scaled = net_scaled.state_dict()
+    assert set(sd_default) == set(sd_scaled)
+    assert all(sd_default[k].shape == sd_scaled[k].shape for k in sd_default)
