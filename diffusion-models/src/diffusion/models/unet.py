@@ -40,6 +40,7 @@ class TimeMLP(nn.Module):
         embed_dim: int,
         time_embed_dim: int,
         activation: str = "silu",
+        time_scale: float = 1.0,
     ) -> None:
         """Inicializa la proyección temporal.
 
@@ -48,12 +49,21 @@ class TimeMLP(nn.Module):
                 par; lo valida el embedding reusado).
             time_embed_dim: Dimensión del vector de condicionamiento de salida.
             activation: Nombre de la activación entre las dos lineales.
+            time_scale: Factor de escala temporal; se pasa tal cual al
+                :class:`~diffusion.models.layers.SinusoidalEmbedding` (que lo
+                valida y lo aplica). Default ``1.0`` (comportamiento previo).
+
+        Raises:
+            ValueError: Si ``time_scale`` no es finito y positivo (la validación
+                la hace el embedding al construirse).
         """
         super().__init__()
         self.embed_dim = int(embed_dim)
         self.time_embed_dim = int(time_embed_dim)
 
-        self.embed = SinusoidalEmbedding(embed_dim)
+        self.embed = SinusoidalEmbedding(embed_dim, scale=time_scale)
+        #: Escala temporal (introspección): el valor ya validado por el embedding.
+        self.time_scale = self.embed.scale
         self.lin1 = nn.Linear(embed_dim, time_embed_dim)
         self.act = _make_activation(activation)
         self.lin2 = nn.Linear(time_embed_dim, time_embed_dim)
@@ -346,6 +356,7 @@ class ScoreUNet(nn.Module):
         attn_resolutions: tuple[int, ...] = (16,),
         groups: int = 8,
         activation: str = "silu",
+        time_scale: float = 1.0,
     ) -> None:
         """Inicializa la red con la arquitectura de referencia por defecto.
 
@@ -370,6 +381,16 @@ class ScoreUNet(nn.Module):
                 todos los anchos de canal.
             activation: Nombre de la activación, compartida por toda la red vía
                 :func:`~diffusion.models.layers._make_activation`.
+            time_scale: Factor de escala temporal; se pasa tal cual (vía
+                :class:`TimeMLP`) al :class:`~diffusion.models.layers.SinusoidalEmbedding`
+                compartido, que lo valida y lo aplica. Default ``1.0``
+                (comportamiento previo).
+
+        Raises:
+            ValueError: Si ``image_size`` no es divisible por el factor total de
+                reducción, si ``groups`` no divide a algún ancho de canal, o si
+                ``time_scale`` no es finito y positivo (esta última la valida el
+                embedding al construirse).
         """
         super().__init__()
         self.in_channels = int(in_channels)
@@ -409,7 +430,9 @@ class ScoreUNet(nn.Module):
 
         # Vector temporal compartido: se computa una vez por forward y lo reusan
         # todos los ConvResBlock (cada uno lo re-proyecta a sus canales).
-        self.time_mlp = TimeMLP(embed_dim, time_embed_dim, activation)
+        self.time_mlp = TimeMLP(embed_dim, time_embed_dim, activation, time_scale)
+        #: Escala temporal (introspección): el valor ya validado por el embedding.
+        self.time_scale = self.time_mlp.time_scale
 
         # Convolución de entrada: lleva los in_channels a base_channels.
         self.conv_in = nn.Conv2d(

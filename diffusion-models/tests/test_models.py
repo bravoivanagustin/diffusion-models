@@ -609,3 +609,102 @@ def test_scoremlp_time_scale_no_new_params_or_shapes():
     sd_scaled = net_scaled.state_dict()
     assert set(sd_default) == set(sd_scaled)
     assert all(sd_default[k].shape == sd_scaled[k].shape for k in sd_default)
+
+
+# ---------------------- TimeMLP + ScoreUNet: passthrough de time_scale (Req 2, 6.1)
+# Spec time-embedding-scale: la red de imágenes acepta `time_scale` en construcción,
+# lo transporta al embedding compartido vía TimeMLP (passthrough puro, sin re-validar
+# ni re-aplicar la escala) y ambas clases lo exponen como atributo de introspección.
+# Default retrocompatible (1.0). Config tiny (misma que _tiny_unet) para CPU rápida.
+
+
+def _tiny_unet_kwargs() -> dict:
+    """Kwargs de la config tiny de _tiny_unet, para construir pares con/sin time_scale."""
+    return dict(
+        in_channels=3,
+        image_size=32,
+        base_channels=8,
+        channel_mults=(1, 2),
+        num_res_blocks=1,
+        embed_dim=8,
+        time_embed_dim=16,
+        groups=4,
+        attn_resolutions=(16,),
+    )
+
+
+def test_scoreunet_default_forward_identical_without_kwarg():
+    # Req 2.5: sin el kwarg y con time_scale=1.0 explícito, el forward es idéntico
+    # bit a bit (misma seed de init -> mismos pesos -> misma salida).
+    x, t = torch.randn(2, 3, 32, 32), torch.rand(2)
+    torch.manual_seed(0)
+    net_default = ScoreUNet(**_tiny_unet_kwargs()).eval()
+    torch.manual_seed(0)
+    net_explicit = ScoreUNet(**_tiny_unet_kwargs(), time_scale=1.0).eval()
+    with torch.no_grad():
+        assert torch.equal(net_default(x, t), net_explicit(x, t))
+
+
+def test_scoreunet_time_scale_passthrough_to_embedding():
+    # Req 2.2: el kwarg atraviesa ScoreUNet -> TimeMLP -> embedding compartido y
+    # queda expuesto para introspección en cada eslabón de la cadena.
+    net = ScoreUNet(**_tiny_unet_kwargs(), time_scale=1000.0)
+    assert net.time_scale == 1000.0
+    assert net.time_mlp.time_scale == 1000.0
+    assert net.time_mlp.embed.scale == 1000.0
+    # Default: sin el kwarg, la escala es 1.0 (retrocompatible).
+    assert ScoreUNet(**_tiny_unet_kwargs()).time_scale == 1.0
+
+
+def test_timemlp_time_scale_passthrough_direct():
+    # Req 2.2: TimeMLP (la proyección temporal) también acepta el kwarg, lo pasa al
+    # embedding y lo expone; default retrocompatible 1.0.
+    from diffusion.models.unet import TimeMLP
+
+    proj = TimeMLP(embed_dim=8, time_embed_dim=16, time_scale=1000.0)
+    assert proj.time_scale == 1000.0
+    assert proj.embed.scale == 1000.0
+    assert TimeMLP(embed_dim=8, time_embed_dim=16).time_scale == 1.0
+
+
+def test_scoreunet_time_scale_changes_forward():
+    # Req 2.2: la escala se aplica de verdad — con los mismos pesos (misma seed),
+    # una escala distinta de 1.0 produce un forward distinto para t no trivial.
+    x, t = torch.randn(2, 3, 32, 32), torch.rand(2)
+    torch.manual_seed(0)
+    net_default = ScoreUNet(**_tiny_unet_kwargs()).eval()
+    torch.manual_seed(0)
+    net_scaled = ScoreUNet(**_tiny_unet_kwargs(), time_scale=1000.0).eval()
+    with torch.no_grad():
+        assert not torch.allclose(net_default(x, t), net_scaled(x, t))
+
+
+@pytest.mark.parametrize("time_scale", [0.0, float("nan")])
+def test_scoreunet_invalid_time_scale_raises(time_scale):
+    # Req 2.2 / 1.4: la validación fail-fast del embedding se propaga por la red
+    # (ValueError en construcción con el valor recibido; la red no la re-implementa).
+    with pytest.raises(ValueError, match=str(time_scale)):
+        ScoreUNet(**_tiny_unet_kwargs(), time_scale=time_scale)
+
+
+def test_scoreunet_scaled_is_deterministic():
+    # Req 2.4: con la escala activa la red sigue determinística — dos forwards con
+    # los mismos insumos son bit a bit idénticos.
+    net = ScoreUNet(**_tiny_unet_kwargs(), time_scale=1000.0).eval()
+    x, t = torch.randn(2, 3, 32, 32), torch.rand(2)
+    with torch.no_grad():
+        assert torch.equal(net(x, t), net(x, t))
+
+
+def test_scoreunet_time_scale_no_new_params_or_shapes():
+    # Req 2.4: el kwarg no agrega parámetros entrenables ni cambia el state_dict —
+    # mismo conteo y mismo set de claves con las mismas shapes con/sin kwarg.
+    net_default = ScoreUNet(**_tiny_unet_kwargs())
+    net_scaled = ScoreUNet(**_tiny_unet_kwargs(), time_scale=1000.0)
+    n_default = sum(p.numel() for p in net_default.parameters() if p.requires_grad)
+    n_scaled = sum(p.numel() for p in net_scaled.parameters() if p.requires_grad)
+    assert n_default == n_scaled
+    sd_default = net_default.state_dict()
+    sd_scaled = net_scaled.state_dict()
+    assert set(sd_default) == set(sd_scaled)
+    assert all(sd_default[k].shape == sd_scaled[k].shape for k in sd_default)
