@@ -31,6 +31,7 @@ model:                  # opcional: la red es la variable de control (fija entre
    hidden_dim: 512
    num_blocks: 4
    activation: silu
+   time_scale: 1000      # escala del embedding de tiempo: resolución a t chico (convención DDPM/Song)
 
 out:                      # rutas de salida (se crean los directorios)
   checkpoint: models/phase_1/vp_mixture.pt
