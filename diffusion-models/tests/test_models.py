@@ -708,3 +708,85 @@ def test_scoreunet_time_scale_no_new_params_or_shapes():
     sd_scaled = net_scaled.state_dict()
     assert set(sd_default) == set(sd_scaled)
     assert all(sd_default[k].shape == sd_scaled[k].shape for k in sd_default)
+
+
+# ------------------- Factory + paridad entre redes: time_scale (Req 2.3, 2.4, 6.1)
+# Spec time-embedding-scale, tarea 2.3: la factory por nombre acepta el kwarg nuevo
+# sin cambios en su mecanismo de filtrado por firma (kwarg ausente -> default), y el
+# embedding crudo de ambas redes coincide para el mismo t, embed_dim y time_scale.
+
+
+def test_make_model_mlp_time_scale_passthrough():
+    # Req 2.3: make_model("mlp", time_scale=...) construye con el valor (el kwarg
+    # atraviesa el filtrado por firma existente hasta el embedding compartido).
+    net = make_model("mlp", data_dim=2, time_scale=1000.0)
+    assert isinstance(net, ScoreMLP)
+    assert net.time_scale == 1000.0
+    assert net.time_embed.scale == 1000.0
+
+
+def test_make_model_mlp_time_scale_absent_defaults():
+    # Req 2.3: sin el kwarg, la factory produce el default retrocompatible (1.0).
+    net = make_model("mlp", data_dim=2)
+    assert net.time_scale == 1.0
+    assert net.time_embed.scale == 1.0
+
+
+def test_make_model_unet_time_scale_passthrough():
+    # Req 2.3: make_model("unet", time_scale=...) construye con el valor; anchos
+    # tiny (misma config que _tiny_unet_kwargs) para mantener el costo de la suite.
+    net = make_model("unet", **_tiny_unet_kwargs(), time_scale=1000.0)
+    assert isinstance(net, ScoreUNet)
+    assert net.time_scale == 1000.0
+    assert net.time_mlp.embed.scale == 1000.0
+
+
+def test_make_model_unet_time_scale_absent_defaults():
+    # Req 2.3: sin el kwarg, la factory produce el default retrocompatible (1.0).
+    net = make_model("unet", **_tiny_unet_kwargs())
+    assert net.time_scale == 1.0
+    assert net.time_mlp.embed.scale == 1.0
+
+
+def test_make_model_filtering_intact_with_time_scale():
+    # Req 2.3: el mecanismo de filtrado por firma sigue intacto tras el kwarg nuevo —
+    # un kwarg que no aplica a la red se descarta en silencio (comportamiento
+    # documentado en make_model y ya cubierto para mlp sin time_scale), mientras
+    # time_scale sí llega al constructor. Se verifica en ambas redes.
+    mlp = make_model("mlp", data_dim=2, time_scale=1000.0, no_aplica=123)
+    assert isinstance(mlp, ScoreMLP)
+    assert mlp.time_scale == 1000.0
+    unet = make_model("unet", **_tiny_unet_kwargs(), time_scale=1000.0, no_aplica=123)
+    assert isinstance(unet, ScoreUNet)
+    assert unet.time_scale == 1000.0
+
+
+@pytest.mark.parametrize("time_scale", [1.0, 1000.0])
+def test_embedding_parity_mlp_unet(time_scale):
+    # Req 2.4 / invariante del diseño: para el mismo t, la misma dimensión de
+    # embedding y la misma escala, el embedding crudo de MLP y U-Net coincide bit a
+    # bit (ambas redes transportan la escala a la MISMA capa compartida, sin
+    # re-aplicarla ni re-implementarla). Se cubre el default (1.0) y la escala
+    # recomendada (1000).
+    embed_dim = 16
+    mlp = ScoreMLP(embed_dim=embed_dim, time_scale=time_scale)
+    unet_kwargs = _tiny_unet_kwargs() | {"embed_dim": embed_dim}
+    unet = ScoreUNet(**unet_kwargs, time_scale=time_scale)
+    t = torch.tensor([0.0, 1e-4, 1e-3, 1e-2, 0.5, 1.0])
+    with torch.no_grad():
+        emb_mlp = mlp.time_embed(t)
+        emb_unet = unet.time_mlp.embed(t)
+    assert emb_mlp.shape == emb_unet.shape == (6, embed_dim)
+    assert torch.equal(emb_mlp, emb_unet)
+
+
+def test_embedding_parity_not_vacuous_across_scales():
+    # Sanidad del test de paridad: la igualdad anterior no es vacía — con escalas
+    # DISTINTAS los embeddings crudos difieren para t no trivial (es decir, la
+    # paridad depende de que time_scale llegue de verdad a ambos embeddings).
+    embed_dim = 16
+    mlp = ScoreMLP(embed_dim=embed_dim, time_scale=1000.0)
+    unet = ScoreUNet(**(_tiny_unet_kwargs() | {"embed_dim": embed_dim}))
+    t = torch.tensor([1e-3, 1e-2, 0.5])
+    with torch.no_grad():
+        assert not torch.allclose(mlp.time_embed(t), unet.time_mlp.embed(t))
