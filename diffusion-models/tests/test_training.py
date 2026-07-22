@@ -592,3 +592,112 @@ def test_build_run_2d_entrena_end_to_end_tras_el_gate():
     assert result.data_dim == spec.sde.data_dim == 2  # dato plano 2D, sin regresión
     assert result.history
     assert all(math.isfinite(v) for v in result.history)
+
+
+# ---------------------------- time-embedding-scale: round-trip de la receta (task 3.1)
+
+
+def test_roundtrip_receta_con_time_scale(tmp_path):
+    """Round-trip de la escala temporal: config → build_run → checkpoint → make_model (3.1–3.3).
+
+    Una corrida config-driven que declara ``time_scale`` en el bloque ``model:`` construye la
+    red con ese valor (3.1), lo persiste dentro de la receta ``model_spec`` del checkpoint
+    (3.2) y la reconstrucción desde la receta —sin el config original— produce una red con la
+    **misma escala** usada al entrenar, a la que el ``state_dict`` guardado carga sin error y
+    con salida idéntica (3.3). La aserción sobre el valor reconstruido fallaría si la receta
+    dropeara el kwarg (no es solo un no-exception).
+    """
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {
+            "shape": "mixture", "dim": 2, "n_samples": 128, "batch_size": 64,
+            "n_components": 2, "seed": 0,
+        },
+        "train": {"num_steps": 2, "seed": 0},
+        "model": {
+            "name": "mlp", "embed_dim": 16, "hidden_dim": 16, "num_blocks": 1,
+            "time_scale": 1000.0,
+        },
+    }
+    spec = build_run(raw)
+
+    # 3.1: la corrida config-driven construye la red con la escala declarada...
+    assert spec.model.time_scale == pytest.approx(1000.0)
+    # ...y la receta del checkpoint la transporta (reconstruible sin el YAML original).
+    assert spec.model_spec["kwargs"]["time_scale"] == pytest.approx(1000.0)
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    path = tmp_path / "ckpt_time_scale.pt"
+    save_checkpoint(result, path, model_spec=spec.model_spec)
+
+    # 3.2: la escala sobrevive el round-trip por disco dentro de la receta.
+    state_dict, meta = load_checkpoint(path)
+    recipe = meta["model"]
+    assert recipe["kwargs"]["time_scale"] == pytest.approx(1000.0)
+
+    # 3.3: la reconstrucción desde la receta produce una red con la MISMA escala entrenada.
+    net2 = make_model(recipe["name"], **recipe["kwargs"])
+    assert net2.time_scale == pytest.approx(1000.0)
+    net2.load_state_dict(state_dict)  # shapes intactas: la escala no agrega parámetros
+
+    # La red reconstruida es funcionalmente la entrenada (misma salida sobre los mismos insumos).
+    x = torch.randn(8, 2)
+    t = torch.rand(8)
+    result.net.eval()
+    net2.eval()
+    with torch.no_grad():
+        assert torch.allclose(result.net(x, t), net2(x, t))
+
+
+def test_receta_vieja_sin_time_scale_reconstruye_con_default(tmp_path):
+    """Una receta anterior al cambio (sin la clave ``time_scale``) reconstruye con el default (3.4).
+
+    Se arma un checkpoint cuya receta NO trae ``time_scale`` (formato pre-cambio) y se verifica
+    que ``make_model`` reconstruye sin error una red con la escala default retrocompatible
+    (``time_scale == 1.0``) y que el ``state_dict`` guardado carga sobre ella (shapes idénticas:
+    la escala no es un parámetro entrenable).
+    """
+    kwargs = {"data_dim": 2, "embed_dim": 16, "hidden_dim": 16, "num_blocks": 1}
+    net = ScoreMLP(**kwargs)  # red pre-cambio: construida sin el kwarg
+    result = TrainResult(net=net, history=[1.0], sde_name="vp", data_dim=2)
+    path = tmp_path / "ckpt_receta_vieja.pt"
+    save_checkpoint(result, path, model_spec={"name": "mlp", "kwargs": dict(kwargs)})
+
+    state_dict, meta = load_checkpoint(path)
+    assert "time_scale" not in meta["model"]["kwargs"]  # receta vieja, sin la clave
+
+    net2 = make_model(meta["model"]["name"], **meta["model"]["kwargs"])  # sin error (3.4)
+    assert net2.time_scale == pytest.approx(1.0)  # default retrocompatible
+    net2.load_state_dict(state_dict)  # los pesos viejos cargan sin conflicto de shapes
+
+    x = torch.randn(8, 2)
+    t = torch.rand(8)
+    net.eval()
+    net2.eval()
+    with torch.no_grad():
+        assert torch.allclose(net(x, t), net2(x, t))
+
+
+def test_generate_from_checkpoint_reconstruye_con_time_scale(tmp_path):
+    """La generación checkpoint-driven reconstruye la red con la escala de la receta (3.3).
+
+    End-to-end en el seam real: un checkpoint cuya receta declara ``time_scale=1000.0`` pasa por
+    ``generate_from_checkpoint`` (que reconstruye vía ``make_model(recipe)``) y produce muestras
+    finitas con la shape esperada, sin error de reconstrucción ni de carga de pesos.
+    """
+    from diffusion.samplers import generate_from_checkpoint
+
+    kwargs = {
+        "data_dim": 2, "embed_dim": 16, "hidden_dim": 16, "num_blocks": 1,
+        "time_scale": 1000.0,
+    }
+    net = ScoreMLP(**kwargs)
+    result = TrainResult(net=net, history=[1.0], sde_name="vp", data_dim=2)
+    path = tmp_path / "ckpt_scale_gen.pt"
+    save_checkpoint(result, path, model_spec={"name": "mlp", "kwargs": dict(kwargs)})
+
+    x0 = generate_from_checkpoint(path, "pf_ode", n_samples=8, n_steps=5, seed=0)
+
+    assert x0.shape == (8, 2)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
