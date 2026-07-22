@@ -9,6 +9,8 @@ U-Net), vive en el archivo de esa red, no acá.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -48,25 +50,38 @@ class SinusoidalEmbedding(nn.Module):
     Sigue la codificación posicional de Transformers: para cada frecuencia se
     aporta un seno y un coseno, intercalados en el vector de salida::
 
-        embed(t)_{2i}   = sin(t / 10000^{2i/d})
-        embed(t)_{2i+1} = cos(t / 10000^{2i/d})
+        embed(t)_{2i}   = sin(t · scale / 10000^{2i/d})
+        embed(t)_{2i+1} = cos(t · scale / 10000^{2i/d})
 
     con ``i = 0, …, d/2 - 1`` y ``d = embed_dim``. Las frecuencias
     (denominadores) se precomputan en :meth:`__init__` y se guardan como buffer
     (no son parámetros: no se aprenden). Funciona para cualquier ``t`` flotante
     no negativo, sin supuestos sobre su escala (el rango depende de la SDE:
     ``[0, 1]``, ``[0, T]`` o pasos enteros).
+
+    El factor ``scale`` multiplica al tiempo **antes** de la codificación y
+    sigue la convención de las implementaciones de referencia para ``t``
+    continuo en ``[0, 1]``: DDPM condiciona en pasos enteros ``0..999`` y el
+    repo oficial de Song et al. (``score_sde_pytorch``) usa ``labels = t * 999``
+    para VP/sub-VP continuo. Con el default ``scale=1.0`` la salida es idéntica
+    bit a bit a la implementación previa (retrocompatible); ``scale=1000`` es el
+    valor recomendado para que la codificación resuelva tiempos chicos
+    (``t ≲ 1e-2``). No agrega parámetros entrenables ni estado aleatorio.
     """
 
-    def __init__(self, embed_dim: int = 128) -> None:
+    def __init__(self, embed_dim: int = 128, scale: float = 1.0) -> None:
         """Inicializa el embedding.
 
         Args:
             embed_dim: Dimensión del vector de salida. Debe ser par (cada
                 frecuencia aporta un seno y un coseno).
+            scale: Factor de escala temporal aplicado a ``t`` antes de la
+                codificación. Debe ser finito y positivo. Default ``1.0``
+                (comportamiento previo, sin escala).
 
         Raises:
-            ValueError: Si ``embed_dim`` no es par.
+            ValueError: Si ``embed_dim`` no es par, o si ``scale`` no es
+                finito y positivo.
         """
         super().__init__()
         if embed_dim % 2 != 0:
@@ -74,7 +89,14 @@ class SinusoidalEmbedding(nn.Module):
                 f"embed_dim debe ser par (un seno y un coseno por frecuencia); "
                 f"recibí embed_dim={embed_dim}"
             )
+        scale = float(scale)
+        if not (math.isfinite(scale) and scale > 0.0):
+            raise ValueError(
+                f"scale debe ser finito y positivo; recibí scale={scale}"
+            )
         self.embed_dim = int(embed_dim)
+        #: Factor de escala temporal (float plano, no buffer: introspección y repr).
+        self.scale = scale
         # Denominadores 10000^{2i/d} para i = 0 .. d/2 - 1, shape (d/2,).
         i = torch.arange(embed_dim // 2, dtype=torch.float32)
         denom = torch.pow(10000.0, (2.0 * i) / embed_dim)
@@ -90,8 +112,8 @@ class SinusoidalEmbedding(nn.Module):
         Returns:
             Tensor de shape ``(B, embed_dim)`` con senos y cosenos intercalados.
         """
-        t = t.reshape(-1)  # (B, 1) o (B,) -> (B,)
-        # args[b, i] = t_b / denom_i  ->  (B, d/2)
+        t = t.reshape(-1) * self.scale  # (B, 1) o (B,) -> (B,), escalado
+        # args[b, i] = t_b * scale / denom_i  ->  (B, d/2)
         args = t[:, None] / self.denom[None, :]
         # Intercalar sin/cos: stack -> (B, d/2, 2) -> reshape (B, d).
         emb = torch.stack((torch.sin(args), torch.cos(args)), dim=-1)

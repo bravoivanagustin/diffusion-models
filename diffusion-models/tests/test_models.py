@@ -455,3 +455,86 @@ def test_make_model_filters_unknown_kwargs():
     net = make_model("mlp", data_dim=2, no_aplica_a_mlp=123)
     assert isinstance(net, ScoreMLP)
     assert net.data_dim == 2
+
+
+# ------------------------------- SinusoidalEmbedding: escala temporal (Req 1, 6.1)
+# Spec time-embedding-scale: escala configurable aplicada al tiempo antes de la
+# codificación, retrocompatible por default (scale=1.0), con validación fail-fast.
+
+
+def _closed_form_embedding(t, embed_dim):
+    """Fórmula cerrada vigente: sin/cos(t / 10000^{2i/d}) con sin/cos intercalados."""
+    i = torch.arange(embed_dim // 2, dtype=torch.float32)
+    denom = torch.pow(10000.0, (2.0 * i) / embed_dim)
+    t = t.reshape(-1)
+    args = t[:, None] / denom[None, :]
+    emb = torch.stack((torch.sin(args), torch.cos(args)), dim=-1)
+    return emb.reshape(t.shape[0], embed_dim)
+
+
+def test_embedding_default_matches_closed_form():
+    # Req 1.2: sin escala explícita, la salida es idéntica bit a bit a la
+    # implementación vigente (misma fórmula cerrada, mismas operaciones).
+    t = torch.tensor([0.0, 1e-4, 1e-2, 0.5, 1.0, 999.0])
+    assert torch.equal(SinusoidalEmbedding(64)(t), _closed_form_embedding(t, 64))
+
+
+def test_embedding_scale_one_identical_to_default():
+    # Req 1.2: scale=1.0 explícito == construcción sin el kwarg, bit a bit.
+    t = torch.rand(16)
+    a = SinusoidalEmbedding(64, scale=1.0)(t)
+    b = SinusoidalEmbedding(64)(t)
+    assert torch.equal(a, b)
+
+
+def test_embedding_scale_applied_before_encoding():
+    # Req 1.1 / postcondición del diseño: forward(t) con escala s equivale a la
+    # codificación vigente evaluada en t * s (bit a bit: es la misma operación).
+    t = torch.rand(16)
+    scaled = SinusoidalEmbedding(64, scale=1000.0)(t)
+    reference = SinusoidalEmbedding(64)(t * 1000.0)
+    assert torch.equal(scaled, reference)
+
+
+def test_embedding_scale_resolves_small_t():
+    # Req 1.3: con la escala recomendada (1000), la distancia euclídea entre los
+    # embeddings de t=1e-4 y t=1e-2 es al menos 50x la obtenida con el default
+    # (la codificación pasa a distinguir tiempos chicos).
+    t_lo = torch.tensor([1e-4])
+    t_hi = torch.tensor([1e-2])
+
+    def dist(scale: float) -> float:
+        emb = SinusoidalEmbedding(64, scale=scale)
+        return torch.linalg.vector_norm(emb(t_lo) - emb(t_hi)).item()
+
+    assert dist(1000.0) >= 50.0 * dist(1.0)
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("inf"), float("nan")])
+def test_embedding_invalid_scale_raises(scale):
+    # Req 1.4: escala no positiva o no finita -> ValueError en construcción cuyo
+    # mensaje incluye el valor recibido.
+    with pytest.raises(ValueError, match=str(scale)):
+        SinusoidalEmbedding(64, scale=scale)
+
+
+def test_embedding_scaled_keeps_shape_dtype_contract():
+    # Req 1.5: con escala activa, t como (B,) o (B, 1) -> mismo resultado bit a bit,
+    # salida (B, embed_dim) float32 y finita (el contrato vigente no cambia).
+    emb = SinusoidalEmbedding(32, scale=1000.0)
+    t = torch.rand(16)
+    a = emb(t)
+    b = emb(t.reshape(16, 1))
+    assert a.shape == b.shape == (16, 32)
+    assert torch.equal(a, b)
+    assert a.dtype == torch.float32
+    assert torch.all(torch.isfinite(a))
+
+
+def test_embedding_scale_no_new_params_or_buffers():
+    # Invariante del diseño: la escala no agrega parámetros entrenables ni buffers
+    # (solo el buffer denom existente) y queda expuesta como atributo de introspección.
+    emb = SinusoidalEmbedding(16, scale=1000.0)
+    assert list(emb.parameters()) == []
+    assert list(dict(emb.named_buffers())) == ["denom"]
+    assert emb.scale == 1000.0
