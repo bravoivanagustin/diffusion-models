@@ -9,6 +9,8 @@ misma arquitectura en todas las celdas SDE × sampler:
 - :mod:`diffusion.models.unet` — :class:`ScoreUNet`, la red convolucional para imágenes (Fase 2).
 - :mod:`diffusion.models.base` — el Protocol :class:`ScoreModel`, el contrato
   ``(x, t) -> score`` que toda red satisface estructuralmente.
+- :mod:`diffusion.models.parametrization` — :class:`EpsilonScoreWrapper`, la
+  parametrización ε del score (``score = -inner/σ_t`` con σ inyectada como callable).
 
 Además expone un registry/factory por nombre (:func:`make_model`, :func:`available_models`,
 :data:`REGISTRY`), espejo de ``make_sde`` y ``make_distribution``, para construir la red desde
@@ -31,6 +33,7 @@ import inspect
 from .base import ScoreModel
 from .layers import SinusoidalEmbedding
 from .mlp import ResidualBlock, ScoreMLP
+from .parametrization import EpsilonScoreWrapper
 from .unet import ScoreUNet
 
 REGISTRY: dict[str, type] = {
@@ -71,6 +74,7 @@ __all__ = [
     "ResidualBlock",
     "ScoreMLP",
     "ScoreUNet",
+    "EpsilonScoreWrapper",
     "REGISTRY",
     "available_models",
     "make_model",

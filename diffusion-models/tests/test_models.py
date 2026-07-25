@@ -790,3 +790,189 @@ def test_embedding_parity_not_vacuous_across_scales():
     t = torch.tensor([1e-3, 1e-2, 0.5])
     with torch.no_grad():
         assert not torch.allclose(mlp.time_embed(t), unet.time_mlp.embed(t))
+
+
+# --------------------- EpsilonScoreWrapper: parametrización ε (Req 2.1, 2.2, 2.7, 5.1)
+# Spec small-t-training-signal: la red interna predice una cantidad acotada (unidades de
+# ε) y el score consumido es -inner(x,t)/clamp(σ(x,t), 1e-5). La σ llega como callable
+# opaco (models no importa sde; estos TESTS sí pueden, para construir el callable real) y
+# el state_dict es transparente: el checkpoint sigue siendo de red pelada, reconstruible
+# con make_model.
+
+from diffusion.models import EpsilonScoreWrapper  # noqa: E402
+
+
+def _tiny_mlp(seed: int = 0) -> ScoreMLP:
+    """MLP chico con seed fija, para tests CPU-rápidos y reproducibles del wrapper."""
+    torch.manual_seed(seed)
+    return ScoreMLP(data_dim=2, embed_dim=16, hidden_dim=32, num_blocks=1)
+
+
+def _vp_std_callable():
+    """La σ real de una VP-SDE como callable opaco (patrón del diseño: get_score_fn)."""
+    from diffusion.sde import make_sde
+
+    sde = make_sde("vp", data_dim=2)
+    return sde, (lambda x, t: sde.marginal_prob(x, t)[1])
+
+
+def test_wrapper_parity_synthetic_sigma():
+    # Req 2.1: paridad numérica contra la fórmula con una σ sintética constante.
+    net = _tiny_mlp().eval()
+    sigma = lambda x, t: torch.full((x.shape[0], 1), 0.5)  # noqa: E731
+    wrapper = EpsilonScoreWrapper(net, sigma).eval()
+    x, t = torch.randn(16, 2), torch.rand(16)
+    with torch.no_grad():
+        expected = -net(x, t) / torch.clamp(sigma(x, t), min=1e-5)
+        assert torch.allclose(wrapper(x, t), expected)
+        assert wrapper(x, t).shape == x.shape
+
+
+def test_wrapper_parity_vp_sigma():
+    # Req 2.1: paridad numérica con la σ real de make_sde("vp") (el callable que
+    # construirán los call sites: lambda x, t: sde.marginal_prob(x, t)[1]).
+    sde, sigma = _vp_std_callable()
+    net = _tiny_mlp().eval()
+    wrapper = EpsilonScoreWrapper(net, sigma).eval()
+    x = torch.randn(16, 2)
+    t = torch.tensor([1e-3, 1e-2, 0.1, 0.5] * 4)
+    with torch.no_grad():
+        std = sde.marginal_prob(x, t)[1]
+        expected = -net(x, t) / torch.clamp(std, min=1e-5)
+        assert torch.allclose(wrapper(x, t), expected)
+
+
+def test_wrapper_clamp_floor_active():
+    # Req 2.1 / numerics.md: con σ < 1e-5 el piso se activa — la división usa 1e-5 y
+    # la salida queda finita (nunca división por ~0).
+    net = _tiny_mlp().eval()
+    sigma = lambda x, t: torch.full((x.shape[0], 1), 1e-8)  # noqa: E731
+    wrapper = EpsilonScoreWrapper(net, sigma).eval()
+    x, t = torch.randn(8, 2), torch.rand(8)
+    with torch.no_grad():
+        expected = -net(x, t) / 1e-5
+        assert torch.allclose(wrapper(x, t), expected)
+        assert torch.all(torch.isfinite(wrapper(x, t)))
+
+
+def test_wrapper_state_dict_transparent():
+    # Prerrequisito de 2.5: claves y tensores del wrapper == los del interno, SIN
+    # prefijo (el checkpoint sigue siendo de red pelada).
+    net = _tiny_mlp()
+    wrapper = EpsilonScoreWrapper(net, lambda x, t: torch.ones(x.shape[0], 1))
+    sd_wrapper = wrapper.state_dict()
+    sd_inner = net.state_dict()
+    assert set(sd_wrapper) == set(sd_inner)
+    assert all(torch.equal(sd_wrapper[k], sd_inner[k]) for k in sd_inner)
+
+
+def test_wrapper_trained_state_dict_reloads_into_bare_net():
+    # Prerrequisito de 2.5: entrenar el wrapper 2 pasos (optimizador sobre
+    # wrapper.parameters()) y reconstruir por factory una red pelada desde su
+    # state_dict — debe cargar sin error y reproducir el forward del interno.
+    from diffusion.training import dsm_loss
+
+    sde, sigma = _vp_std_callable()
+    wrapper = EpsilonScoreWrapper(_tiny_mlp(), sigma)
+    gen = torch.Generator().manual_seed(0)
+    opt = torch.optim.Adam(wrapper.parameters(), lr=1e-3)
+    for _ in range(2):
+        x0 = torch.randn(32, 2, generator=gen)
+        t = 1e-3 + (1.0 - 1e-3) * torch.rand(32, generator=gen)
+        loss = dsm_loss(wrapper, sde, x0, t, generator=gen)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    bare = make_model("mlp", data_dim=2, embed_dim=16, hidden_dim=32, num_blocks=1)
+    bare.load_state_dict(wrapper.state_dict())
+    bare.eval()
+    wrapper.eval()
+    x, t = torch.randn(16, 2), torch.rand(16)
+    with torch.no_grad():
+        assert torch.equal(bare(x, t), wrapper.inner(x, t))
+
+
+def test_wrapper_load_state_dict_accepts_bare_net():
+    # Prerrequisito de 2.5/2.6: load_state_dict acepta el state_dict de una red
+    # pelada (mismas claves sin prefijo) y el interno queda con esos pesos.
+    donor = _tiny_mlp(seed=1)
+    wrapper = EpsilonScoreWrapper(_tiny_mlp(seed=0), lambda x, t: torch.ones(x.shape[0], 1))
+    wrapper.load_state_dict(donor.state_dict())
+    wrapper.eval()
+    donor.eval()
+    x, t = torch.randn(16, 2), torch.rand(16)
+    with torch.no_grad():
+        assert torch.equal(wrapper.inner(x, t), donor(x, t))
+
+
+def test_wrapper_deterministic():
+    # Req 2.7: sin fuentes de aleatoriedad — dos forwards idénticos bit a bit.
+    _, sigma = _vp_std_callable()
+    wrapper = EpsilonScoreWrapper(_tiny_mlp(), sigma).eval()
+    x, t = torch.randn(16, 2), torch.rand(16)
+    with torch.no_grad():
+        assert torch.equal(wrapper(x, t), wrapper(x, t))
+
+
+def test_wrapper_no_new_parameters():
+    # Req 2.7: el wrapper no agrega parámetros entrenables — mismo conteo y misma
+    # cantidad de tensores de parámetros que el interno.
+    net = _tiny_mlp()
+    wrapper = EpsilonScoreWrapper(net, lambda x, t: torch.ones(x.shape[0], 1))
+    assert len(list(wrapper.parameters())) == len(list(net.parameters()))
+    n_wrapper = sum(p.numel() for p in wrapper.parameters() if p.requires_grad)
+    n_inner = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    assert n_wrapper == n_inner
+
+
+def test_wrapper_exposes_inner_and_parametrization():
+    # Contrato del diseño: expone el interno (.inner) y el nombre de la
+    # parametrización ("epsilon"); satisface el Protocol ScoreModel; y las
+    # delegaciones de nn.Module no rompen (smoke de .to/.train/.eval).
+    net = _tiny_mlp()
+    wrapper = EpsilonScoreWrapper(net, lambda x, t: torch.ones(x.shape[0], 1))
+    assert wrapper.inner is net
+    assert wrapper.parametrization == "epsilon"
+    assert isinstance(wrapper, ScoreModel)
+    wrapper.to("cpu")
+    wrapper.train()
+    assert net.training
+    wrapper.eval()
+    assert not net.training
+    out = wrapper(torch.randn(4, 2), torch.rand(4))
+    assert out.shape == (4, 2)
+
+
+def test_wrapper_inner_stays_in_epsilon_scale_on_delta_data():
+    # Req 2.2 (test funcional): con dato tipo delta (2 puntos fijos) y la pérdida DSM
+    # real, el pesado vigente λ=σ² deja la regresión interna en unidades de ε — tras
+    # ~80 pasos, en t=1e-3 la magnitud típica del interno sigue O(1) (< 10) mientras
+    # el score del wrapper es grande (≥ 10× la del interno; σ_VP(1e-3) ≈ 0.01).
+    from diffusion.training import dsm_loss
+
+    sde, sigma = _vp_std_callable()
+    net = _tiny_mlp()
+    wrapper = EpsilonScoreWrapper(net, sigma)
+    x0_points = torch.tensor([[1.0, -1.0], [-1.0, 1.0]])  # dato delta: 2 puntos fijos
+    gen = torch.Generator().manual_seed(0)
+    opt = torch.optim.Adam(wrapper.parameters(), lr=3e-3)
+    wrapper.train()
+    for _ in range(80):
+        idx = torch.randint(0, 2, (64,), generator=gen)
+        x0 = x0_points[idx]
+        t = 1e-3 + (1.0 - 1e-3) * torch.rand(64, generator=gen)
+        loss = dsm_loss(wrapper, sde, x0, t, generator=gen)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    wrapper.eval()
+    idx = torch.randint(0, 2, (256,), generator=gen)
+    x0 = x0_points[idx]
+    t_small = torch.full((256,), 1e-3)
+    x_t, _ = sde.perturb(x0, t_small, generator=gen)
+    with torch.no_grad():
+        inner_mag = net(x_t, t_small).abs().mean().item()
+        wrapper_mag = wrapper(x_t, t_small).abs().mean().item()
+    assert inner_mag < 10.0                     # el interno queda acotado (unidades de ε)
+    assert wrapper_mag >= 10.0 * inner_mag      # el score sale de la división por σ
+    assert wrapper_mag > 10.0                   # y es grande en términos absolutos
