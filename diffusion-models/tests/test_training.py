@@ -1252,3 +1252,114 @@ def test_roundtrip_checkpoint_con_parametrizacion_epsilon(tmp_path):
     with torch.no_grad():
         # La red reconstruida ES la interna entrenada (misma salida en unidades de ε).
         assert torch.allclose(net2(x, t), spec.model.inner(x, t))
+
+
+# ------------- small-t-training-signal: reconstrucción al generar (task 2.3)
+
+
+def test_generate_from_checkpoint_seam_e2e_con_ambos_ejes(tmp_path):
+    """Seam e2e config→train→checkpoint→generate con ambos ejes activos (2.3, 2.5).
+
+    Una corrida corta con ``time_sampling: log_uniform`` (eje 1) y ``score_parametrization:
+    epsilon`` (eje 2) produce un checkpoint cuya generación checkpoint-driven devuelve muestras
+    finitas con la shape esperada. Además se verifica que ``generate_from_checkpoint``
+    reconstruyó la red ENVUELTA con la MISMA σ: como la función no expone la red, se compara
+    por equivalencia — la reconstrucción a mano (``make_model`` + ``load_state_dict`` +
+    :class:`EpsilonScoreWrapper` con la σ de la SDE default) integrada con el mismo sampler y
+    la misma semilla produce ``torch.equal`` (mismo prior y mismo ruido por seed). Si generate
+    dejara la red pelada (sin dividir por σ), el score consumido sería otro y las trayectorias
+    divergirían. El contrato de los samplers no cambia: el wrapper entra como ``score_fn``
+    igual que una red pelada (2.3).
+    """
+    from diffusion.samplers import generate_from_checkpoint, make_sampler
+
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 2, "seed": 0, "time_sampling": "log_uniform"},
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1,
+                  "score_parametrization": "epsilon"},
+    }
+    spec = build_run(raw)
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    path = tmp_path / "ckpt_seam_ambos_ejes.pt"
+    save_checkpoint(result, path, model_spec=spec.model_spec)
+
+    x0 = generate_from_checkpoint(path, "euler", n_samples=8, n_steps=5, seed=0)
+
+    assert x0.shape == (8, 2)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+    # Reconstrucción a mano del MISMO pipeline: red pelada por la receta + wrap con la σ de la
+    # SDE default reconstruida desde la meta (mismo criterio que el lado de entrenamiento).
+    state_dict, meta = load_checkpoint(path)
+    recipe = meta["model"]
+    assert recipe["score_parametrization"] == "epsilon"  # la clave viajó en el checkpoint
+    net2 = make_model(recipe["name"], **recipe["kwargs"])
+    net2.load_state_dict(state_dict)
+    sde = make_sde(meta["sde_name"], data_dim=meta["data_dim"])
+    wrapper = EpsilonScoreWrapper(net2, lambda x, t: sde.marginal_prob(x, t)[1])
+    wrapper.eval()
+    sampler = make_sampler("euler", sde, wrapper, n_steps=5)
+    generator = torch.Generator()
+    generator.manual_seed(0)
+    esperado = sampler.sample(8, generator=generator)
+
+    # Igualdad exacta: mismo prior, mismo ruido, mismo score ⇒ misma trayectoria bit a bit.
+    assert torch.equal(x0, esperado)
+
+
+def test_generate_from_checkpoint_receta_vieja_reconstruye_pelada(tmp_path):
+    """Una receta anterior al cambio (sin ``score_parametrization``) genera SIN wrap (2.6).
+
+    Checkpoint con la forma vieja de la receta (``{name, kwargs}``): la generación corre sin
+    error y equivale bit a bit a integrar con la red PELADA reconstruida a mano — el
+    comportamiento previo queda intacto (retrocompatibilidad sin warning ni wrap).
+    """
+    from diffusion.samplers import generate_from_checkpoint, make_sampler
+
+    kwargs = {"data_dim": 2, "embed_dim": 16, "hidden_dim": 16, "num_blocks": 1}
+    net = ScoreMLP(**kwargs)
+    result = TrainResult(net=net, history=[1.0], sde_name="vp", data_dim=2)
+    path = tmp_path / "ckpt_receta_vieja_gen.pt"
+    save_checkpoint(result, path, model_spec={"name": "mlp", "kwargs": dict(kwargs)})
+
+    x0 = generate_from_checkpoint(path, "euler", n_samples=8, n_steps=5, seed=0)
+
+    assert x0.shape == (8, 2)
+    assert x0.dtype == torch.float32
+    assert torch.all(torch.isfinite(x0))
+
+    # Equivalencia contra la reconstrucción pelada: sin la clave no hay wrap.
+    state_dict, meta = load_checkpoint(path)
+    assert "score_parametrization" not in meta["model"]  # receta vieja, sin la clave
+    net2 = make_model(meta["model"]["name"], **meta["model"]["kwargs"])
+    net2.load_state_dict(state_dict)
+    net2.eval()
+    sde = make_sde(meta["sde_name"], data_dim=meta["data_dim"])
+    sampler = make_sampler("euler", sde, net2, n_steps=5)
+    generator = torch.Generator()
+    generator.manual_seed(0)
+    esperado = sampler.sample(8, generator=generator)
+
+    assert torch.equal(x0, esperado)
+
+
+def test_generate_from_checkpoint_rechaza_parametrizacion_desconocida(tmp_path):
+    """Un valor desconocido de ``score_parametrization`` en la receta revienta con
+    ``ValueError`` que menciona el valor recibido — mismo criterio de validación que
+    ``build_run`` en el lado de entrenamiento (los dos call sites validan igual)."""
+    from diffusion.samplers import generate_from_checkpoint
+
+    kwargs = {"data_dim": 2, "embed_dim": 16, "hidden_dim": 16, "num_blocks": 1}
+    net = ScoreMLP(**kwargs)
+    result = TrainResult(net=net, history=[1.0], sde_name="vp", data_dim=2)
+    path = tmp_path / "ckpt_parametrizacion_invalida.pt"
+    save_checkpoint(
+        result, path,
+        model_spec={"name": "mlp", "kwargs": dict(kwargs), "score_parametrization": "otra"},
+    )
+
+    with pytest.raises(ValueError, match="otra"):
+        generate_from_checkpoint(path, "euler", n_samples=4, n_steps=3, seed=0)
