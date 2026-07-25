@@ -30,7 +30,8 @@ import torch
 
 from ..models import ScoreModel
 from ..sde import ForwardSDE
-from .losses import dsm_loss, sample_timesteps
+from .losses import dsm_loss
+from .time_sampling import make_time_sampler
 
 
 @dataclass
@@ -55,6 +56,11 @@ class TrainConfig:
     # vista). El *cómo/dónde* persistir lo decide el callback ``on_checkpoint`` de :func:`train`
     # (el loop no toca el filesystem); sin ese callback este campo no hace nada.
     checkpoint_every: int = 0
+    # Distribución de muestreo de t del loop (ver :mod:`diffusion.training.time_sampling`):
+    # "uniform" = el default retrocompatible (misma secuencia por seed que antes del campo);
+    # "log_uniform" = la recomendada para concentrar señal de entrenamiento en t chico (la
+    # pérdida se corrige por likelihood ratio — mismo objetivo en esperanza, menos varianza).
+    time_sampling: str = "uniform"
 
 
 @dataclass
@@ -185,6 +191,12 @@ def train(
         # ResumeState. Igual hay que crear el objeto si el caller no lo pasó.
         generator = torch.Generator(device=device)
 
+    # Muestreo de t configurable (R1): el sampler se construye UNA sola vez, fail-fast — un
+    # nombre desconocido (o un t_eps fuera de (0, T)) revienta acá, antes de mover la red o de
+    # consumir data. No toca el RNG: el default "uniform" reproduce la fórmula previa del loop
+    # (misma llamada a torch.rand por paso), así que el stream del generator no cambia.
+    time_sampler = make_time_sampler(config.time_sampling, sde.T, config.t_eps)
+
     net = model.to(device)  # idempotente: no falla si el caller ya la movió
     net.train()
 
@@ -244,10 +256,12 @@ def train(
     # inicial ya lo alcanzó/superó, el rango es vacío y no se ejecuta ningún paso (no-op, 2.4).
     for step in range(start_step, config.num_steps):
         x0 = next(data_iter).to(device)
-        t = sample_timesteps(
-            x0.shape[0], sde.T, config.t_eps, generator=generator, device=device
+        # Tiempos y pesos por paso: la uniforme devuelve weights=None (camino idéntico al
+        # previo); una variante no uniforme devuelve el likelihood ratio y la pérdida lo aplica.
+        t, sample_weights = time_sampler.sample(
+            x0.shape[0], generator=generator, device=device
         )
-        loss = dsm_loss(net, sde, x0, t, generator=generator)
+        loss = dsm_loss(net, sde, x0, t, generator=generator, sample_weights=sample_weights)
 
         optimizer.zero_grad()
         loss.backward()

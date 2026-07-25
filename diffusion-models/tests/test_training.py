@@ -973,3 +973,150 @@ def test_dsm_loss_equivalencia_en_esperanza_log_uniforme():
     )
     # La tolerancia debe ser chica frente a la pérdida (el test no pasa por manga ancha).
     assert 3.0 * se_comb < 0.05 * media_a
+
+
+# ------------- small-t-training-signal: config y loop (task 1.3)
+
+
+def test_trainconfig_time_sampling_default_uniforme():
+    """``TrainConfig()`` sin el campo nuevo declara ``time_sampling="uniform"`` (1.2, 5.1).
+
+    El default retrocompatible: quien no configura nada obtiene el muestreo uniforme actual.
+    """
+    cfg = TrainConfig()
+    assert cfg.time_sampling == "uniform"
+    # El campo es configurable como cualquier otro del dataclass.
+    assert TrainConfig(time_sampling="log_uniform").time_sampling == "log_uniform"
+
+
+def test_train_default_bit_identico_al_loop_previo():
+    """Con el default (``time_sampling="uniform"``) ``train()`` es BIT-IDÉNTICO al loop previo (1.2).
+
+    Prueba de equivalencia determinística elegida: una **réplica manual del código previo del
+    loop** (``sample_timesteps`` + ``dsm_loss`` sin pesos, mismo orden de operaciones y mismo
+    consumo del RNG) contra ``train()`` con la config default. Ambas corridas parten de los
+    mismos pesos iniciales (``torch.manual_seed`` antes de construir la red) y la misma seed del
+    loop, así que si el cambio alterara el stream del generator, la secuencia de ``t`` o la
+    fórmula de la pérdida, la igualdad EXACTA (no aproximada) de historia y pesos finales
+    fallaría. Nota: este test también pasa sobre el código anterior al campo — es el guard de
+    regresión del invariante R1.2, no un test de feature.
+    """
+
+    def _fresh():
+        torch.manual_seed(123)  # pesos iniciales idénticos entre ambas corridas
+        sde = make_sde("vp")
+        net = _small_net(sde)
+        dist = make_distribution("gaussian", 2, seed=0)
+        data = _data(dist, n=128, batch_size=32, shuffle=False)
+        return sde, net, data, TrainConfig(num_steps=3, seed=0)
+
+    # (a) train() con la config default (sin declarar time_sampling).
+    sde, net_a, data, cfg = _fresh()
+    hist_a = train(sde, net_a, data, cfg).history
+
+    # (b) réplica manual del loop previo al cambio: misma inicialización del azar, un batch por
+    # paso, t por sample_timesteps y dsm_loss SIN pesos (el código de trainer.py pre-1.3).
+    sde, net_b, data, cfg = _fresh()
+    device = torch.device(cfg.device)
+    torch.manual_seed(cfg.seed)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(cfg.seed)
+    net_b = net_b.to(device)
+    net_b.train()
+    data_iter = iter(data)
+    optimizer = torch.optim.Adam(net_b.parameters(), lr=cfg.lr)
+    hist_b = []
+    for _ in range(cfg.num_steps):
+        x0 = next(data_iter).to(device)
+        t = sample_timesteps(x0.shape[0], sde.T, cfg.t_eps, generator=generator, device=device)
+        loss = dsm_loss(net_b, sde, x0, t, generator=generator)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        hist_b.append(loss.item())
+
+    assert hist_a == hist_b  # igualdad exacta de floats por paso, no aproximada
+    sd_a, sd_b = net_a.state_dict(), net_b.state_dict()
+    assert sd_a.keys() == sd_b.keys()
+    for key in sd_a:
+        assert torch.equal(sd_a[key], sd_b[key]), f"peso final distinto en {key}"
+
+
+def test_train_rechaza_time_sampling_desconocido_antes_de_entrenar():
+    """Una distribución desconocida revienta con ``ValueError`` ANTES de cualquier paso (1.6).
+
+    El loop construye el sampler una única vez, fail-fast: si el nombre no está registrado, el
+    error sale antes de consumir data — la fuente centinela convierte cualquier consumo prematuro
+    en un ``AssertionError`` distinto del ``ValueError`` esperado.
+    """
+
+    class _DataProhibida:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise AssertionError("el loop consumió data antes de validar time_sampling")
+
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    cfg = TrainConfig(num_steps=2, seed=0, time_sampling="desconocida")
+    with pytest.raises(ValueError, match="desconocida"):
+        train(sde, net, _DataProhibida(), cfg)
+
+
+def test_train_con_log_uniform_entrena_y_usa_la_distribucion():
+    """Con ``time_sampling="log_uniform"`` el loop entrena con pérdidas finitas y la distribución
+    declarada realmente gobierna el muestreo: misma seed, historia distinta a la del uniforme."""
+
+    def _run(time_sampling):
+        torch.manual_seed(123)
+        sde = make_sde("vp")
+        net = _small_net(sde)
+        dist = make_distribution("gaussian", 2, seed=0)
+        cfg = TrainConfig(num_steps=3, seed=0, time_sampling=time_sampling)
+        return train(sde, net, _data(dist, n=128, batch_size=32, shuffle=False), cfg).history
+
+    hist_log = _run("log_uniform")
+    assert len(hist_log) == 3
+    assert all(math.isfinite(v) for v in hist_log)
+    assert hist_log != _run("uniform")  # el campo cambia de verdad el muestreo de t
+
+
+def test_build_run_acepta_time_sampling_y_sigue_estricto(tmp_path):
+    """El bloque ``train:`` del YAML acepta la clave nueva y la validación estricta sigue
+    rechazando claves inválidas (1.7); la corrida config-driven con la distribución recomendada
+    construye el ``TrainConfig`` con ella y entrena end-to-end (observable de la tarea)."""
+    pytest.importorskip("yaml")
+    text = (
+        "sde:\n"
+        "  name: vp\n"
+        "data:\n"
+        "  shape: gaussian\n"
+        "  dim: 2\n"
+        "  n_samples: 128\n"
+        "  batch_size: 64\n"
+        "  seed: 0\n"
+        "train:\n"
+        "  num_steps: 2\n"
+        "  seed: 0\n"
+        "  time_sampling: log_uniform\n"
+    )
+    path = tmp_path / "run_log_uniform.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    spec = build_run(load_config(path))
+    assert spec.config.time_sampling == "log_uniform"
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    assert len(result.history) == 2
+    assert all(math.isfinite(v) for v in result.history)
+
+    # La validación estricta de claves del bloque train: sigue funcionando con el campo nuevo
+    # registrado (una clave inválida se rechaza nombrándola).
+    bad = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1, "time_sampling_typo": "log_uniform"},
+    }
+    with pytest.raises(ValueError, match="time_sampling_typo"):
+        build_run(bad)
