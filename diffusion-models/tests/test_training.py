@@ -701,3 +701,122 @@ def test_generate_from_checkpoint_reconstruye_con_time_scale(tmp_path):
     assert x0.shape == (8, 2)
     assert x0.dtype == torch.float32
     assert torch.all(torch.isfinite(x0))
+
+
+# ------------------- small-t-training-signal: muestreo de tiempos (task 1.1)
+
+from diffusion.training import (  # noqa: E402
+    TimeSampler,
+    available_time_samplers,
+    make_time_sampler,
+)
+
+
+def test_uniform_time_sampler_identidad_por_seed():
+    """El default ``uniform`` reproduce EXACTAMENTE ``sample_timesteps`` con el mismo generator (1.2).
+
+    Es el invariante de retrocompatibilidad: con la misma semilla, la variante uniforme del
+    submódulo nuevo produce la misma secuencia de tiempos que la fórmula actual del loop
+    (``torch.equal``, no ``allclose``: debe ser la misma llamada a ``torch.rand`` seguida de la
+    misma transformación afín). Los pesos de la uniforme son ``None`` (likelihood ratio trivial).
+    """
+    sampler = make_time_sampler("uniform", T=1.0, t_eps=1e-4)
+    assert isinstance(sampler, TimeSampler)
+
+    g1 = torch.Generator().manual_seed(42)
+    t, weights = sampler.sample(1000, generator=g1)
+
+    g2 = torch.Generator().manual_seed(42)
+    t_ref = sample_timesteps(1000, T=1.0, t_eps=1e-4, generator=g2)
+
+    assert torch.equal(t, t_ref)  # identidad bit a bit, no aproximada
+    assert weights is None  # la uniforme no corrige: no hay ratio que aplicar
+
+
+def test_log_uniform_shape_dtype_y_rango():
+    """La log-uniforme cumple el contrato de salida: ``(n,)`` float32 en ``[t_eps, T]``."""
+    sampler = make_time_sampler("log_uniform", T=1.0, t_eps=1e-4)
+    g = torch.Generator().manual_seed(0)
+    t, weights = sampler.sample(4096, generator=g)
+
+    assert t.shape == (4096,)
+    assert t.dtype == torch.float32
+    assert float(t.min()) >= 1e-4 - 1e-9
+    assert float(t.max()) <= 1.0 + 1e-9
+    assert weights is not None
+    assert weights.shape == (4096,)
+    assert weights.dtype == torch.float32
+
+
+def test_log_uniform_concentra_masa_en_t_chico():
+    """La distribución recomendada pone ≥ 30% de las muestras en ``[t_eps, 0.01]`` (1.5).
+
+    Con ``t = t_eps·(T/t_eps)^u`` y ``u ~ U(0,1)``, la masa teórica de ``[t_eps, 0.01]`` es
+    ``ln(0.01/t_eps)/ln(T/t_eps) = ln(100)/ln(10000) = 0.50`` para ``t_eps=1e-4, T=1``.
+
+    Tolerancia estadística: la fracción empírica con ``n = 200_000`` tiene
+    ``SE = sqrt(0.5·0.5/200_000) ≈ 0.0011``, así que el umbral 0.30 queda a ~180·SE del valor
+    teórico 0.50 — el test no puede fallar por azar con la seed fija (ni con casi ninguna otra).
+    """
+    sampler = make_time_sampler("log_uniform", T=1.0, t_eps=1e-4)
+    g = torch.Generator().manual_seed(0)
+    t, _ = sampler.sample(200_000, generator=g)
+
+    masa = float((t <= 0.01).float().mean())
+    assert masa >= 0.30
+    # Chequeo de coherencia con la fórmula (0.50 teórico), no parte del gate del requisito.
+    assert masa == pytest.approx(0.50, abs=0.01)
+
+
+def test_log_uniform_pesos_formula_y_media_uno():
+    """Los pesos son el likelihood ratio contra la uniforme: fórmula puntual y ``E_q[w] = 1``.
+
+    Fórmula: ``w(t) = p_unif(t)/q(t) = t·ln(T/t_eps)/(T − t_eps)`` — positiva en todo el rango.
+
+    Tolerancia estadística de la media: con ``t`` log-uniforme en ``[1e-4, 1]``,
+    ``Var[w] = ln(r)·(T²−t_eps²)/(2(T−t_eps)²) − 1 ≈ ln(10⁴)/2 − 1 ≈ 3.6`` (``sd ≈ 1.9``), así que
+    con ``n = 200_000`` la media empírica tiene ``SE ≈ 1.9/√200_000 ≈ 0.0043``; la tolerancia
+    ``abs=0.02`` es ≈ 4.7·SE — holgada para la seed fija sin ocultar un ratio mal calculado.
+    """
+    T, t_eps = 1.0, 1e-4
+    sampler = make_time_sampler("log_uniform", T=T, t_eps=t_eps)
+    g = torch.Generator().manual_seed(0)
+    t, weights = sampler.sample(200_000, generator=g)
+
+    assert torch.all(weights > 0)
+    esperado = t * math.log(T / t_eps) / (T - t_eps)
+    assert torch.allclose(weights, esperado)
+    assert float(weights.mean()) == pytest.approx(1.0, abs=0.02)
+
+
+def test_time_sampler_factory_y_validacion():
+    """Factory fail-fast (1.1, 1.6): registry ordenado, nombre desconocido con opciones listadas,
+    y ``t_eps`` fuera de ``(0, T)`` rechazado en construcción."""
+    assert available_time_samplers() == ["log_uniform", "uniform"]
+
+    with pytest.raises(ValueError, match="log_uniform.*uniform"):
+        make_time_sampler("desconocido", T=1.0, t_eps=1e-4)
+
+    for bad_eps in (0.0, -1e-4, 1.0, 2.0):  # fuera de (0, T) con T=1.0
+        with pytest.raises(ValueError):
+            make_time_sampler("uniform", T=1.0, t_eps=bad_eps)
+        with pytest.raises(ValueError):
+            make_time_sampler("log_uniform", T=1.0, t_eps=bad_eps)
+
+
+@pytest.mark.parametrize("name", ["uniform", "log_uniform"])
+def test_time_sampler_reproducible_con_generator(name):
+    """Mismo generator → secuencia idéntica; seeds distintas → secuencias distintas."""
+    sampler = make_time_sampler(name, T=1.0, t_eps=1e-4)
+
+    g1 = torch.Generator().manual_seed(7)
+    g2 = torch.Generator().manual_seed(7)
+    t1, w1 = sampler.sample(256, generator=g1)
+    t2, w2 = sampler.sample(256, generator=g2)
+    assert torch.equal(t1, t2)
+    if w1 is not None:
+        assert torch.equal(w1, w2)
+
+    g3 = torch.Generator().manual_seed(8)
+    t3, _ = sampler.sample(256, generator=g3)
+    assert not torch.equal(t1, t3)

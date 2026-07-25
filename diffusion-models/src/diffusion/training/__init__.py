@@ -31,6 +31,13 @@ from __future__ import annotations
 
 from .config import RunSpec, build_run, load_config
 from .losses import dsm_loss, sample_timesteps
+from .time_sampling import (
+    LogUniformTimeSampler,
+    TimeSampler,
+    UniformTimeSampler,
+    available_time_samplers,
+    make_time_sampler,
+)
 from .resume import (
     ResumePlan,
     discover_snapshots,
@@ -54,6 +61,11 @@ from .trainer import (
 __all__ = [
     "dsm_loss",
     "sample_timesteps",
+    "TimeSampler",
+    "UniformTimeSampler",
+    "LogUniformTimeSampler",
+    "make_time_sampler",
+    "available_time_samplers",
     "TrainConfig",
     "TrainResult",
     "train",
