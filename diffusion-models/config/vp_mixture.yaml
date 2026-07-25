@@ -19,6 +19,7 @@ train:                    # hiperparámetros del loop de optimización (-> Train
   num_steps: 19200        # pasos de optimización (reemplaza epochs; ver docs/project/training.md)
   lr: 0.001
   t_eps: 1.0e-4           # piso del muestreo de t (evita t=0, sigma->0)
+  time_sampling: log_uniform  # muestreo de t: log-uniforme concentra señal de entrenamiento a t chico
   seed: 0
   device: cpu
   grad_clip: 1.0
@@ -32,6 +33,7 @@ model:                  # opcional: la red es la variable de control (fija entre
    num_blocks: 4
    activation: silu
    time_scale: 1000      # escala del embedding de tiempo: resolución a t chico (convención DDPM/Song)
+   score_parametrization: epsilon  # la red predice epsilon; se envuelve con EpsilonScoreWrapper (score = -eps/sigma_t)
 
 out:                      # rutas de salida (se crean los directorios)
   checkpoint: models/phase_1/vp_mixture.pt
