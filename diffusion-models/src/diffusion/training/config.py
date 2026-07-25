@@ -24,6 +24,9 @@ Estructura esperada del YAML::
     model:                # opcional: receta de la red -> make_model(name, **resto)
       name: mlp           #   si falta, se usa {name: mlp} dimensionado desde el dato/SDE
       hidden_dim: 256
+      score_parametrization: epsilon  # opcional: envuelve la red con EpsilonScoreWrapper
+                          #   (score = -red/σ_t de la SDE de la corrida); sin la clave, red
+                          #   pelada como siempre. Único valor válido: "epsilon".
     out:                  # rutas de salida (relativas al cwd)
       checkpoint: models/vp_mixture.pt
       loss_curve: models/vp_mixture_loss.png
@@ -36,7 +39,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields
 
 from ..data_generation import infinite_bare, make_distribution
-from ..models import ScoreModel, make_model
+from ..models import EpsilonScoreWrapper, ScoreModel, make_model
 from ..sde import ForwardSDE, make_sde
 from .trainer import TrainConfig
 
@@ -101,8 +104,9 @@ def build_run(raw: dict) -> RunSpec:
 
     Raises:
         ValueError: Si faltan claves obligatorias (``sde.name``, ``data.shape``), si el bloque
-            ``train:`` trae claves desconocidas para :class:`TrainConfig`, o si el ``name`` del
-            bloque ``model:`` no está registrado en ``make_model``.
+            ``train:`` trae claves desconocidas para :class:`TrainConfig`, si el ``name`` del
+            bloque ``model:`` no está registrado en ``make_model``, o si
+            ``model.score_parametrization`` trae un valor distinto de ``"epsilon"``.
     """
     raw = dict(raw or {})
 
@@ -139,6 +143,15 @@ def build_run(raw: dict) -> RunSpec:
     # las claves del bloque van a make_model, que filtra por firma (no se validan acá) ---
     model_raw = dict(raw.get("model") or {})
     model_name = model_raw.pop("name", "mlp")
+    # La clave de parametrización se saca ANTES de make_model: no es un hiperparámetro de la
+    # red (no debe llegar al constructor ni a los kwargs de la receta) sino una decisión de
+    # cómo se consume su salida. Sin la clave -> pipeline idéntico al actual (red pelada).
+    parametrization = model_raw.pop("score_parametrization", None)
+    if parametrization is not None and parametrization != "epsilon":
+        raise ValueError(
+            f"config: score_parametrization desconocida: {parametrization!r}. "
+            "Válidas: 'epsilon' (u omitir la clave para la red pelada)."
+        )
     # Gate: inyectamos ``data_dim`` en la receta del modelo solo cuando es un entero (path MLP
     # 2D: dimensiona el default desde la SDE). Para una forma de evento multidimensional (tupla,
     # imágenes) NO se inyecta: la red de imágenes es la U-Net, que trae su propia config y no
@@ -149,6 +162,13 @@ def build_run(raw: dict) -> RunSpec:
     # Receta genérica {name, kwargs} para el checkpoint model-agnóstico: la misma con la que se
     # construyó la red, así generate.py la reconstruye con make_model sin el config original.
     model_spec = {"name": model_name, "kwargs": dict(model_raw)}
+    if parametrization == "epsilon":
+        # Wrap con la σ de la SDE de la corrida: el RunSpec entrena/consume score = -red/σ_t
+        # (misma fórmula que la reconstrucción al generar). La clave viaja como hermana de
+        # name/kwargs en la receta —los kwargs quedan pelados: el camino de reconstrucción
+        # sigue siendo make_model(name, **kwargs) y recién después el wrap—.
+        model = EpsilonScoreWrapper(model, lambda x, t: sde.marginal_prob(x, t)[1])
+        model_spec["score_parametrization"] = "epsilon"
 
     # --- salidas ---
     out_raw = dict(raw.get("out") or {})

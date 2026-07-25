@@ -1120,3 +1120,135 @@ def test_build_run_acepta_time_sampling_y_sigue_estricto(tmp_path):
     }
     with pytest.raises(ValueError, match="time_sampling_typo"):
         build_run(bad)
+
+
+# ------------- small-t-training-signal: activación config-driven de la parametrización (task 2.2)
+
+from diffusion.models import EpsilonScoreWrapper  # noqa: E402  (sección append-only, task 2.2)
+
+
+def test_build_run_con_score_parametrization_envuelve_y_persiste_la_clave():
+    """Con ``score_parametrization: epsilon`` en el bloque ``model:``, ``build_run`` envuelve la
+    red con :class:`EpsilonScoreWrapper` y registra la clave en la receta del checkpoint (2.4, 2.5).
+
+    La receta transporta la clave como hermana de ``name``/``kwargs`` y los ``kwargs`` quedan
+    PELADOS (sin la clave): el camino de reconstrucción es ``make_model(name, **kwargs)`` y
+    después el wrap — si la clave se filtrara a los kwargs, la factory la rechazaría o la
+    ignoraría en silencio.
+    """
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 1, "seed": 0},
+        "model": {
+            "name": "mlp", "hidden_dim": 32, "num_blocks": 1,
+            "score_parametrization": "epsilon",
+        },
+    }
+    spec = build_run(raw)
+
+    # La red del RunSpec ES el wrapper, con la red interna construida desde el bloque model:.
+    assert isinstance(spec.model, EpsilonScoreWrapper)
+    assert isinstance(spec.model.inner, ScoreMLP)
+    assert spec.model.inner.hidden_dim == 32
+    assert spec.model.inner.num_blocks == 1
+    assert spec.model.inner.data_dim == spec.sde.data_dim  # el data_dim lo sigue aportando la SDE
+
+    # La receta persiste la clave al lado de name/kwargs; los kwargs quedan pelados.
+    assert spec.model_spec["score_parametrization"] == "epsilon"
+    assert spec.model_spec["name"] == "mlp"
+    assert "score_parametrization" not in spec.model_spec["kwargs"]
+
+
+def test_build_run_sin_la_clave_pipeline_identico_al_actual():
+    """Sin ``score_parametrization`` el pipeline es idéntico al actual: red pelada (sin wrapper)
+    y receta con la forma vieja, sin la clave nueva (retrocompatibilidad, 2.4)."""
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1},
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1},
+    }
+    spec = build_run(raw)
+
+    assert not isinstance(spec.model, EpsilonScoreWrapper)
+    assert isinstance(spec.model, ScoreMLP)
+    assert "score_parametrization" not in spec.model_spec
+    assert set(spec.model_spec) == {"name", "kwargs"}  # forma vieja de la receta, intacta
+
+
+def test_build_run_rechaza_score_parametrization_desconocida():
+    """Un valor desconocido de ``score_parametrization`` revienta con ``ValueError`` explícito
+    que menciona el valor recibido (fail-fast antes de entrenar)."""
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1},
+        "model": {"name": "mlp", "score_parametrization": "otra"},
+    }
+    with pytest.raises(ValueError, match="otra"):
+        build_run(raw)
+
+
+def test_build_run_envuelve_con_la_sigma_de_la_sde_de_la_corrida():
+    """El wrap usa la σ de la SDE de la corrida: el score del RunSpec es exactamente
+    ``-inner(x, t) / clamp(σ_t, 1e-5)`` con la σ de ``spec.sde.marginal_prob`` (2.1 vía 2.4)."""
+    raw = {
+        "sde": {"name": "vp", "beta_min": 0.1, "beta_max": 20.0},
+        "data": {"shape": "gaussian", "dim": 2, "seed": 0},
+        "train": {"num_steps": 1, "seed": 0},
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1,
+                  "score_parametrization": "epsilon"},
+    }
+    spec = build_run(raw)
+
+    torch.manual_seed(0)
+    x = torch.randn(16, 2)
+    t = torch.rand(16).clamp_min(1e-3)
+    spec.model.eval()
+    with torch.no_grad():
+        score = spec.model(x, t)
+        std = spec.sde.marginal_prob(x, t)[1]
+        esperado = -spec.model.inner(x, t) / std.clamp_min(1e-5)
+    assert torch.allclose(score, esperado, rtol=0.0, atol=0.0)
+
+
+def test_roundtrip_checkpoint_con_parametrizacion_epsilon(tmp_path):
+    """Smoke del seam config→train→checkpoint con la parametrización activa (2.5, 5.1).
+
+    ``train()`` consume el RunSpec envuelto (2 pasos, historia finita); el checkpoint guardado
+    con ``model_spec`` transporta la clave en la meta, y la reconstrucción por la receta —
+    ``make_model(name, **kwargs)`` + ``load_state_dict`` — funciona sobre la RED PELADA (el
+    state_dict persistido no tiene prefijo de wrapper)."""
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 2, "seed": 0},
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1,
+                  "score_parametrization": "epsilon"},
+    }
+    spec = build_run(raw)
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    assert result.net is spec.model  # entrena la red envuelta que armó build_run
+    assert len(result.history) == 2
+    assert all(math.isfinite(v) for v in result.history)
+
+    path = tmp_path / "ckpt_epsilon.pt"
+    save_checkpoint(result, path, model_spec=spec.model_spec)
+
+    state_dict, meta = load_checkpoint(path)
+    recipe = meta["model"]
+    assert recipe["score_parametrization"] == "epsilon"
+    assert "score_parametrization" not in recipe["kwargs"]
+
+    # Reconstrucción por la receta: red pelada + state_dict sin prefijo de wrapper.
+    net2 = make_model(recipe["name"], **recipe["kwargs"])
+    net2.load_state_dict(state_dict)
+    x = torch.randn(4, 2)
+    t = torch.rand(4)
+    spec.model.eval()
+    net2.eval()
+    with torch.no_grad():
+        # La red reconstruida ES la interna entrenada (misma salida en unidades de ε).
+        assert torch.allclose(net2(x, t), spec.model.inner(x, t))
