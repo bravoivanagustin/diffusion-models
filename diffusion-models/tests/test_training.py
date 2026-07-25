@@ -820,3 +820,156 @@ def test_time_sampler_reproducible_con_generator(name):
     g3 = torch.Generator().manual_seed(8)
     t3, _ = sampler.sample(256, generator=g3)
     assert not torch.equal(t1, t3)
+
+
+# ------------- small-t-training-signal: pesos en dsm_loss (task 1.2)
+
+
+def _per_sample_dsm(net, sde, x0, t, *, generator):
+    """Réplica por-muestra de la fórmula de ``dsm_loss`` con los mismos componentes públicos.
+
+    Devuelve ``(B,)`` con ``mean_evento( λ(t) · (s_θ − s_real)² )`` por dato: su media de batch
+    coincide con el escalar de ``dsm_loss`` (misma seed de ``generator``), lo que se verifica
+    explícitamente en el test de equivalencia antes de usarla para estadística.
+    """
+    x_t, eps = sde.perturb(x0, t, generator=generator)
+    score_real, weight = sde.score_target(x0, t, eps)
+    with torch.no_grad():
+        score_pred = net(x_t, t)
+    err = weight * (score_pred - score_real).pow(2)
+    return err.reshape(err.shape[0], -1).mean(dim=1)
+
+
+def test_dsm_loss_retrocompatible_sin_pesos():
+    """Sin ``sample_weights`` (omitido o ``None``) el valor es idéntico al actual (1.3, 5.1).
+
+    Se compara bit a bit (``torch.equal``) contra la réplica manual de la fórmula vigente
+    (``perturb`` → ``score_target`` → media pesada por λ) con la misma seed, y entre la llamada
+    sin kwarg y la llamada con ``sample_weights=None`` explícito: ambas deben recorrer el mismo
+    camino de código.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    x0 = torch.randn(32, 2, generator=torch.Generator().manual_seed(1))
+    t = sample_timesteps(32, T=sde.T, t_eps=1e-3, generator=torch.Generator().manual_seed(2))
+
+    # Réplica manual de la fórmula actual (el "valor previo") con la misma seed del kernel.
+    g_ref = torch.Generator().manual_seed(3)
+    x_t, eps = sde.perturb(x0, t, generator=g_ref)
+    score_real, weight = sde.score_target(x0, t, eps)
+    esperado = (weight * (net(x_t, t) - score_real).pow(2)).mean()
+
+    g1 = torch.Generator().manual_seed(3)
+    sin_kwarg = dsm_loss(net, sde, x0, t, generator=g1)
+    g2 = torch.Generator().manual_seed(3)
+    con_none = dsm_loss(net, sde, x0, t, generator=g2, sample_weights=None)
+
+    assert torch.equal(sin_kwarg, esperado)
+    assert torch.equal(con_none, sin_kwarg)
+
+
+@pytest.mark.parametrize(
+    ("data_shape", "make_net"),
+    [
+        ((32, 2), None),  # dato 2D: red MLP real
+        ((8, 1, 4, 4), _DummyScoreNet),  # dato tipo imagen: dummy N-D-safe
+    ],
+    ids=["2d", "imagen"],
+)
+def test_dsm_loss_aplica_pesos_por_muestra(data_shape, make_net):
+    """Los pesos por muestra escalan la pérdida y broadcastean sobre las dims de evento (1.3).
+
+    - ``w = 1`` → idéntico a sin pesos; ``w = 2`` → exactamente 2×.
+    - Shapes ``(B,)`` y ``(B, 1)`` producen el mismo resultado.
+    - Funciona igual con dato 2D ``(B, 2)`` y con dato imagen ``(B, 1, 4, 4)`` (el peso se
+      expande a ``(B, 1, …, 1)`` como hace ``λ(t)``).
+    """
+    B = data_shape[0]
+    event_shape = data_shape[1:]
+    sde = make_sde("vp", data_dim=event_shape[0] if len(event_shape) == 1 else event_shape)
+    net = _small_net(sde) if make_net is None else make_net()
+    x0 = torch.randn(*data_shape, generator=torch.Generator().manual_seed(5))
+    t = sample_timesteps(B, T=sde.T, t_eps=1e-3, generator=torch.Generator().manual_seed(6))
+
+    def loss_con(w):
+        g = torch.Generator().manual_seed(7)
+        return dsm_loss(net, sde, x0, t, generator=g, sample_weights=w)
+
+    base = loss_con(None)
+    assert torch.allclose(loss_con(torch.ones(B)), base)
+    assert torch.allclose(loss_con(2.0 * torch.ones(B)), 2.0 * base)
+    # (B,) y (B, 1) son shapes equivalentes para el mismo vector de pesos.
+    w = torch.rand(B, generator=torch.Generator().manual_seed(8)) + 0.5
+    assert torch.allclose(loss_con(w), loss_con(w.reshape(B, 1)))
+
+
+def test_dsm_loss_equivalencia_en_esperanza_log_uniforme():
+    """La log-uniforme corregida estima la MISMA pérdida esperada que la uniforme (1.4, 5.1).
+
+    Es el test clave del importance sampling: con un modelo fijo chico (``ScoreMLP`` sin
+    entrenar, seed fija) y la SDE VP, la pérdida esperada ``E[λ(t)·‖s_θ − s_real‖²]`` se estima
+    por Monte Carlo de dos formas — (a) ``t`` uniforme sin pesos y (b) ``t`` log-uniforme con su
+    likelihood ratio ``w(t)`` — y ambas deben coincidir dentro del error estadístico.
+
+    Tolerancia (derivación): cada estimador es una media de ``n`` términos i.i.d. por-muestra
+    (``ℓ_i`` para (a); ``w_i·ℓ_i`` para (b)), así que su error estándar es
+    ``SE = sd_empírico/√n``. La diferencia de las dos medias tiene, si fueran independientes,
+    ``SE_comb = sqrt(SE_a² + SE_b²)``; acá comparten el mismo ``x0`` (números aleatorios comunes,
+    correlación ≥ 0), lo que solo puede REDUCIR la varianza de la diferencia, así que
+    ``SE_comb`` es un techo conservador. Se exige ``|media_a − media_b| ≤ 3·SE_comb``: bajo la
+    hipótesis nula (mismo objetivo en esperanza, R1.3) un desvío de 3·SE tiene probabilidad
+    < 0.3%, y con seeds fijas el test es determinístico — no puede volverse flaky. Con
+    ``n = 200_000`` la tolerancia resultante es ~1% de la pérdida, así que un ratio mal
+    calculado (p. ej. sin el factor ``ln(T/t_eps)``, que sesga la media en ~7× — 1/ln(1000);
+    incluso la falta total de corrección, sesgo ~4% de la media, cae fuera de la tolerancia).
+
+    Las estadísticas por-muestra se calculan con ``_per_sample_dsm`` (réplica de la fórmula con
+    los mismos componentes públicos ``perturb``/``score_target``), cuya coherencia con
+    ``dsm_loss`` — sin y con pesos — se asserta antes de usarla.
+    """
+    torch.manual_seed(0)  # inicialización determinística de la red (modelo fijo)
+    net = ScoreMLP(data_dim=2, embed_dim=16, hidden_dim=16, num_blocks=1)
+    net.eval()
+    sde = make_sde("vp")
+    T, t_eps, n = sde.T, 1e-3, 200_000
+
+    x0 = torch.randn(n, 2, generator=torch.Generator().manual_seed(10))
+
+    # (a) t uniforme, sin pesos.
+    t_unif, w_unif = make_time_sampler("uniform", T=T, t_eps=t_eps).sample(
+        n, generator=torch.Generator().manual_seed(11)
+    )
+    assert w_unif is None
+    por_muestra_a = _per_sample_dsm(net, sde, x0, t_unif, generator=torch.Generator().manual_seed(12))
+
+    # (b) t log-uniforme, corregido por el likelihood ratio.
+    t_log, w = make_time_sampler("log_uniform", T=T, t_eps=t_eps).sample(
+        n, generator=torch.Generator().manual_seed(13)
+    )
+    por_muestra_b = w * _per_sample_dsm(net, sde, x0, t_log, generator=torch.Generator().manual_seed(14))
+
+    # Coherencia de la réplica: su media de batch ES el escalar de dsm_loss (misma seed),
+    # sin pesos y con pesos — así el test mide de verdad la pérdida de producción.
+    assert torch.allclose(
+        dsm_loss(net, sde, x0, t_unif, generator=torch.Generator().manual_seed(12)),
+        por_muestra_a.mean(),
+    )
+    assert torch.allclose(
+        dsm_loss(net, sde, x0, t_log, generator=torch.Generator().manual_seed(14), sample_weights=w),
+        por_muestra_b.mean(),
+    )
+
+    # Estadística en float64 para que la comparación no dependa de la suma en float32.
+    a = por_muestra_a.double()
+    b = por_muestra_b.double()
+    media_a, media_b = a.mean().item(), b.mean().item()
+    se_a = (a.std() / math.sqrt(n)).item()
+    se_b = (b.std() / math.sqrt(n)).item()
+    se_comb = math.sqrt(se_a**2 + se_b**2)
+
+    assert abs(media_a - media_b) <= 3.0 * se_comb, (
+        f"media_unif={media_a:.6f}, media_log_unif_corregida={media_b:.6f}, "
+        f"|dif|={abs(media_a - media_b):.6f} > 3·SE_comb={3.0 * se_comb:.6f}"
+    )
+    # La tolerancia debe ser chica frente a la pérdida (el test no pasa por manga ancha).
+    assert 3.0 * se_comb < 0.05 * media_a

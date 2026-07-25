@@ -30,11 +30,19 @@ def dsm_loss(
     t: torch.Tensor,
     *,
     generator: torch.Generator | None = None,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pérdida de denoising score matching para un batch.
 
     Calcula ``mean( λ(t) · || s_θ(x_t, t) - ∇_{x_t} log p_t(x_t | x_0) ||² )`` muestreando un
     único ``x_t`` por dato (estimador de un punto del DSM, suficiente para batches grandes).
+
+    Con ``sample_weights`` la media es ponderada: ``mean( w · λ(t) · ‖·‖² )``. Los pesos son el
+    **likelihood ratio** contra el muestreo uniforme de ``t`` (``w(t) = p_unif(t)/q(t)``, con
+    ``E_q[w] = 1``, ver :mod:`~diffusion.training.time_sampling`): cuando ``t`` viene de una
+    distribución no uniforme ``q``, ponderar por ``w`` deja la pérdida esperada idéntica a la
+    del muestreo uniforme — importance sampling puro, que solo reduce la varianza del estimador
+    sin cambiar el objetivo que se optimiza.
 
     Args:
         net: Red de score ``s_θ`` (típicamente :class:`diffusion.models.ScoreMLP`); recibe
@@ -43,6 +51,9 @@ def dsm_loss(
         x0: Dato limpio de shape ``(B, D)`` con ``D = sde.data_dim``.
         t: Tiempo de shape ``(B,)`` o ``(B, 1)``, normalmente en ``[t_eps, T]``.
         generator: Generador opcional de torch para el ruido del kernel (reproducibilidad).
+        sample_weights: Pesos por muestra opcionales, ``(B,)`` o ``(B, 1)`` positivos (el
+            likelihood ratio del muestreo de ``t``). Con ``None`` (default) la pérdida es la
+            media sin ponderar, idéntica al comportamiento previo.
 
     Returns:
         Escalar (tensor 0-dim) diferenciable con la pérdida media del batch.
@@ -50,8 +61,16 @@ def dsm_loss(
     x_t, eps = sde.perturb(x0, t, generator=generator)
     score_real, weight = sde.score_target(x0, t, eps)
     score_pred = net(x_t, t)
-    # weight es (B, 1) y broadcastea sobre las D componentes del score.
-    return (weight * (score_pred - score_real).pow(2)).mean()
+    if sample_weights is None:
+        # Camino idéntico al previo: weight ya viene rank-matched (B, 1, …, 1) y broadcastea
+        # sobre las dimensiones de evento del score.
+        return (weight * (score_pred - score_real).pow(2)).mean()
+    # Reshape de (B,) / (B, 1) a (B, 1, …, 1) para broadcastear sobre las dimensiones de
+    # evento, igual que weight (mismo patrón que ForwardSDE._expand_t). Una primera dimensión
+    # incompatible revienta con el error de broadcast de torch: es un parámetro interno del
+    # loop, no superficie de usuario.
+    w = sample_weights.reshape(sample_weights.shape[0], *([1] * (x0.ndim - 1)))
+    return (w * weight * (score_pred - score_real).pow(2)).mean()
 
 
 def sample_timesteps(
