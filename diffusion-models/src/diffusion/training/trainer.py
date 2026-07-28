@@ -98,12 +98,25 @@ class ResumeState:
     sidecar: ya vive en el ``meta`` del checkpoint de pesos (:func:`save_checkpoint`) y duplicarlo
     sería redundante (ver :func:`save_resume_state`); al cargar se rellena desde ese ``meta``.
 
+    Con **EMA activo** el estado de la corrida queda *partido* entre los dos artefactos: el
+    checkpoint de pesos publica la **sombra** (ver :func:`save_checkpoint`), así que los pesos
+    **crudos** —lo que hace falta para seguir optimizando— y la sombra misma viajan acá, en el
+    sidecar (R3.1). Son campos **opcionales**: sin EMA quedan en ``None`` y el sidecar no gana
+    ninguna clave, así que los sidecars anteriores a la feature siguen siendo válidos (R3.3).
+
     Attributes:
         optimizer_state: ``optimizer.state_dict()`` (estado de Adam).
         start_step: Pasos ya completados (= ``N`` del nombre ``…_stepNNNNN``).
         torch_rng_state: ``torch.get_rng_state()`` (RNG global de torch).
         generator_state: ``generator.get_state()`` (RNG del ruido del kernel / muestreo de ``t``).
         history: Pérdida per-step hasta ``start_step`` (se rellena desde el ``meta`` al cargar).
+        ema_state: Foto **clonada** de la sombra EMA del momento (``EmaShadow.state_dict()``) o
+            ``None`` sin EMA. Al reanudar se restaura con ``EmaShadow.load_state`` en lugar de
+            reconstruirse desde los pesos (una sombra nueva perdería el promedio acumulado).
+        raw_model_state: Pesos **crudos** del momento (``net.state_dict()`` clonado) o ``None`` sin
+            EMA. Es lo que :func:`~diffusion.training.load_resume` devuelve para cargar en la red
+            cuando el checkpoint de pesos publica EMA; sin esta clave (sidecar viejo = corrida sin
+            EMA) el checkpoint ya trae los crudos y se usa ese.
     """
 
     optimizer_state: dict
@@ -111,6 +124,8 @@ class ResumeState:
     torch_rng_state: torch.Tensor
     generator_state: torch.Tensor
     history: list[float]
+    ema_state: dict | None = None
+    raw_model_state: dict | None = None
 
 
 @dataclass
@@ -188,7 +203,8 @@ def train(
             azar (``torch.set_rng_state`` + ``generator.set_state``) **sin re-sembrar**, arranca
             en ``resume.start_step``, continúa ``resume.history`` e itera
             ``range(start_step, num_steps)``. Si ``start_step >= num_steps`` no corre ningún paso
-            y devuelve el resultado ya completo.
+            y devuelve el resultado ya completo. Si trae ``ema_state`` (corrida con EMA) la sombra
+            se restaura desde ahí; ver los guards de coherencia más abajo.
 
     Mantiene además, si ``config.ema_decay`` está configurado, una **sombra EMA** de los pesos
     (:class:`~diffusion.training.ema.EmaShadow`): se construye antes de consumir datos (fail-fast
@@ -196,12 +212,25 @@ def train(
     ``TrainResult.ema_state``. Es un observador pasivo — con la misma semilla, la trayectoria de
     optimización (pesos crudos e historia) es idéntica a la de una corrida sin EMA.
 
+    Al **reanudar** una corrida con EMA la sombra se **restaura** desde ``resume.ema_state`` (no se
+    reconstruye desde los pesos cargados, que valen θ_N y no el promedio acumulado), y los
+    snapshots persisten en el sidecar los pesos **crudos** del momento junto a la sombra (R3.1) —
+    los pesos del checkpoint son los EMA. Las dos combinaciones incoherentes entre la config y el
+    sidecar (EMA pedido sin sombra guardada; sombra guardada sin EMA pedido) se rechazan con
+    ``ValueError`` antes de entrenar: nunca se continúa con una sombra inventada ni descartada en
+    silencio (R3.4).
+
     Returns:
         :class:`TrainResult` con la red entrenada, la historia de pérdida (**serie per-step
         completa**: una entrada por paso, ``len(history) == num_steps`` cuando
         ``start_step < num_steps``; el ``history`` previo intacto en el caso no-op), el ``config``
         usado, el nombre de la SDE, su ``data_dim`` y la foto de la sombra EMA en ``ema_state``
         (``None`` si el EMA no está activo).
+
+    Raises:
+        ValueError: Si ``config.ema_decay`` es inválido (R1.6), si ``config.time_sampling`` no
+            existe, o si al reanudar la config y el sidecar no coinciden en el uso del EMA (R3.4).
+            Todos antes de consumir el primer batch.
     """
     device = torch.device(config.device)
     if resume is None:
@@ -233,6 +262,33 @@ def train(
     # a la previa (R1.2). La sombra es un observador **pasivo**: lee los pesos después del paso del
     # optimizador, no escribe en la red y no consume RNG (R1.4).
     ema = EmaShadow(net, config.ema_decay) if config.ema_decay is not None else None
+
+    # Coherencia config ↔ sidecar al reanudar (R3.4). Con EMA el estado de la corrida vive PARTIDO
+    # (el checkpoint publica la sombra; los crudos y la sombra van en el sidecar), así que las dos
+    # combinaciones cruzadas arrancarían de un estado inconsistente y hay que fallar en las dos —
+    # acá, junto al resto del fail-fast: antes de restaurar el optimizador y antes de consumir data.
+    if resume is not None:
+        if ema is not None and resume.ema_state is None:
+            raise ValueError(
+                f"La corrida configuró ema_decay={config.ema_decay} pero el punto de reanudación "
+                "no trae la sombra EMA: el sidecar de resume del checkpoint elegido no la "
+                "persistió (¿la corrida original entrenó sin EMA?). No se reanuda con una sombra "
+                "inventada —perdería el promedio de todos los pasos ya corridos y el checkpoint "
+                "final publicaría un EMA que no corresponde a la corrida—: entrená desde cero o "
+                "reanudá con la misma configuración que la corrida original."
+            )
+        if ema is None and resume.ema_state is not None:
+            raise ValueError(
+                "El punto de reanudación trae una sombra EMA en su sidecar de resume (la corrida "
+                "original la mantenía) pero esta corrida no configuró ema_decay: continuar "
+                "descartaría la sombra en silencio y el checkpoint final publicaría los pesos "
+                "crudos donde los intermedios de la misma corrida publicaron el promedio. "
+                "Declará el ema_decay de la corrida original o reanudá desde otro punto."
+            )
+        if ema is not None:
+            # Restaurada, no reconstruida: la sombra recién construida arriba vale θ_N (los pesos
+            # cargados), no el promedio acumulado hasta el paso N.
+            ema.load_state(resume.ema_state)
 
     data_iter = iter(data)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.lr)
@@ -276,6 +332,13 @@ def train(
         # Foto completa para que el callback persista pesos y sidecar: el TrainResult (pesos +
         # history) más el ResumeState del momento (optimizador + paso + azar + history). El azar
         # se lee DESPUÉS del paso, así que reanudar desde acá continúa el mismo stream (2.6).
+        #
+        # Con EMA activo el sidecar lleva además los pesos CRUDOS y la sombra del momento (R3.1):
+        # el checkpoint de pesos publica la sombra, así que sin los crudos acá una reanudación
+        # continuaría desde los pesos promediados. Los crudos se CLONAN explícitamente (el loop
+        # sigue mutando los tensores de la red in-place; una referencia viva haría que el sidecar
+        # del paso N terminara con los pesos del final de la corrida) y la sombra ya viene clonada
+        # de ``EmaShadow.state_dict()``.
         return TrainSnapshot(
             result=_result(),
             resume=ResumeState(
@@ -284,6 +347,12 @@ def train(
                 torch_rng_state=torch.get_rng_state(),
                 generator_state=generator.get_state(),
                 history=list(history),
+                ema_state=ema.state_dict() if ema is not None else None,
+                raw_model_state=(
+                    {k: v.detach().clone() for k, v in net.state_dict().items()}
+                    if ema is not None
+                    else None
+                ),
             ),
         )
 
@@ -479,11 +548,19 @@ def save_resume_state(
     de pesos (:func:`save_checkpoint`) y se recupera de ahí al reanudar (1.3). El checkpoint de
     pesos no se toca ni cambia de formato/tamaño (1.2).
 
+    Con **EMA activo** el sidecar lleva además dos claves **opcionales** (R3.1): ``raw_model_state``
+    (los pesos crudos del momento — el checkpoint de pesos publica la sombra, así que sin ellos no
+    se podría continuar optimizando) y ``ema_state`` (la sombra, para restaurarla en el loop). Se
+    escriben **solo si están**: los campos requeridos no cambian, así que el sidecar de una corrida
+    sin EMA queda idéntico en contenido al de antes de la feature y los sidecars viejos siguen
+    siendo válidos (R3.3).
+
     Args:
         path: Ruta de salida del sidecar (se crean los directorios intermedios). Convención de
             nombre: ``X_stepNNNNN.resume.pt`` hermano de ``X_stepNNNNN.pt``.
         resume: Estado a persistir. Debe tener el optimizador, el paso y ambos estados de RNG
-            presentes (no ``None``).
+            presentes (no ``None``); ``raw_model_state`` / ``ema_state`` son opcionales (van solo
+            si la corrida tiene EMA).
 
     Returns:
         La ruta donde se guardó (como :class:`pathlib.Path`).
@@ -509,6 +586,12 @@ def save_resume_state(
         "generator_state": resume.generator_state,
         # NB: 'history' NO se persiste acá (vive en el meta del checkpoint de pesos; 1.3).
     }
+    # Claves opcionales de EMA: presentes solo en corridas con sombra (R3.1). El ``if`` es lo que
+    # sostiene la retrocompatibilidad por construcción — sin EMA el blob no gana ninguna clave.
+    if resume.raw_model_state is not None:
+        blob["raw_model_state"] = resume.raw_model_state
+    if resume.ema_state is not None:
+        blob["ema_state"] = resume.ema_state
     torch.save(blob, out)
     return out
 
@@ -524,7 +607,9 @@ def load_resume_state(
 
     Returns:
         ``{optimizer_state, step, torch_rng_state, generator_state}`` (sin ``history``: se toma del
-        ``meta`` del checkpoint de pesos al reanudar).
+        ``meta`` del checkpoint de pesos al reanudar), más ``raw_model_state`` y ``ema_state`` **si
+        el sidecar los trae** (corrida con EMA, R3.1). Un sidecar anterior a esa feature no tiene
+        esas claves y se lee igual que siempre (R3.3), así que el consumidor las pide con ``get``.
     """
     # weights_only=False: es nuestro propio archivo (incluye el state_dict del optimizador).
     return torch.load(path, map_location=map_location, weights_only=False)

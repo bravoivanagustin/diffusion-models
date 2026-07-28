@@ -2236,3 +2236,272 @@ def test_publicacion_ema_compone_con_la_parametrizacion_epsilon(tmp_path):
         assert x.shape == (8, 2)
         assert torch.all(torch.isfinite(x))
     assert not torch.equal(x_ema, x_raw)  # el hermano lleva otros pesos (crudos)
+
+
+# ------------- ema-weights: reanudación con EMA (task 3)
+#
+# Con EMA activo los checkpoints publican la sombra, así que el estado de una corrida vive
+# **partido**: el checkpoint lleva el EMA y el sidecar de resume los crudos + la sombra. Esta
+# sección cubre el lado del LOOP de ese contrato —los dos guards de coherencia (3.4), la
+# restauración de la sombra y el round-trip interrumpida ≡ ininterrumpida (3.1, 3.2)—; el lado del
+# sidecar/``load_resume`` vive en ``test_resume.py``, donde están sus tests.
+
+from diffusion.training import (  # noqa: E402  (sección append-only, task 3)
+    ResumeState,
+    load_resume,
+    resume_sidecar_path,
+    save_resume_state,
+)
+
+_EMA_RESUME_N = 4  # paso del snapshot intermedio (el punto de interrupción)
+_EMA_RESUME_TOTAL = 8  # total de la corrida (el snapshot cae antes del último paso)
+_EMA_RESUME_DECAY = 0.6  # chico a propósito: la sombra se separa de los crudos en pocos pasos
+
+
+def _fuente_constante(batch):
+    """Fuente infinita de ORDEN FIJO (el mismo batch en cada paso): resume-invariante.
+
+    ``train`` reconstruye ``iter(data)`` en cada llamada, así que una fuente posicional le daría a
+    la corrida reanudada los batches del arranque y no los del paso ``N``. Con un batch constante
+    el dato de cada paso es el mismo en las dos corridas y la comparación aísla exactamente lo que
+    esta tarea prueba (crudos + sombra + optimizador + azar restaurados). Es el mismo recurso que
+    usan los tests de equivalencia de ``training-resume``.
+    """
+    while True:
+        yield batch
+
+
+def _batch_constante(n=32, dim=2, seed=4321):
+    """Batch fijo con ``Generator`` propio: no toca el RNG global que las corridas siembran."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(n, dim, generator=gen)
+
+
+def _net_resume_ema(sde) -> ScoreMLP:
+    """Red chica con pesos iniciales idénticos en cada invocación (misma semilla)."""
+    torch.manual_seed(321)
+    return _small_net(sde)
+
+
+def _resume_dummy(**overrides) -> ResumeState:
+    """:class:`ResumeState` mínimo para ejercitar los guards (el loop falla antes de usarlo)."""
+    base = dict(
+        optimizer_state={},
+        start_step=1,
+        torch_rng_state=torch.get_rng_state(),
+        generator_state=torch.Generator().manual_seed(0).get_state(),
+        history=[1.0],
+    )
+    base.update(overrides)
+    return ResumeState(**base)
+
+
+def test_train_con_ema_rechaza_reanudar_sin_sombra_en_el_sidecar():
+    """EMA pedido + sidecar sin sombra ⇒ ``ValueError`` explícito antes de entrenar (3.4).
+
+    Nunca una sombra inventada en silencio: reconstruirla de cero desde los pesos del paso ``N``
+    perdería el promedio de toda la primera mitad de la corrida y el checkpoint final publicaría un
+    EMA que no corresponde a la corrida. El guard va con el resto del fail-fast (la fuente centinela
+    convierte cualquier consumo de datos en un ``AssertionError`` distinto del error esperado) y el
+    mensaje nombra el sidecar y el decay configurado.
+    """
+    sde = make_sde("vp")
+    cfg = TrainConfig(num_steps=2, seed=0, ema_decay=0.9)
+
+    with pytest.raises(ValueError) as exc:
+        train(sde, _small_net(sde), _DataProhibidaEma(), cfg, resume=_resume_dummy())
+
+    mensaje = str(exc.value)
+    assert "sidecar" in mensaje
+    assert "ema_decay" in mensaje
+
+
+def test_train_sin_ema_rechaza_reanudar_con_sombra_en_el_sidecar():
+    """Sombra en el sidecar + EMA no pedido ⇒ ``ValueError`` explícito (3.4, simetría del guard).
+
+    La corrida original mantenía una sombra; continuar sin EMA la descartaría y el checkpoint final
+    publicaría los pesos crudos donde antes iba el promedio — un artefacto inconsistente con los
+    intermedios de la misma corrida. Se falla, con el mismo criterio fail-fast.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    sombra = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    cfg = TrainConfig(num_steps=2, seed=0)  # sin EMA
+
+    with pytest.raises(ValueError) as exc:
+        train(sde, net, _DataProhibidaEma(), cfg, resume=_resume_dummy(ema_state=sombra))
+
+    mensaje = str(exc.value)
+    assert "sidecar" in mensaje
+    assert "ema_decay" in mensaje
+
+
+def test_snapshot_con_ema_lleva_crudos_y_sombra_clonados():
+    """Cada snapshot intermedio lleva en su ``ResumeState`` los crudos y la sombra del momento (3.1).
+
+    Ambos **clonados**: el loop sigue mutando los pesos in-place y avanzando la sombra después del
+    snapshot, así que una referencia viva haría que el sidecar del paso 2 persistiera el estado del
+    final de la corrida (y la reanudación desde ese punto sería una ficción).
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=6, checkpoint_every=2, ema_decay=0.9)
+    estados: dict[str, ResumeState] = {}
+
+    def _cb(tag, snapshot):
+        estados[tag] = snapshot.resume
+
+    train(sde, net, data, cfg, on_checkpoint=_cb, generator=_generador(cfg))
+
+    assert sorted(estados) == ["step00002", "step00004"]
+    r2, r4 = estados["step00002"], estados["step00004"]
+    finales = net.state_dict()
+    for estado in (r2, r4):
+        assert estado.raw_model_state is not None
+        assert estado.ema_state is not None
+        assert set(estado.raw_model_state) == set(finales)
+        assert set(estado.ema_state) == set(finales)
+
+    # Fotos del momento, no referencias vivas: paso 2 ≠ paso 4 ≠ final de la corrida.
+    assert any(not torch.equal(r2.raw_model_state[k], r4.raw_model_state[k]) for k in finales)
+    assert any(not torch.equal(r2.raw_model_state[k], finales[k]) for k in finales)
+    assert any(not torch.equal(r2.ema_state[k], r4.ema_state[k]) for k in finales)
+    # La sombra es un promedio, no una copia de los crudos de su mismo momento.
+    assert any(not torch.equal(r4.ema_state[k], r4.raw_model_state[k]) for k in finales)
+
+
+def test_resume_con_ema_equivalente_a_corrida_ininterrumpida(tmp_path):
+    """Round-trip (3.2): interrumpida y reanudada ≡ ininterrumpida, por comparación **exacta**.
+
+    Se recorre el camino real del CLI de punta a punta: la corrida A persiste en el paso
+    ``_EMA_RESUME_N`` el checkpoint de pesos (que publica la **sombra**) y su sidecar (crudos +
+    sombra); la corrida B lo levanta con :func:`load_resume` —de donde salen los **crudos** para la
+    red— y completa los pasos restantes. Al terminar deben coincidir las tres cosas que nombra el
+    criterio, con ``torch.equal``: los pesos **crudos**, la **sombra** y el **checkpoint publicado**
+    (más el ``history``). Sin la extensión del sidecar, B arrancaría de los pesos EMA del
+    checkpoint intermedio y nada de eso cerraría.
+    """
+    sde = make_sde("vp")
+    batch = _batch_constante()
+    receta = {"name": "mlp", "kwargs": dict(_RECETA_CHICA["kwargs"])}
+    expected = {"sde_name": "vp", "model_spec": receta, "data_dim": 2}
+    base = tmp_path / "vp_ema.pt"
+
+    def on_checkpoint(tag, snapshot):
+        # Wiring del CLI: pesos (con la política de publicación EMA) + sidecar de resume.
+        tagged = base.with_stem(f"{base.stem}_{tag}")
+        save_checkpoint(snapshot.result, tagged, model_spec=receta)
+        save_resume_state(resume_sidecar_path(tagged), snapshot.resume)
+
+    # --- A: corrida ininterrumpida (deja el punto de reanudación del paso _EMA_RESUME_N).
+    net_a = _net_resume_ema(sde)
+    res_a = train(
+        sde,
+        net_a,
+        _fuente_constante(batch),
+        TrainConfig(
+            num_steps=_EMA_RESUME_TOTAL,
+            seed=0,
+            ema_decay=_EMA_RESUME_DECAY,
+            checkpoint_every=_EMA_RESUME_N,
+        ),
+        on_checkpoint=on_checkpoint,
+    )
+    crudos_a = {k: v.detach().clone() for k, v in net_a.state_dict().items()}
+    ckpt_a = tmp_path / "final_a.pt"
+    save_checkpoint(res_a, ckpt_a, model_spec=receta)
+
+    # --- B: reanudada desde el snapshot por el camino real (load_resume).
+    snap = base.with_stem(f"{base.stem}_step{_EMA_RESUME_N:05d}")
+    state_dict, _meta, resume = load_resume(snap, expected=expected)
+    assert resume.start_step == _EMA_RESUME_N
+    assert resume.ema_state is not None  # la sombra viajó en el sidecar (3.1)
+    # El checkpoint intermedio publica la SOMBRA: lo que se carga en la red son los CRUDOS.
+    publicado, _ = load_checkpoint(snap)
+    assert any(not torch.equal(state_dict[k], publicado[k]) for k in state_dict)
+
+    net_b = _net_resume_ema(sde)
+    net_b.load_state_dict(state_dict)
+    res_b = train(
+        sde,
+        net_b,
+        _fuente_constante(batch),
+        TrainConfig(num_steps=_EMA_RESUME_TOTAL, seed=0, ema_decay=_EMA_RESUME_DECAY),
+        resume=resume,
+    )
+    ckpt_b = tmp_path / "final_b.pt"
+    save_checkpoint(res_b, ckpt_b, model_spec=receta)
+
+    # (1) misma curva y mismos pesos CRUDOS.
+    assert res_b.history == res_a.history  # igualdad exacta de floats, paso a paso
+    crudos_b = net_b.state_dict()
+    for key in crudos_a:
+        assert torch.equal(crudos_b[key], crudos_a[key]), f"peso crudo distinto en {key}"
+
+    # (2) misma SOMBRA: restaurada del sidecar, no reconstruida desde los pesos cargados.
+    assert res_b.ema_state is not None
+    for key in res_a.ema_state:
+        assert torch.equal(res_b.ema_state[key], res_a.ema_state[key]), f"sombra distinta en {key}"
+
+    # (3) mismo checkpoint publicado (contenido: state_dict tensor a tensor + meta).
+    sd_a, meta_a = load_checkpoint(ckpt_a)
+    sd_b, meta_b = load_checkpoint(ckpt_b)
+    assert meta_a == meta_b
+    for key in sd_a:
+        assert torch.equal(sd_b[key], sd_a[key]), f"peso publicado distinto en {key}"
+
+    # La sombra NO es los crudos: la igualdad de (2) y (3) no es trivialmente satisfacible.
+    assert any(not torch.equal(res_a.ema_state[k], crudos_a[k]) for k in crudos_a)
+
+
+def test_resume_sin_ema_no_cambia_con_sidecar_viejo(tmp_path):
+    """Sidecar sin claves de EMA + config sin EMA ⇒ reanudación **exactamente como hoy** (3.3).
+
+    El camino retrocompatible completo: la corrida A no configura EMA (su checkpoint intermedio
+    publica los crudos y su sidecar no gana ninguna clave), B reanuda desde ahí y termina idéntica
+    a la ininterrumpida. Ningún guard se dispara y ``ema_state`` queda en ``None`` de punta a punta.
+    """
+    sde = make_sde("vp")
+    batch = _batch_constante()
+    receta = {"name": "mlp", "kwargs": dict(_RECETA_CHICA["kwargs"])}
+    base = tmp_path / "vp_sin_ema.pt"
+
+    def on_checkpoint(tag, snapshot):
+        tagged = base.with_stem(f"{base.stem}_{tag}")
+        save_checkpoint(snapshot.result, tagged, model_spec=receta)
+        save_resume_state(resume_sidecar_path(tagged), snapshot.resume)
+
+    net_a = _net_resume_ema(sde)
+    res_a = train(
+        sde,
+        net_a,
+        _fuente_constante(batch),
+        TrainConfig(num_steps=_EMA_RESUME_TOTAL, seed=0, checkpoint_every=_EMA_RESUME_N),
+        on_checkpoint=on_checkpoint,
+    )
+    crudos_a = {k: v.detach().clone() for k, v in net_a.state_dict().items()}
+    assert res_a.ema_state is None
+
+    snap = base.with_stem(f"{base.stem}_step{_EMA_RESUME_N:05d}")
+    state_dict, meta, resume = load_resume(
+        snap, expected={"sde_name": "vp", "model_spec": receta, "data_dim": 2}
+    )
+    assert "ema" not in meta  # el intermedio publicó crudos, como siempre
+    assert resume.ema_state is None
+    publicado, _ = load_checkpoint(snap)
+    for key in publicado:
+        assert torch.equal(state_dict[key], publicado[key]), key  # los pesos del checkpoint
+
+    net_b = _net_resume_ema(sde)
+    net_b.load_state_dict(state_dict)
+    res_b = train(
+        sde,
+        net_b,
+        _fuente_constante(batch),
+        TrainConfig(num_steps=_EMA_RESUME_TOTAL, seed=0),
+        resume=resume,
+    )
+
+    assert res_b.ema_state is None
+    assert res_b.history == res_a.history
+    crudos_b = net_b.state_dict()
+    for key in crudos_a:
+        assert torch.equal(crudos_b[key], crudos_a[key]), f"peso crudo distinto en {key}"

@@ -1174,3 +1174,168 @@ def test_cli_resume_from_inexistente_error_exit_2(tmp_path, capsys):
     rc = main(["--config", cfg, "--resume-from", "99999"])
 
     assert rc == 2  # ValueError mapeado a exit code 2 (patrón del script)
+
+
+# =============================================================================
+# ema-weights task 3 — sidecar extendido (crudos + sombra) y carga del punto
+# =============================================================================
+#
+# Con EMA activo el checkpoint de pesos publica la SOMBRA (R2.1/R2.2), así que los pesos con los
+# que hay que **continuar entrenando** —los crudos del momento— tienen que viajar en el sidecar y
+# ``load_resume`` tiene que preferirlos (R3.1/R3.2). Las claves nuevas son **opcionales**: los
+# campos requeridos del sidecar no cambian, así que un sidecar anterior a esta spec (corrida sin
+# EMA, cuyo checkpoint ya es crudo) se sigue cargando exactamente como hoy (R3.3).
+
+#: Claves del sidecar de una corrida CON EMA: las de siempre más las dos nuevas.
+_SIDECAR_KEYS_EMA = SIDECAR_KEYS | {"raw_model_state", "ema_state"}
+
+
+def _crudos_y_sombra(net):
+    """Dos fotos distinguibles del ``state_dict`` de ``net``: los "crudos" y una "sombra".
+
+    La sombra se desplaza (``+1``) para que ninguna comparación tensor a tensor pueda pasar por
+    casualidad (un ``mul`` dejaría iguales los tensores nulos, p. ej. los bias recién inicializados).
+    """
+    crudos = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    sombra = {k: v.detach().clone().add_(1.0) for k, v in net.state_dict().items()}
+    return crudos, sombra
+
+
+# ------------------------------------------------- el sidecar lleva crudos + sombra (3.1)
+
+
+def test_sidecar_con_ema_persiste_crudos_y_sombra(tmp_path):
+    """Con EMA el sidecar incluye además los pesos crudos del momento y la sombra (3.1).
+
+    Round-trip por disco: las dos claves nuevas vuelven tensor a tensor (``torch.equal``) sin
+    alterar los campos requeridos (el ``step`` y el azar siguen ahí, el ``history`` sigue afuera).
+    """
+    net, opt = _net_with_optimizer_state()
+    crudos, sombra = _crudos_y_sombra(net)
+    resume = _resume_state(opt, start_step=5)
+    resume.raw_model_state = crudos
+    resume.ema_state = sombra
+
+    path = tmp_path / "vp_gaussian_step00005.resume.pt"
+    save_resume_state(path, resume)
+    loaded = load_resume_state(path)
+
+    assert set(loaded) == _SIDECAR_KEYS_EMA
+    assert loaded["step"] == 5
+    assert "history" not in loaded  # el contrato del sidecar no cambia (1.3)
+    for key in crudos:
+        assert torch.equal(loaded["raw_model_state"][key], crudos[key]), key
+        assert torch.equal(loaded["ema_state"][key], sombra[key]), key
+
+
+def test_sidecar_sin_ema_no_agrega_claves(tmp_path):
+    """Sin EMA el sidecar es **el de hoy**: ni ``raw_model_state`` ni ``ema_state`` (3.3).
+
+    Las claves nuevas se persisten **solo si están**, así que el contenido del sidecar de una
+    corrida sin EMA queda idéntico al de antes de esta feature — es lo que hace que la
+    retrocompatibilidad sea por construcción y no por tolerancia del lector.
+    """
+    _, opt = _net_with_optimizer_state()
+    resume = _resume_state(opt, start_step=2)
+    assert resume.raw_model_state is None  # default del dataclass: sin EMA
+    assert resume.ema_state is None
+
+    path = tmp_path / "sin_ema.resume.pt"
+    save_resume_state(path, resume)
+    loaded = load_resume_state(path)
+
+    assert set(loaded) == SIDECAR_KEYS
+
+
+# --------------------------------- load_resume prefiere los crudos del sidecar (3.1, 3.2)
+
+
+def _checkpoint_ema_con_sidecar(tmp_path, *, start_step=4, decay=0.6):
+    """Punto de reanudación de una corrida **con EMA**, como lo deja el CLI.
+
+    El checkpoint de pesos publica la **sombra** (política de :func:`save_checkpoint`) y el sidecar
+    hermano lleva los **crudos** del momento más la sombra.
+
+    Returns:
+        ``(weights, crudos, sombra, history)``.
+    """
+    net, opt = _net_with_optimizer_state()
+    crudos, sombra = _crudos_y_sombra(net)
+    history = [1.0, 0.5, 0.25, 0.2]
+    result = TrainResult(
+        net=net,
+        history=list(history),
+        config=TrainConfig(ema_decay=decay),
+        sde_name="vp",
+        data_dim=2,
+        ema_state=sombra,
+    )
+    weights = tmp_path / f"vp_gaussian_step{start_step:05d}.pt"
+    save_checkpoint(result, weights, model_spec=_MODEL_SPEC)
+
+    resume = _resume_state(opt, start_step=start_step, history=history)
+    resume.raw_model_state = crudos
+    resume.ema_state = sombra
+    save_resume_state(resume_sidecar_path(weights), resume)
+    return weights, crudos, sombra, history
+
+
+def test_load_resume_con_ema_devuelve_los_crudos_del_sidecar(tmp_path):
+    """El checkpoint publica EMA ⇒ ``load_resume`` devuelve los **crudos** del sidecar (3.1, 3.2).
+
+    Es el punto que el enfoque A obliga a extender: devolver el ``state_dict`` del checkpoint de
+    pesos cargaría la **sombra** como punto de partida del entrenamiento (pesos promediados
+    disfrazados de crudos, corriendo el optimizador sobre un estado que nunca existió). El
+    ``meta``/``history`` siguen viniendo del checkpoint de pesos, y el :class:`ResumeState` se arma
+    con la sombra para restaurarla en el loop.
+    """
+    weights, crudos, sombra, history = _checkpoint_ema_con_sidecar(tmp_path, start_step=4)
+    expected = {"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+
+    state_dict, meta, resume = load_resume(weights, expected=expected)
+
+    # Lo publicado en el checkpoint es la sombra; lo que devuelve load_resume son los crudos.
+    publicado, _ = load_checkpoint(weights)
+    for key in crudos:
+        assert torch.equal(publicado[key], sombra[key]), f"el checkpoint no publicó EMA en {key}"
+        assert torch.equal(state_dict[key], crudos[key]), f"no devolvió los crudos en {key}"
+    assert any(not torch.equal(state_dict[k], publicado[k]) for k in crudos)  # crudos ≠ EMA
+
+    # El ResumeState lleva la sombra (la restaura ``train``); los crudos NO se duplican en él —
+    # ya se devuelven como ``state_dict`` para que el caller los cargue en la red.
+    assert resume.ema_state is not None
+    for key in sombra:
+        assert torch.equal(resume.ema_state[key], sombra[key]), key
+    assert resume.raw_model_state is None
+
+    # El resto del contrato de load_resume, intacto: paso y azar del sidecar, history del meta.
+    assert resume.start_step == 4
+    assert resume.history == history == meta["history"]
+    assert meta["ema"] == {"decay": pytest.approx(0.6)}
+
+
+def test_load_resume_sidecar_viejo_sin_claves_de_ema_como_hoy(tmp_path):
+    """Sidecar anterior a esta spec (sin claves de EMA) ⇒ carga **exactamente como hoy** (3.3).
+
+    El sidecar de una corrida sin EMA no tiene ``raw_model_state``, y su checkpoint de pesos ya
+    publica los crudos: ``load_resume`` devuelve ese ``state_dict`` como siempre y el
+    :class:`ResumeState` queda sin sombra (lo que después habilita el camino sin EMA del loop).
+    """
+    weights, sidecar, saved = _build_checkpoint_and_sidecar(
+        tmp_path, model_spec=_MODEL_SPEC, start_step=5
+    )
+    assert set(load_resume_state(sidecar)) == SIDECAR_KEYS  # sidecar "viejo": sin claves nuevas
+
+    publicado, _ = load_checkpoint(weights)
+    state_dict, meta, resume = load_resume(
+        weights, expected={"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+    )
+
+    assert state_dict.keys() == publicado.keys()
+    for key in publicado:
+        assert torch.equal(state_dict[key], publicado[key]), key  # los pesos del checkpoint
+    assert resume.ema_state is None
+    assert resume.raw_model_state is None
+    assert "ema" not in meta
+    assert resume.start_step == 5
+    assert torch.equal(resume.generator_state, saved.generator_state)
