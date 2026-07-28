@@ -1967,3 +1967,267 @@ def test_ema_shadow_rechaza_modulo_sin_tensores_rastreables():
     with pytest.raises(ValueError) as exc:
         EmaShadow(_EmaModuloDeStateDictOpaco(), decay=0.9)
     assert "keep_vars" in str(exc.value)
+
+
+# ------------- ema-weights: publicación en checkpoints + hermano de crudos (task 2.2)
+
+from diffusion.training import discover_snapshots  # noqa: E402  (sección append-only, task 2.2)
+
+#: Receta de la red chica de la suite (``_small_net``): lo que el caller pasa como ``model_spec``.
+_RECETA_CHICA = {"name": "mlp", "kwargs": {"data_dim": 2, "hidden_dim": 64, "num_blocks": 2}}
+
+
+def _corrida_publicable(**overrides):
+    """Corrida corta reproducible + su receta, lista para publicar en un checkpoint.
+
+    Reusa los helpers de la sección anterior (``_fresh_ema``/``_generador``: misma red chica,
+    mismos pesos iniciales y mismo azar en cada invocación).
+
+    Returns:
+        ``(result, model_spec, crudos)``: el :class:`TrainResult`, la receta genérica de la red y
+        un clon del ``state_dict`` **crudo** final (para contrastarlo contra lo publicado).
+    """
+    sde, net, data, cfg = _fresh_ema(**overrides)
+    result = train(sde, net, data, cfg, generator=_generador(cfg))
+    crudos = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    return result, {"name": "mlp", "kwargs": dict(_RECETA_CHICA["kwargs"])}, crudos
+
+
+def test_save_checkpoint_con_ema_publica_la_sombra_y_marca_el_decay(tmp_path):
+    """Con EMA activo el checkpoint publica la sombra como su ``state_dict`` (2.1) + marca (2.3).
+
+    Un solo punto de publicación: ``save_checkpoint`` toma ``result.ema_state`` en lugar de los
+    pesos vivos. Se verifica lo tres cosas que pide el criterio: (a) el ``model_state`` es la foto
+    EMA **tensor a tensor** (``torch.equal``) y difiere de los crudos —si publicara los crudos, la
+    corrida con EMA no aportaría nada—; (b) el **formato no cambia** (mismas claves de blob y de
+    meta que hoy, más la marca) y la receta sigue reconstruyendo la red; (c) la meta registra la
+    trazabilidad ``ema.decay``.
+    """
+    decay = 0.6
+    result, model_spec, crudos = _corrida_publicable(num_steps=6, ema_decay=decay)
+
+    path = tmp_path / "vp_pub.pt"
+    save_checkpoint(result, path, model_spec=model_spec)
+
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    assert set(blob) == {"model_state", "meta"}  # formato intacto (2.1)
+
+    state_dict, meta = load_checkpoint(path)
+    assert state_dict.keys() == crudos.keys()
+    for key in result.ema_state:
+        assert torch.equal(state_dict[key], result.ema_state[key]), f"no publicó la sombra en {key}"
+    assert any(not torch.equal(state_dict[k], crudos[k]) for k in crudos)  # ≠ pesos crudos
+
+    # Marca de trazabilidad (2.3): quién publicó y con qué decay.
+    assert meta["ema"] == {"decay": pytest.approx(decay)}
+    # El resto de la meta es la de siempre (2.1: receta incluida, sin campos nuevos de más).
+    assert set(meta) == {"sde_name", "data_dim", "history", "model", "ema"}
+    assert meta["sde_name"] == "vp"
+    assert meta["data_dim"] == 2
+    assert meta["history"] == pytest.approx(result.history)
+    assert meta["model"] == model_spec
+
+    # La receta sigue reconstruyendo la red y los pesos EMA cargan con strict=True.
+    net2 = make_model(meta["model"]["name"], **meta["model"]["kwargs"])
+    net2.load_state_dict(state_dict)
+
+
+def test_save_checkpoint_sin_ema_contenido_identico_al_actual(tmp_path):
+    """Sin EMA el checkpoint es **idéntico al actual** en contenido, sin la marca nueva (2.5).
+
+    Retrocompatibilidad: ``ema_decay=None`` ⇒ ``model_state`` == los pesos vivos ``torch.equal``
+    tensor a tensor y meta con exactamente las claves de antes (la ausencia de ``ema`` es lo que
+    un consumidor lee como "pesos crudos", 2.3).
+    """
+    result, model_spec, crudos = _corrida_publicable(num_steps=6)  # ema_decay=None (default)
+    assert result.ema_state is None
+
+    path = tmp_path / "vp_sin_ema.pt"
+    save_checkpoint(result, path, model_spec=model_spec)
+
+    state_dict, meta = load_checkpoint(path)
+    assert state_dict.keys() == crudos.keys()
+    for key in crudos:
+        assert torch.equal(state_dict[key], crudos[key]), f"peso publicado distinto en {key}"
+    assert "ema" not in meta
+    assert set(meta) == {"sde_name", "data_dim", "history", "model"}
+
+
+def test_checkpoints_intermedios_publican_la_sombra_de_su_momento(tmp_path):
+    """Los checkpoints intermedios periódicos publican también la sombra de su momento (2.2).
+
+    Reproduce el wiring del CLI (``on_checkpoint`` → ``save_checkpoint`` sobre rutas hermanas):
+    como los intermedios pasan por el **mismo** punto de publicación, ganan el EMA sin cambio
+    propio. Dos snapshots sucesivos **difieren** (la foto es un clonado profundo del momento, no
+    una referencia viva que terminaría igual al final de la corrida) y ambos llevan la marca.
+    """
+    decay = 0.6
+    sde, net, data, cfg = _fresh_ema(num_steps=6, checkpoint_every=2, ema_decay=decay)
+    base = tmp_path / "vp_inter.pt"
+    fotos: dict[str, dict] = {}
+
+    def on_checkpoint(tag, snapshot):
+        save_checkpoint(
+            snapshot.result, base.with_stem(f"{base.stem}_{tag}"), model_spec=dict(_RECETA_CHICA)
+        )
+        if tag.startswith("step"):
+            fotos[tag] = {k: v.clone() for k, v in snapshot.result.ema_state.items()}
+
+    train(sde, net, data, cfg, on_checkpoint=on_checkpoint, generator=_generador(cfg))
+
+    assert sorted(fotos) == ["step00002", "step00004"]
+    publicados = {}
+    for tag in ("step00002", "step00004"):
+        state_dict, meta = load_checkpoint(tmp_path / f"vp_inter_{tag}.pt")
+        assert meta["ema"] == {"decay": pytest.approx(decay)}  # marca en los intermedios (2.3)
+        for key in fotos[tag]:
+            assert torch.equal(state_dict[key], fotos[tag][key]), f"{tag}: no publicó su sombra"
+        publicados[tag] = state_dict
+
+    # La sombra avanzó entre snapshots: los dos artefactos no son el mismo estado.
+    assert any(
+        not torch.equal(publicados["step00002"][k], publicados["step00004"][k])
+        for k in publicados["step00002"]
+    )
+
+
+def test_save_checkpoint_hermano_de_crudos_publica_los_pesos_crudos(tmp_path):
+    """``raw_sibling=True`` escribe además ``{stem}_raw.pt`` con los pesos CRUDOS finales (2.7).
+
+    El hermano es un checkpoint **estándar** (mismo formato, receta incluida) para habilitar la
+    comparativa crudo-vs-EMA de la misma corrida: su ``state_dict`` son los crudos
+    (``torch.equal``) y difiere del EMA del principal; su meta **no** lleva la marca ``ema`` (la
+    ausencia = pesos crudos, 2.3) y sí un puntero al checkpoint del que es contraparte. Se verifica
+    que todo el tooling existente lo consume sin cambios (``load_checkpoint`` + ``make_model`` +
+    ``generate_from_checkpoint``) y que el descubrimiento de snapshots **no** lo levanta.
+    """
+    from diffusion.samplers import generate_from_checkpoint
+
+    result, model_spec, crudos = _corrida_publicable(num_steps=6, ema_decay=0.6)
+
+    path = tmp_path / "vp_final.pt"
+    save_checkpoint(result, path, model_spec=model_spec, raw_sibling=True)
+
+    raw_path = tmp_path / "vp_final_raw.pt"
+    assert raw_path.exists()
+
+    raw_state, raw_meta = load_checkpoint(raw_path)
+    ema_state, ema_meta = load_checkpoint(path)
+    for key in crudos:
+        assert torch.equal(raw_state[key], crudos[key]), f"el hermano no lleva los crudos en {key}"
+    assert any(not torch.equal(raw_state[k], ema_state[k]) for k in crudos)  # crudos ≠ EMA
+
+    # Marcado como contraparte cruda y sin la marca de EMA (no se puede confundir con el oficial).
+    assert "ema" not in raw_meta
+    assert raw_meta["raw_of"] == path.name
+    assert ema_meta["ema"] == {"decay": pytest.approx(0.6)}
+    # Formato estándar con receta: el resto de la meta es la del principal.
+    assert set(raw_meta) == {"sde_name", "data_dim", "history", "model", "raw_of"}
+    assert raw_meta["model"] == model_spec
+    assert raw_meta["history"] == pytest.approx(result.history)
+
+    # Reconstruible por la receta y consumible por la generación checkpoint-driven.
+    net2 = make_model(raw_meta["model"]["name"], **raw_meta["model"]["kwargs"])
+    net2.load_state_dict(raw_state)
+    x_raw = generate_from_checkpoint(raw_path, "euler", n_samples=8, n_steps=5, seed=0)
+    x_ema = generate_from_checkpoint(path, "euler", n_samples=8, n_steps=5, seed=0)
+    for x in (x_raw, x_ema):
+        assert x.shape == (8, 2)
+        assert x.dtype == torch.float32
+        assert torch.all(torch.isfinite(x))
+    # Pesos distintos ⇒ muestras distintas con la misma semilla (la comparativa tiene sentido).
+    assert not torch.equal(x_raw, x_ema)
+
+    # El hermano no es un snapshot periódico: el descubrimiento no lo levanta (2.7).
+    assert discover_snapshots(path) == []
+
+
+def test_hermano_de_crudos_no_se_escribe_sin_ema(tmp_path):
+    """Sin EMA activo, ``raw_sibling=True`` **no** escribe el hermano (sería un duplicado).
+
+    El hermano existe para separar crudos de EMA; sin EMA el checkpoint principal YA publica los
+    crudos, así que emitirlo sería escribir dos veces lo mismo. El parámetro queda por eso seguro
+    de activar incondicionalmente en el guardado final del CLI (2.5: sin EMA, nada cambia).
+    """
+    result, model_spec, crudos = _corrida_publicable(num_steps=4)  # sin EMA
+    path = tmp_path / "vp_sin_ema_final.pt"
+    save_checkpoint(result, path, model_spec=model_spec, raw_sibling=True)
+
+    assert not (tmp_path / "vp_sin_ema_final_raw.pt").exists()
+    state_dict, meta = load_checkpoint(path)
+    assert "ema" not in meta and "raw_of" not in meta
+    for key in crudos:
+        assert torch.equal(state_dict[key], crudos[key])
+
+
+def test_discover_snapshots_ignora_el_hermano_de_crudos(tmp_path):
+    """Mecánico: ``{stem}_raw.pt`` no matchea el patrón ``_stepNNNNN`` del descubrimiento (2.7).
+
+    Se tocan los tres artefactos posibles de una corrida (final, hermano de crudos y un snapshot
+    periódico con su sidecar) sin escribir contenido: la política de descubrimiento mira solo
+    nombres. Solo el periódico debe salir en la lista — el hermano nunca puede elegirse como punto
+    de reanudación.
+    """
+    base = tmp_path / "vp_mixture.pt"
+    for nombre in (
+        "vp_mixture.pt",
+        "vp_mixture_raw.pt",
+        "vp_mixture_step00002.pt",
+        "vp_mixture_step00002.resume.pt",
+    ):
+        (tmp_path / nombre).touch()
+
+    assert discover_snapshots(base) == [(2, tmp_path / "vp_mixture_step00002.pt")]
+
+
+def test_publicacion_ema_compone_con_la_parametrizacion_epsilon(tmp_path):
+    """El EMA publicado compone con la parametrización ε de la receta (2.4).
+
+    Corrida corta config-driven con la red **envuelta** (``EpsilonScoreWrapper``): su
+    ``state_dict`` delega al interno, así que la sombra —y por lo tanto el checkpoint publicado—
+    queda en claves de **red pelada**. Consecuencia verificada acá: el checkpoint EMA se
+    reconstruye por ``make_model`` + wrap por receta y ``generate_from_checkpoint`` produce
+    muestras finitas sin ningún cambio en su contrato; el hermano de crudos también.
+    """
+    from diffusion.samplers import generate_from_checkpoint
+
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 4, "seed": 0, "ema_decay": 0.6},
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1,
+                  "score_parametrization": "epsilon"},
+    }
+    spec = build_run(raw)
+    assert isinstance(spec.model, EpsilonScoreWrapper)
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+
+    # Claves de red pelada (el wrapper delega): sin prefijo ``_net.``, como las de make_model.
+    assert result.ema_state is not None
+    assert all(not k.startswith("_net.") for k in result.ema_state)
+    assert set(result.ema_state) == set(make_model("mlp", data_dim=2, hidden_dim=32,
+                                                  num_blocks=1).state_dict())
+
+    path = tmp_path / "ckpt_epsilon_ema.pt"
+    save_checkpoint(result, path, model_spec=spec.model_spec, raw_sibling=True)
+    raw_path = tmp_path / "ckpt_epsilon_ema_raw.pt"
+
+    state_dict, meta = load_checkpoint(path)
+    assert meta["model"]["score_parametrization"] == "epsilon"  # la receta viaja igual que antes
+    assert meta["ema"] == {"decay": pytest.approx(0.6)}
+    for key in result.ema_state:
+        assert torch.equal(state_dict[key], result.ema_state[key])
+
+    # Reconstrucción por la receta: red pelada + wrap con la σ de la SDE (lo que hace generate).
+    sde = make_sde(meta["sde_name"], data_dim=meta["data_dim"])
+    net2 = make_model(meta["model"]["name"], **meta["model"]["kwargs"])
+    net2.load_state_dict(state_dict)
+    wrapper = EpsilonScoreWrapper(net2, lambda x, t: sde.marginal_prob(x, t)[1])
+    wrapper.eval()
+
+    x_ema = generate_from_checkpoint(path, "euler", n_samples=8, n_steps=5, seed=0)
+    x_raw = generate_from_checkpoint(raw_path, "euler", n_samples=8, n_steps=5, seed=0)
+    for x in (x_ema, x_raw):
+        assert x.shape == (8, 2)
+        assert torch.all(torch.isfinite(x))
+    assert not torch.equal(x_ema, x_raw)  # el hermano lleva otros pesos (crudos)

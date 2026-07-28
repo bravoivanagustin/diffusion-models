@@ -14,6 +14,11 @@ Guarda los pesos entrenados (``.pt`` con ``state_dict`` + metadata) y una curva 
 ``train.checkpoint_every > 0`` (o ``--checkpoint-every``) guarda además, junto al checkpoint
 final, un snapshot periódico ``…_stepNNNNN.pt`` cada N pasos y un ``…_best.pt`` con la menor
 pérdida vista.
+
+Con ``train.ema_decay`` configurado los checkpoints publican la **sombra EMA** de los pesos (ver
+:func:`diffusion.training.save_checkpoint`) y el guardado final escribe además el **hermano de
+crudos** ``…_raw.pt`` con los pesos del último paso de Adam, para poder comparar crudo vs EMA
+dentro de la misma corrida.
 """
 
 from __future__ import annotations
@@ -199,8 +204,16 @@ def main(argv=None) -> int:
     )
 
     if spec.checkpoint:
-        save_checkpoint(result, spec.checkpoint, model_spec=spec.model_spec)
+        # raw_sibling=True: guardado FINAL, así que si la corrida tiene EMA activo se escribe
+        # además el hermano de crudos ``…_raw.pt`` (para la comparativa crudo-vs-EMA de la misma
+        # corrida). Sin EMA no escribe nada extra: el principal ya publica los crudos.
+        save_checkpoint(
+            result, spec.checkpoint, model_spec=spec.model_spec, raw_sibling=True
+        )
         print(f"Checkpoint -> {spec.checkpoint}")
+        if result.ema_state is not None:
+            raw_path = spec.checkpoint.with_stem(f"{spec.checkpoint.stem}_raw")
+            print(f"Crudos     -> {raw_path}  (contraparte cruda del checkpoint EMA)")
     if spec.loss_curve:
         save_loss_curve(
             spec.loss_curve, result.history, f"{spec.sde.name} · {type(spec.model).__name__}"

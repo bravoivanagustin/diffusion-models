@@ -353,6 +353,7 @@ def save_checkpoint(
     path: str | pathlib.Path,
     *,
     model_spec: dict | None = None,
+    raw_sibling: bool = False,
 ) -> pathlib.Path:
     """Guarda la red entrenada y su metadata **model-agnóstica** en ``path`` (``.pt`` de torch).
 
@@ -362,15 +363,44 @@ def save_checkpoint(
     generar habrá que pasar una red explícita (ver :func:`load_checkpoint` y
     :func:`diffusion.samplers.generate_from_checkpoint`).
 
+    **Punto único de publicación del EMA**: si ``result.ema_state`` está presente (la corrida
+    configuró ``TrainConfig.ema_decay``), lo que se guarda como ``model_state`` es la **sombra
+    EMA** —no los pesos vivos del último paso de Adam— y la meta gana la marca de trazabilidad
+    ``ema = {"decay": …}``. El formato del blob no cambia (``{model_state, meta}``), así que la
+    generación, el wrapper ε y las mediciones consumen los pesos promediados **sin modificarse**.
+    Todos los checkpoints (el final y los intermedios del callback ``on_checkpoint``) pasan por
+    acá, así que la política vale para los dos. Sin EMA el contenido es **idéntico al actual**
+    (mismos pesos, misma meta, sin la clave ``ema``).
+
+    Convención de lectura de la marca (la que interpretan los consumidores):
+
+    - meta **sin** ``ema`` ⇒ los pesos publicados son **crudos** (retrocompatibilidad: es lo que
+      son todos los checkpoints anteriores a esta feature).
+    - meta **con** ``ema = {"decay": d}`` ⇒ los pesos publicados son la sombra EMA con ese decay.
+    - meta con ``raw_of = "<archivo>.pt"`` (y **sin** ``ema``) ⇒ es el *hermano de crudos* de
+      ``raw_sibling`` (ver abajo): pesos crudos, contraparte del checkpoint EMA que nombra.
+
     Args:
         result: Resultado de :func:`train`.
         path: Ruta de salida (se crean los directorios intermedios).
         model_spec: Receta genérica de la red ``{"name": str, "kwargs": dict}`` para poder
             reconstruirla vía :func:`diffusion.models.make_model`. Si es ``None`` no se guarda
             la clave ``model`` (la red se pasa aparte al generar).
+        raw_sibling: Si es ``True`` **y** la corrida publica EMA, escribe además un checkpoint
+            hermano ``{stem}_raw.pt`` con los **pesos crudos finales** (``result.net``): un
+            checkpoint estándar (mismo formato, misma receta) cuya meta no lleva la marca ``ema``
+            y sí ``raw_of`` apuntando al principal — así queda inequívoco que sus pesos son crudos
+            y de qué corrida son contraparte. Habilita la comparativa crudo-vs-EMA de la **misma**
+            corrida. Lo activan los guardados **finales** (los intermedios no lo necesitan: sus
+            crudos ya viajan en el sidecar de resume). Sin EMA activo no escribe nada: el
+            principal ya publica los crudos y el hermano sería un duplicado exacto. El sufijo
+            ``_raw`` **no** matchea el patrón ``_stepNNNNN`` de
+            :func:`diffusion.training.discover_snapshots`, así que nunca se elige como punto de
+            reanudación.
 
     Returns:
-        La ruta donde se guardó (como :class:`pathlib.Path`).
+        La ruta donde se guardó el checkpoint **principal** (como :class:`pathlib.Path`); la del
+        hermano de crudos, cuando se escribe, es ``out.with_stem(out.stem + "_raw")``.
     """
     out = pathlib.Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -383,8 +413,28 @@ def save_checkpoint(
     }
     if model_spec is not None:
         meta["model"] = model_spec  # receta genérica {name, kwargs}, independiente de la clase
-    blob = {"model_state": result.net.state_dict(), "meta": meta}
+
+    # Publicación: la sombra EMA cuando está (la foto ya viene clonada de EmaShadow.state_dict) o
+    # los pesos vivos como siempre. Con ema_state=None no se agrega NINGUNA clave a la meta: el
+    # contenido queda bit a bit igual al de antes de esta feature.
+    publica_ema = result.ema_state is not None
+    if publica_ema:
+        meta["ema"] = {"decay": result.config.ema_decay}
+    blob = {
+        "model_state": result.ema_state if publica_ema else result.net.state_dict(),
+        "meta": meta,
+    }
     torch.save(blob, out)
+
+    if raw_sibling and publica_ema:
+        # Hermano de crudos: checkpoint estándar con los pesos vivos y la MISMA meta, salvo que la
+        # marca de EMA se reemplaza por el puntero al principal (sin ``ema`` = pesos crudos).
+        raw_meta = {clave: valor for clave, valor in meta.items() if clave != "ema"}
+        raw_meta["raw_of"] = out.name
+        torch.save(
+            {"model_state": result.net.state_dict(), "meta": raw_meta},
+            out.with_stem(f"{out.stem}_raw"),
+        )
     return out
 
 
