@@ -23,8 +23,11 @@ train:                    # hiperparámetros del loop de optimización (-> Train
   seed: 0
   device: cpu
   grad_clip: 1.0
+  ema_decay: 0.999        # sombra EMA de los pesos (Song/DDPM/Karras) con rampa de warmup: el
+                          #   checkpoint publica los pesos promediados en vez de la foto del último
+                          #   paso de Adam. Sin la clave = sin EMA (pesos crudos, como antes).
   # checkpoint_every: 50  # opcional: 0 = solo el checkpoint final (default). N>0 guarda además
-                          #   un snapshot cada N pasos (…_stepNNNNN.pt) y un …_best.pt (menor pérdida).
+                          #   un snapshot cada N pasos (…_stepNNNNN.pt) + su sidecar de reanudación.
 
 model:                  # opcional: la red es la variable de control (fija entre celdas).
    name: mlp             # si falta, se usa {name: mlp} dimensionado desde el dato/SDE.
