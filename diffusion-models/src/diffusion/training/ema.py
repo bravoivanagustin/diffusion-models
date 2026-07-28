@@ -78,7 +78,9 @@ class EmaShadow:
 
     Raises:
         ValueError: Si ``decay`` no es finito o cae fuera de ``(0, 1)`` — fail-fast en
-            construcción, antes de entrenar, con el valor recibido en el mensaje.
+            construcción, antes de entrenar, con el valor recibido en el mensaje. También si no se
+            pudo rastrear **ningún** tensor entrenable del módulo (sombra vacía: promediaría nada
+            en silencio).
     """
 
     def __init__(self, module: torch.nn.Module, decay: float) -> None:
@@ -89,6 +91,17 @@ class EmaShadow:
         # Claves del state_dict cuyo tensor ES un parámetro entrenable del módulo. Se filtra por
         # identidad (no por nombre) para no depender de cómo el módulo arme sus claves.
         self._nombres = [nombre for nombre, t in vivos.items() if id(t) in entrenables]
+        if entrenables and not self._nombres:
+            # El módulo tiene parámetros entrenables pero su ``state_dict`` no los expuso como
+            # tales: el caso típico es un override que no reenvía ``keep_vars`` y devuelve copias
+            # detachadas, así que el filtro por identidad no matchea nada. Sin este guard la
+            # sombra quedaría vacía y el checkpoint publicaría pesos crudos disfrazados de EMA.
+            raise ValueError(
+                f"EmaShadow no pudo rastrear ningún tensor entrenable de {type(module).__name__}: "
+                f"tiene {len(entrenables)} parámetro(s) entrenable(s) pero su state_dict no "
+                "devolvió los tensores vivos. Revisá que el módulo reenvíe keep_vars=True a "
+                "nn.Module.state_dict (la sombra los identifica por identidad)."
+            )
         self._sombra = {nombre: vivos[nombre].detach().clone() for nombre in self._nombres}
 
     def update(self, step: int) -> None:

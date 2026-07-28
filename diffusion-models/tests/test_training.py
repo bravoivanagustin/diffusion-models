@@ -1649,3 +1649,321 @@ def test_ema_shadow_load_state_rechaza_foto_incompleta():
     with pytest.raises(ValueError) as exc:
         shadow.load_state({"denom": torch.tensor([2.0, 4.0])})
     assert "w" in str(exc.value)
+
+
+# ------------- ema-weights: orquestación de la sombra en el loop (task 2.1)
+
+
+class _EmaModuloDeStateDictOpaco(torch.nn.Module):
+    """Módulo cuyo ``state_dict`` **no reenvía** ``keep_vars`` al de ``nn.Module``.
+
+    Caso patológico realista (un wrapper que reescribe ``state_dict`` a mano): los tensores que
+    ve la sombra son copias detachadas, así que la identificación por identidad no encuentra
+    ningún parámetro entrenable y la sombra quedaría **vacía** — promediando nada en silencio.
+    Sirve para verificar el guard fail-fast de :class:`EmaShadow`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(3))
+
+    def state_dict(self, *args, **kwargs):  # noqa: D102
+        kwargs.pop("keep_vars", None)  # el bug que el guard tiene que detectar
+        return super().state_dict(*args, **kwargs)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:  # noqa: ARG002
+        return self.w.sum() * x
+
+
+class _DataProhibidaEma:
+    """Fuente centinela: cualquier consumo de datos es un fallo del orden fail-fast del loop."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise AssertionError("el loop consumió data antes de validar ema_decay")
+
+
+def _fresh_ema(**overrides):
+    """Corrida chica reproducible: mismos pesos iniciales y misma fuente en cada invocación."""
+    torch.manual_seed(321)  # pesos iniciales idénticos entre corridas comparadas
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    dist = make_distribution("gaussian", 2, seed=0)
+    data = _data(dist, n=128, batch_size=32, shuffle=False)
+    base = dict(num_steps=4, seed=0)
+    base.update(overrides)
+    return sde, net, data, TrainConfig(**base)
+
+
+def _generador(cfg: TrainConfig) -> torch.Generator:
+    """El ``generator`` del loop, explícito, para poder comparar el azar consumido."""
+    g = torch.Generator(device=torch.device(cfg.device))
+    g.manual_seed(cfg.seed)
+    return g
+
+
+def _replica_loop_crudo(sde, net, data, cfg, generator):
+    """Réplica manual del loop **sin sombra**, bit a bit equivalente al camino default.
+
+    Mismo orden de operaciones y mismo consumo del RNG que :func:`train` con
+    ``time_sampling="uniform"`` (el invariante que ya sostiene el test del default de
+    ``time_sampling``). El caller siembra el azar global antes de llamar.
+
+    Returns:
+        ``(history, thetas)``: la pérdida por paso y, en ``thetas[s-1]``, el clon del
+        ``state_dict`` tras el paso completado ``s`` (1-indexado) — la trayectoria cruda de Adam
+        que la sombra tiene que promediar.
+    """
+    device = torch.device(cfg.device)
+    net = net.to(device)
+    net.train()
+    data_iter = iter(data)
+    optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr)
+    history: list[float] = []
+    thetas: list[dict] = []
+    for _ in range(cfg.num_steps):
+        x0 = next(data_iter).to(device)
+        t = sample_timesteps(x0.shape[0], sde.T, cfg.t_eps, generator=generator, device=device)
+        loss = dsm_loss(net, sde, x0, t, generator=generator)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        history.append(loss.item())
+        thetas.append({k: v.detach().clone() for k, v in net.state_dict().items()})
+    return history, thetas
+
+
+def test_trainconfig_ema_decay_default_sin_ema():
+    """``TrainConfig()`` sin el campo nuevo declara ``ema_decay=None`` — sin EMA (1.1).
+
+    El default retrocompatible: quien no configura nada entrena exactamente como hasta hoy.
+    """
+    cfg = TrainConfig()
+    assert cfg.ema_decay is None
+    # El campo es configurable como cualquier otro del dataclass.
+    assert TrainConfig(ema_decay=0.999).ema_decay == pytest.approx(0.999)
+
+
+def test_train_default_sin_ema_bit_identico_al_loop_previo():
+    """Con el default (``ema_decay=None``) ``train()`` es BIT-IDÉNTICO al loop previo (1.2).
+
+    Mismo patrón de prueba que el default de ``time_sampling``: una réplica manual del loop (sin
+    sombra, mismo orden de operaciones) contra ``train()`` con la config default. Se comparan las
+    tres cosas que el criterio 1.2 nombra —historia (igualdad EXACTA de floats), pesos finales
+    (``torch.equal``) y el azar consumido (RNG global de torch + estado del ``generator``)—: si la
+    rama nueva tocara el stream o el orden, alguna fallaría. Además ``ema_state`` queda en
+    ``None``: sin configurar nada, el resultado no gana contenido.
+    """
+    sde, net_a, data, cfg = _fresh_ema()
+    g_a = _generador(cfg)
+    res_a = train(sde, net_a, data, cfg, generator=g_a)
+    rng_a = torch.get_rng_state()
+
+    sde, net_b, data, cfg = _fresh_ema()
+    g_b = _generador(cfg)
+    torch.manual_seed(cfg.seed)  # lo que hace train() al arrancar desde cero
+    hist_b, _ = _replica_loop_crudo(sde, net_b, data, cfg, g_b)
+    rng_b = torch.get_rng_state()
+
+    assert res_a.history == hist_b  # igualdad exacta de floats por paso, no aproximada
+    assert res_a.ema_state is None
+    sd_a, sd_b = net_a.state_dict(), net_b.state_dict()
+    assert sd_a.keys() == sd_b.keys()
+    for key in sd_a:
+        assert torch.equal(sd_a[key], sd_b[key]), f"peso final distinto en {key}"
+    assert torch.equal(rng_a, rng_b)  # misma secuencia del RNG global
+    assert torch.equal(g_a.get_state(), g_b.get_state())  # mismo stream del generator
+
+
+def test_train_con_ema_promedia_la_trayectoria_cruda_de_adam():
+    """Con EMA activo, ``result.ema_state`` == réplica cerrada sobre la trayectoria cruda (1.3).
+
+    Verifica la **orquestación** (no la aritmética de la pieza, ya cubierta): el loop actualiza
+    la sombra una vez por paso, después del ``optimizer.step()``, con el contador 1-indexado de
+    pasos completados. La réplica manual del loop registra los ``θ_s`` de cada paso y
+    :func:`_replica_ema` los promedia desde ``θ_0`` con ``d_s = min(d, (1+s)/(10+s))``. Un
+    ``update`` de más/de menos, o un contador corrido, rompe la igualdad. Los buffers no se
+    promedian (se copian del módulo vivo), así que se contrastan aparte.
+    """
+    decay = 0.6  # chico a propósito: la rampa y el techo se distinguen en pocos pasos
+    sde, net_a, data, cfg = _fresh_ema(ema_decay=decay)
+    res_a = train(sde, net_a, data, cfg, generator=_generador(cfg))
+
+    sde, net_b, data, cfg = _fresh_ema(ema_decay=decay)
+    theta0 = {k: v.detach().clone() for k, v in net_b.state_dict().items()}
+    entrenables = set(dict(net_b.named_parameters()))
+    g_b = _generador(cfg)
+    torch.manual_seed(cfg.seed)
+    _, thetas = _replica_loop_crudo(sde, net_b, data, cfg, g_b)
+
+    assert res_a.ema_state is not None
+    assert set(res_a.ema_state) == set(net_a.state_dict())  # foto publicable tal cual
+    for key in entrenables:
+        esperado = _replica_ema(theta0[key], [th[key] for th in thetas], decay)
+        assert torch.allclose(res_a.ema_state[key], esperado, rtol=0, atol=1e-6), key
+    for key in set(theta0) - entrenables:  # buffers: copia del vivo, no promedio
+        assert torch.equal(res_a.ema_state[key], net_a.state_dict()[key]), key
+
+    # Sentinela del contador: un ``update`` de más (o el contador corrido) daría otro valor, así
+    # que la igualdad de arriba no es trivialmente satisfacible.
+    clave = next(iter(entrenables))
+    de_mas = _replica_ema(
+        theta0[clave], [th[clave] for th in thetas] + [thetas[-1][clave]], decay
+    )
+    assert not torch.allclose(res_a.ema_state[clave], de_mas, rtol=0, atol=1e-6)
+
+
+def test_train_con_ema_no_altera_la_trayectoria_de_optimizacion():
+    """Pasividad: EMA on/off con la misma semilla ⇒ historia y pesos CRUDOS idénticos (1.4).
+
+    La sombra es un observador: no escribe en la red, no toca el optimizador y no consume RNG.
+    Dos corridas con la misma semilla —una con EMA y otra sin— deben terminar con la misma
+    historia, los mismos pesos crudos (``torch.equal``) y el ``generator`` en el mismo estado. El
+    cierre del test verifica que el EMA igual hizo algo: la foto difiere de los pesos crudos.
+    """
+
+    def _run(ema_decay):
+        sde, net, data, cfg = _fresh_ema(ema_decay=ema_decay)
+        g = _generador(cfg)
+        res = train(sde, net, data, cfg, generator=g)
+        crudos = {k: v.detach().clone() for k, v in net.state_dict().items()}
+        return res, crudos, g.get_state()
+
+    res_off, crudos_off, g_off = _run(None)
+    res_on, crudos_on, g_on = _run(0.9)
+
+    assert res_on.history == res_off.history  # igualdad exacta, no aproximada
+    assert crudos_on.keys() == crudos_off.keys()
+    for key in crudos_off:
+        assert torch.equal(crudos_on[key], crudos_off[key]), f"peso crudo distinto en {key}"
+    assert torch.equal(g_on, g_off)  # la sombra no consume RNG
+
+    assert res_off.ema_state is None
+    assert res_on.ema_state is not None
+    assert any(not torch.equal(res_on.ema_state[k], crudos_on[k]) for k in crudos_on)
+
+
+@pytest.mark.parametrize("bad", [0.0, 1.0, -0.5, 1.5, float("inf"), float("nan")])
+def test_train_rechaza_ema_decay_invalido_antes_de_consumir_data(bad):
+    """Un ``ema_decay`` inválido revienta con ``ValueError`` ANTES de tocar los datos (1.6).
+
+    El loop construye la sombra una única vez, fail-fast, con el mismo criterio que el time
+    sampler: la fuente centinela convierte cualquier consumo prematuro en un ``AssertionError``
+    distinto del ``ValueError`` esperado, y el mensaje debe nombrar el valor recibido.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    cfg = TrainConfig(num_steps=2, seed=0, ema_decay=bad)
+    with pytest.raises(ValueError) as exc:
+        train(sde, net, _DataProhibidaEma(), cfg)
+    assert str(bad) in str(exc.value)
+
+
+def test_train_con_ema_snapshots_llevan_fotos_clonadas_e_independientes():
+    """La foto clonada viaja en el resultado y en cada snapshot intermedio (observable de 2.1).
+
+    ``_snapshot`` fotografía vía ``_result``, así que los checkpoints intermedios llevan la
+    sombra **de su momento**: dos snapshots sucesivos difieren y son objetos independientes
+    (mutar uno no toca al otro ni al resultado final). Es lo que hace segura la publicación.
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=6, checkpoint_every=2, ema_decay=0.9)
+    fotos: list[tuple[str, dict]] = []
+
+    def _cb(tag, snapshot):
+        if tag.startswith("step"):
+            fotos.append((tag, snapshot.result.ema_state))
+
+    res = train(sde, net, data, cfg, on_checkpoint=_cb, generator=_generador(cfg))
+
+    assert [tag for tag, _ in fotos] == ["step00002", "step00004"]
+    (_, f2), (_, f4) = fotos
+    assert all(estado is not None for _, estado in fotos)
+    # La sombra avanzó entre snapshots y sigue avanzando hasta el final de la corrida.
+    assert any(not torch.equal(f2[k], f4[k]) for k in f2)
+    assert any(not torch.equal(f4[k], res.ema_state[k]) for k in f4)
+
+    # Independencia: mutar la foto del paso 2 no altera la del 4 ni la final (clones profundos).
+    congelada_f4 = {k: v.clone() for k, v in f4.items()}
+    congelada_fin = {k: v.clone() for k, v in res.ema_state.items()}
+    for v in f2.values():
+        v.add_(100.0)
+    assert all(torch.equal(f4[k], congelada_f4[k]) for k in f4)
+    assert all(torch.equal(res.ema_state[k], congelada_fin[k]) for k in res.ema_state)
+
+
+def test_build_run_acepta_ema_decay_y_sigue_estricto():
+    """El bloque ``train:`` acepta ``ema_decay`` y la validación estricta sigue viva (4.1).
+
+    ``TrainConfig`` se valida por **introspección de sus fields**, así que el campo nuevo queda
+    disponible desde la config sin tocar ``build_run``; una corrida config-driven corta entrena
+    con él (observable de la tarea) y una clave inválida se sigue rechazando nombrándola. Se
+    ejercita con un ``dict`` —el mismo que produce ``load_config``— para no depender de PyYAML
+    (el camino de archivo va en el test hermano).
+    """
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 2, "seed": 0, "ema_decay": 0.999},
+    }
+    spec = build_run(raw)
+    assert spec.config.ema_decay == pytest.approx(0.999)
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    assert len(result.history) == 2
+    assert all(math.isfinite(v) for v in result.history)
+    assert result.ema_state is not None
+    assert set(result.ema_state) == set(spec.model.state_dict())
+
+    bad = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1, "ema_decay_typo": 0.999},
+    }
+    with pytest.raises(ValueError, match="ema_decay_typo"):
+        build_run(bad)
+
+
+def test_build_run_desde_yaml_con_ema_decay(tmp_path):
+    """El mismo camino pero desde un archivo YAML real: ``train.ema_decay`` llega al loop (4.1).
+
+    Complementa al test hermano cubriendo el front-end de archivo (``load_config``); se skipea si
+    PyYAML no está instalado, como el resto de los tests del camino YAML de la suite.
+    """
+    pytest.importorskip("yaml")
+    text = (
+        "sde:\n"
+        "  name: vp\n"
+        "data:\n"
+        "  shape: gaussian\n"
+        "  dim: 2\n"
+        "  n_samples: 128\n"
+        "  batch_size: 64\n"
+        "  seed: 0\n"
+        "train:\n"
+        "  num_steps: 2\n"
+        "  seed: 0\n"
+        "  ema_decay: 0.999\n"
+    )
+    path = tmp_path / "run_ema.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    spec = build_run(load_config(path))
+    assert spec.config.ema_decay == pytest.approx(0.999)
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    assert len(result.history) == 2
+    assert result.ema_state is not None
+
+
+def test_ema_shadow_rechaza_modulo_sin_tensores_rastreables():
+    """Un módulo cuyo ``state_dict`` no reenvía ``keep_vars`` se rechaza en construcción.
+
+    Guard fail-fast: sin él la sombra quedaría vacía y **promediaría nada en silencio**,
+    publicando pesos crudos disfrazados de EMA. El mensaje nombra el problema (``keep_vars``) en
+    lugar de dejar pasar una corrida con EMA inerte.
+    """
+    with pytest.raises(ValueError) as exc:
+        EmaShadow(_EmaModuloDeStateDictOpaco(), decay=0.9)
+    assert "keep_vars" in str(exc.value)

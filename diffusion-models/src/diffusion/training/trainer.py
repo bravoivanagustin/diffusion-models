@@ -30,6 +30,7 @@ import torch
 
 from ..models import ScoreModel
 from ..sde import ForwardSDE
+from .ema import EmaShadow
 from .losses import dsm_loss
 from .time_sampling import make_time_sampler
 
@@ -61,6 +62,12 @@ class TrainConfig:
     # "log_uniform" = la recomendada para concentrar señal de entrenamiento en t chico (la
     # pérdida se corrige por likelihood ratio — mismo objetivo en esperanza, menos varianza).
     time_sampling: str = "uniform"
+    # Sombra EMA de los pesos (ver :mod:`diffusion.training.ema`): ``None`` = **sin EMA**, el
+    # default retrocompatible bit a bit (R1.1/R1.2 — cero ramas nuevas activas). Un decay finito en
+    # el intervalo abierto (0, 1) —0.999 es el recomendado del estudio— activa la media móvil
+    # exponencial con rampa de warmup que después publican los checkpoints; es lo que samplean las
+    # implementaciones de referencia (Song, DDPM, EDM) en lugar de la foto del último paso de Adam.
+    ema_decay: float | None = None
 
 
 @dataclass
@@ -74,6 +81,10 @@ class TrainResult:
     # = sde.data_dim (valor crudo): un entero para dato plano 2D o una tupla (forma de evento,
     # imágenes). Lo copia save_checkpoint a la meta y lo consume generate.py para reconstruir la SDE.
     data_dim: int | tuple[int, ...] = 0
+    # Foto CLONADA de la sombra EMA (``EmaShadow.state_dict()``: mismas claves que el state_dict de
+    # la red, con los parámetros promediados) cuando ``config.ema_decay`` está configurado; ``None``
+    # sin EMA. Es lo que publican los checkpoints en lugar de los pesos crudos.
+    ema_state: dict | None = None
 
 
 @dataclass
@@ -171,11 +182,18 @@ def train(
             ``range(start_step, num_steps)``. Si ``start_step >= num_steps`` no corre ningún paso
             y devuelve el resultado ya completo.
 
+    Mantiene además, si ``config.ema_decay`` está configurado, una **sombra EMA** de los pesos
+    (:class:`~diffusion.training.ema.EmaShadow`): se construye antes de consumir datos (fail-fast
+    ante un decay inválido), se actualiza después de cada paso del optimizador y viaja clonada en
+    ``TrainResult.ema_state``. Es un observador pasivo — con la misma semilla, la trayectoria de
+    optimización (pesos crudos e historia) es idéntica a la de una corrida sin EMA.
+
     Returns:
         :class:`TrainResult` con la red entrenada, la historia de pérdida (**serie per-step
         completa**: una entrada por paso, ``len(history) == num_steps`` cuando
         ``start_step < num_steps``; el ``history`` previo intacto en el caso no-op), el ``config``
-        usado, el nombre de la SDE y su ``data_dim``.
+        usado, el nombre de la SDE, su ``data_dim`` y la foto de la sombra EMA en ``ema_state``
+        (``None`` si el EMA no está activo).
     """
     device = torch.device(config.device)
     if resume is None:
@@ -199,6 +217,14 @@ def train(
 
     net = model.to(device)  # idempotente: no falla si el caller ya la movió
     net.train()
+
+    # Sombra EMA (opt-in, R1.1): se construye acá —después de mover la red al device (la sombra
+    # clona sus tensores, tienen que estar ya en el device final) y ANTES de consumir datos—, así un
+    # decay inválido revienta fail-fast con el mismo criterio que el time sampler (R1.6). Con el
+    # default (``None``) no se construye nada: cero ramas nuevas activas, corrida bit a bit idéntica
+    # a la previa (R1.2). La sombra es un observador **pasivo**: lee los pesos después del paso del
+    # optimizador, no escribe en la red y no consume RNG (R1.4).
+    ema = EmaShadow(net, config.ema_decay) if config.ema_decay is not None else None
 
     data_iter = iter(data)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.lr)
@@ -228,13 +254,17 @@ def train(
     best_loss = float("inf")
 
     def _result() -> TrainResult:
-        # Foto del TrainResult actual (pesos vía la red viva + copia del history).
+        # Foto del TrainResult actual (pesos vía la red viva + copia del history + foto de la
+        # sombra si el EMA está activo). ``EmaShadow.state_dict()`` ya devuelve CLONES, así que la
+        # foto no se mueve cuando la sombra sigue avanzando: es lo que hace seguro publicarla en un
+        # checkpoint intermedio sin congelar el loop.
         return TrainResult(
             net=net,
             history=list(history),
             config=config,
             sde_name=sde.name,
             data_dim=sde.data_dim,
+            ema_state=ema.state_dict() if ema is not None else None,
         )
 
     def _snapshot(completed_steps: int) -> TrainSnapshot:
@@ -269,6 +299,14 @@ def train(
             torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
         optimizer.step()
 
+        # La sombra se actualiza DESPUÉS del paso del optimizador, con el contador de pasos
+        # completados que fija la convención de :class:`EmaShadow` (1-indexado): el ``step`` del
+        # rango 0-indexado del loop equivale al paso completado ``step + 1`` (R1.3). Una sola
+        # llamada por paso: la rampa de warmup depende del contador, así que un update de más o de
+        # menos cambiaría la ponderación.
+        if ema is not None:
+            ema.update(step + 1)
+
         history.append(loss.item())  # serie completa: la pérdida de cada paso
         is_last = step == config.num_steps - 1
 
@@ -297,7 +335,13 @@ def train(
             )
 
     return TrainResult(
-        net=net, history=history, config=config, sde_name=sde.name, data_dim=sde.data_dim
+        net=net,
+        history=history,
+        config=config,
+        sde_name=sde.name,
+        data_dim=sde.data_dim,
+        # Foto final de la sombra (clonada), lo que el checkpoint publica cuando el EMA está activo.
+        ema_state=ema.state_dict() if ema is not None else None,
     )
 
 
