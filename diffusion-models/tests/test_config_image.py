@@ -271,3 +271,87 @@ def test_build_run_puntos_data_dim_entero_y_mlp():
 
     assert spec.sde.data_dim == 2
     assert isinstance(spec.model, ScoreMLP)
+
+
+# --------------------------------------------- config de ejemplo (plantilla)
+
+import pathlib  # noqa: E402
+
+from diffusion.training import train  # noqa: E402
+
+# La config de ejemplo vive en diffusion-models/config/ (hermana de tests/).
+_EXAMPLE_CONFIG = pathlib.Path(__file__).resolve().parent.parent / "config" / "vp_cats.yaml"
+
+
+def test_config_ejemplo_imagenes_parsea_y_tiene_estructura():
+    """La config de ejemplo ``vp_cats.yaml`` (kind: images + model: unet) parsea y está bien armada.
+
+    Es un test estructural (lint) de la plantilla: su ``data.root`` puede no existir en CI, así que
+    NO se corre ``build_run`` sobre ella (eso escanearía la carpeta). Se afirma que declara una celda
+    de imágenes con U-Net: ``kind: images``, ``root`` e ``image_size`` presentes, red ``unet`` y SDE
+    nombrada (2.4).
+    """
+    assert _EXAMPLE_CONFIG.exists(), f"falta la config de ejemplo: {_EXAMPLE_CONFIG}"
+    cfg = load_config(str(_EXAMPLE_CONFIG))
+
+    # bloque data: fuente de imágenes con los campos obligatorios del contrato `kind: images`.
+    assert cfg["data"]["kind"] == "images"
+    assert cfg["data"]["root"]                 # ruta presente (obligatoria para imágenes)
+    assert cfg["data"]["image_size"]           # tamaño presente (deriva la forma de evento)
+    # bloque model: la red default-eable a unet queda declarada explícitamente en la plantilla.
+    assert cfg["model"]["name"] == "unet"
+    # bloque sde: nombrada (Eje 1); sin data_dim (se deriva de data:, única fuente de verdad).
+    assert cfg["sde"]["name"]
+    assert "data_dim" not in cfg["sde"]
+
+
+# ----------------------------------------------------------- smoke end-to-end
+
+
+def test_smoke_e2e_imagenes_build_run_y_train(carpeta_imagenes):
+    """Smoke integral: ``build_run`` de imágenes → ``train`` unos pocos pasos con la U-Net (2.4).
+
+    Arma su PROPIA config (no la de ejemplo, cuyo ``root`` puede faltar) apuntando ``data.root`` a
+    una carpeta temporal de imágenes chicas, con una U-Net MÍNIMA compatible con el ``image_size``
+    (canales chicos, sin down-sampling profundo) para correr forward/backward en CPU en segundos.
+    Verifica que la corrida se ensambla como la del toy y que ``train`` completa con una historia de
+    pérdida finita — el loop de entrenamiento no ramifica por tipo de fuente.
+    """
+    image_size = 8
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {
+            "kind": "images",
+            "root": str(carpeta_imagenes),
+            "image_size": image_size,
+            "batch_size": 4,
+            "augment": False,   # determinístico y más rápido para el smoke
+            "crop": True,
+        },
+        # U-Net mínima: 2 niveles (reduction = 2^1 = 2, divide a image_size=8), pocos canales,
+        # 1 res-block por nivel, sin atención en encoder/decoder (el bottleneck la lleva igual),
+        # embed chico. groups=4 divide a los anchos 8 y 16. image_size = data.image_size.
+        "model": {
+            "name": "unet",
+            "image_size": image_size,
+            "base_channels": 8,
+            "channel_mults": [1, 2],
+            "num_res_blocks": 1,
+            "attn_resolutions": [],
+            "embed_dim": 16,
+            "time_embed_dim": 32,
+            "groups": 4,
+        },
+        "train": {"num_steps": 2, "lr": 1e-3, "seed": 0, "device": "cpu"},
+    }
+    spec = build_run(raw)
+
+    # La corrida quedó cableada como imágenes: forma de evento en la SDE y red U-Net.
+    assert spec.sde.data_dim == (3, image_size, image_size)
+    assert isinstance(spec.model, ScoreUNet)
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+
+    # El loop completó los pasos pedidos con pérdidas finitas (no ramifica por tipo de fuente).
+    assert len(result.history) == 2
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result.history)
