@@ -207,23 +207,37 @@ def build_run(raw: dict) -> RunSpec:
         :class:`TrainConfig` y las rutas.
 
     Raises:
-        ValueError: Si faltan claves obligatorias (``sde.name``, ``data.shape``), si el bloque
-            ``train:`` trae claves desconocidas para :class:`TrainConfig`, si el ``name`` del
-            bloque ``model:`` no está registrado en ``make_model``, o si
-            ``model.score_parametrization`` trae un valor distinto de ``"epsilon"``.
+        ValueError: Si faltan claves obligatorias (``sde.name``, ``data.shape``), si una corrida
+            de imágenes declara ``data_dim`` en ``sde:`` (la forma se deriva de ``data:``; única
+            fuente de verdad), si el bloque ``train:`` trae claves desconocidas para
+            :class:`TrainConfig`, si el ``name`` del bloque ``model:`` no está registrado en
+            ``make_model``, o si ``model.score_parametrization`` trae un valor distinto de
+            ``"epsilon"``.
     """
     raw = dict(raw or {})
 
-    # --- SDE ---
+    # --- datos: el resolver es el único dueño del parseo de 'data:' (dispatch por kind). Para
+    # puntos devuelve event_shape=None (comportamiento idéntico al de antes); para imágenes la
+    # forma de evento (C, H, W) alimenta la SDE de abajo. Se arma ANTES que la SDE para que la
+    # forma derivada pueda configurarla (única fuente de verdad en 'data:'). ---
+    data, event_shape = build_data_source(raw.get("data") or {})
+
+    # --- SDE: para imágenes se construye con la forma de evento como data_dim (derivada de
+    # 'data:', no declarada en 'sde:'); para puntos, exactamente como antes. ---
     sde_raw = dict(raw.get("sde") or {})
     if "name" not in sde_raw:
         raise ValueError("config: falta 'sde.name' (p. ej. vp / ve / sub_vp).")
-    sde = make_sde(**sde_raw)
-
-    # --- datos: el resolver es el único dueño del parseo de 'data:' (dispatch por kind). Para
-    # puntos devuelve event_shape=None (comportamiento idéntico al de antes); la forma de evento
-    # se consumirá en la Task 2 para cablear la SDE de imágenes. ---
-    data, event_shape = build_data_source(raw.get("data") or {})
+    if event_shape is not None:
+        # Única fuente de verdad: la forma vive en 'data:' y se deriva; declararla también en
+        # 'sde:' abriría la puerta a que se desincronicen, así que se rechaza (R3.3).
+        if "data_dim" in sde_raw:
+            raise ValueError(
+                "config: no declares 'data_dim' en sde: para imágenes; se deriva de data: "
+                f"(forma de evento {event_shape})."
+            )
+        sde = make_sde(**sde_raw, data_dim=event_shape)
+    else:
+        sde = make_sde(**sde_raw)
 
     # --- hiperparámetros del loop -> TrainConfig (validación estricta contra sus campos) ---
     train_raw = dict(raw.get("train") or {})
@@ -236,10 +250,12 @@ def build_run(raw: dict) -> RunSpec:
         )
     config = TrainConfig(**train_raw)
 
-    # --- red: bloque 'model:' opcional (default {name: mlp} dimensionado desde el dato/SDE);
-    # las claves del bloque van a make_model, que filtra por firma (no se validan acá) ---
+    # --- red: bloque 'model:' opcional. El default depende de la fuente: 'unet' para imágenes
+    # (forma de evento presente), 'mlp' para puntos (dimensionado desde el dato/SDE). Las claves
+    # del bloque van a make_model, que filtra por firma (no se validan acá). ---
     model_raw = dict(raw.get("model") or {})
-    model_name = model_raw.pop("name", "mlp")
+    default_model = "unet" if event_shape is not None else "mlp"
+    model_name = model_raw.pop("name", default_model)
     # La clave de parametrización se saca ANTES de make_model: no es un hiperparámetro de la
     # red (no debe llegar al constructor ni a los kwargs de la receta) sino una decisión de
     # cómo se consume su salida. Sin la clave -> pipeline idéntico al actual (red pelada).

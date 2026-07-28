@@ -197,3 +197,77 @@ def test_build_data_source_imagenes_forma_inesperada_es_value_error(
         build_data_source(
             {"kind": "images", "root": str(carpeta_imagenes), "image_size": 16, "batch_size": 4}
         )
+
+
+# ------------------------------------------------- build_run: cableado imágenes
+
+from diffusion.models import ScoreUNet  # noqa: E402
+
+
+def test_build_run_imagenes_cablea_sde_y_unet(carpeta_imagenes):
+    """``build_run`` con ``kind: images`` cablea la SDE con la forma derivada y default-ea U-Net.
+
+    La forma de evento ``(3, H, W)`` sale del bloque ``data:`` (única fuente de verdad) y se pasa
+    a ``make_sde`` como ``data_dim``; sin bloque ``model:`` la red default-ea a ``unet`` (2.2). El
+    ``RunSpec`` conserva la misma estructura que el camino de puntos (2.4): mismos campos poblados.
+    """
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {
+            "kind": "images", "root": str(carpeta_imagenes),
+            "image_size": 16, "batch_size": 4,
+        },
+    }
+    spec = build_run(raw)
+
+    assert isinstance(spec, RunSpec)
+    assert spec.sde.data_dim == (3, 16, 16)  # 3.1: forma derivada → sde.data_dim
+    assert isinstance(spec.model, ScoreUNet)  # 2.2: default unet para imágenes
+    # 2.4: misma estructura de RunSpec que el camino toy (mismos campos poblados por train).
+    assert spec.sde is not None
+    assert spec.model is not None
+    assert spec.data is not None
+    assert spec.config is not None
+    assert spec.model_spec is not None
+    assert spec.model_spec["name"] == "unet"
+
+
+def test_build_run_imagenes_data_dim_en_sde_es_value_error(carpeta_imagenes):
+    """Declarar ``data_dim`` en ``sde:`` para imágenes falla: única fuente de verdad en ``data:`` (3.3)."""
+    raw = {
+        "sde": {"name": "vp", "data_dim": [3, 16, 16]},
+        "data": {
+            "kind": "images", "root": str(carpeta_imagenes),
+            "image_size": 16, "batch_size": 4,
+        },
+    }
+    with pytest.raises(ValueError, match="data_dim"):
+        build_run(raw)
+
+
+def test_build_run_imagenes_model_unet_explicito_respetado(carpeta_imagenes):
+    """Un ``model: {name: unet, ...}`` explícito se respeta (sigue siendo una ``ScoreUNet``)."""
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {
+            "kind": "images", "root": str(carpeta_imagenes),
+            "image_size": 16, "batch_size": 4,
+        },
+        "model": {"name": "unet", "base_channels": 16},
+    }
+    spec = build_run(raw)
+
+    assert isinstance(spec.model, ScoreUNet)
+    assert spec.sde.data_dim == (3, 16, 16)
+
+
+def test_build_run_puntos_data_dim_entero_y_mlp():
+    """Regresión de puntos (2.4): ``sde.data_dim == 2`` y red MLP (sin cambio de comportamiento)."""
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 64, "batch_size": 8},
+    }
+    spec = build_run(raw)
+
+    assert spec.sde.data_dim == 2
+    assert isinstance(spec.model, ScoreMLP)
