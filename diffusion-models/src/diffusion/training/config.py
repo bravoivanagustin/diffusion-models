@@ -48,6 +48,10 @@ from .trainer import TrainConfig
 _DEFAULT_N_SAMPLES = 4000
 _DEFAULT_BATCH_SIZE = 256
 
+# Valores válidos del discriminador ``data.kind`` (fuente de datos). ``points`` es el default
+# retrocompatible; ``images`` se cablea en tareas posteriores de la feature config-image-training.
+_VALID_KINDS = ("points", "images")
+
 
 @dataclass
 class RunSpec:
@@ -92,6 +96,63 @@ def load_config(path: str | pathlib.Path) -> dict:
         return yaml.safe_load(f)
 
 
+def build_data_source(
+    data_raw: dict,
+) -> tuple[Iterator, tuple[int, ...] | None]:
+    """Dispatcha la fuente de datos por ``data_raw['kind']`` ('points' default | 'images').
+
+    Es el **único dueño** del parseo del bloque ``data:``: :func:`build_run` obtiene su fuente
+    a través de este resolver, sin duplicar el parseo. Para puntos arma la distribución de
+    juguete y la envuelve en un iterador infinito de tensores crudos; la forma de evento es
+    ``None`` (dato plano, la dimensión la lleva la SDE).
+
+    Args:
+        data_raw: El bloque ``data:`` del config (se copia; no se muta el ``dict`` del caller).
+            ``kind`` ausente ⇒ ``points``. Para puntos: ``shape``/``name`` (obligatorio),
+            ``dim`` (default 2), ``n_samples``/``batch_size`` (defaults de la corrida previa),
+            ``shuffle`` (default True), + params de la forma (p. ej. ``n_components``).
+
+    Returns:
+        ``(data, event_shape)``: el iterador infinito de tensores crudos y la forma de evento
+        ``(C, H, W)`` para imágenes o ``None`` para puntos.
+
+    Raises:
+        ValueError: Si ``kind`` no está reconocido (lista los válidos); o —camino de puntos— si
+            falta ``data.shape``/``data.name``.
+        NotImplementedError: Para ``kind: images`` (se cablea en la Task 1.2 de la feature).
+    """
+    data_raw = dict(data_raw or {})
+    kind = data_raw.pop("kind", "points")
+
+    if kind == "points":
+        # Camino de puntos (movido verbatim desde build_run): n_samples/batch_size son params de
+        # la fuente (no del TrainConfig); el resto de las claves van a make_distribution, que
+        # filtra por firma.
+        shape = data_raw.pop("shape", None) or data_raw.pop("name", None)
+        if shape is None:
+            raise ValueError(
+                "config: falta 'data.shape' (p. ej. gaussian / mixture / two_moons)."
+            )
+        dim = data_raw.pop("dim", 2)
+        n_samples = data_raw.pop("n_samples", None) or _DEFAULT_N_SAMPLES
+        batch_size = data_raw.pop("batch_size", None) or _DEFAULT_BATCH_SIZE
+        shuffle = data_raw.pop("shuffle", True)
+        distribution = make_distribution(shape, dim, **data_raw)
+        data = infinite_bare(distribution.dataloader(n_samples, batch_size, shuffle=shuffle))
+        return data, None  # dato plano: sin forma de evento (la dimensión la lleva la SDE)
+
+    if kind == "images":
+        # Seam para la Task 1.2: el camino de imágenes (infinite_batches + forma de evento) se
+        # cablea después. Se levanta explícito para no confundirlo con un kind desconocido.
+        raise NotImplementedError(
+            "config: data.kind 'images' todavía no está implementado (Task 1.2)."
+        )
+
+    raise ValueError(
+        f"config: data.kind desconocido: {kind!r}. Válidos: {', '.join(_VALID_KINDS)}."
+    )
+
+
 def build_run(raw: dict) -> RunSpec:
     """Ensambla un :class:`RunSpec` desde un ``dict`` de configuración.
 
@@ -116,17 +177,10 @@ def build_run(raw: dict) -> RunSpec:
         raise ValueError("config: falta 'sde.name' (p. ej. vp / ve / sub_vp).")
     sde = make_sde(**sde_raw)
 
-    # --- datos: n_samples/batch_size son parámetros de la fuente (ya no del TrainConfig) ---
-    data_raw = dict(raw.get("data") or {})
-    shape = data_raw.pop("shape", None) or data_raw.pop("name", None)
-    if shape is None:
-        raise ValueError("config: falta 'data.shape' (p. ej. gaussian / mixture / two_moons).")
-    dim = data_raw.pop("dim", 2)
-    n_samples = data_raw.pop("n_samples", None) or _DEFAULT_N_SAMPLES
-    batch_size = data_raw.pop("batch_size", None) or _DEFAULT_BATCH_SIZE
-    shuffle = data_raw.pop("shuffle", True)
-    distribution = make_distribution(shape, dim, **data_raw)
-    data = infinite_bare(distribution.dataloader(n_samples, batch_size, shuffle=shuffle))
+    # --- datos: el resolver es el único dueño del parseo de 'data:' (dispatch por kind). Para
+    # puntos devuelve event_shape=None (comportamiento idéntico al de antes); la forma de evento
+    # se consumirá en la Task 2 para cablear la SDE de imágenes. ---
+    data, event_shape = build_data_source(raw.get("data") or {})
 
     # --- hiperparámetros del loop -> TrainConfig (validación estricta contra sus campos) ---
     train_raw = dict(raw.get("train") or {})

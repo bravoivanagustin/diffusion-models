@@ -29,7 +29,7 @@ Uso típico (config-driven, una celda del estudio por archivo)::
 
 from __future__ import annotations
 
-from .config import RunSpec, build_run, load_config
+from .config import RunSpec, build_data_source, build_run, load_config
 from .ema import EmaShadow
 from .losses import dsm_loss, sample_timesteps
 from .time_sampling import (
@@ -86,4 +86,5 @@ __all__ = [
     "RunSpec",
     "load_config",
     "build_run",
+    "build_data_source",
 ]
