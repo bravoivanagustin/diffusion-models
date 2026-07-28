@@ -12,7 +12,9 @@ Dentro de lo que respecta al tema general de lo que me gustaría llevar a cabo e
 
 Por ejemplo, tengo ganas de implementar un sampleador de imagenes de gatos, viendo como distintas utilizaciones o implementaciones de los modulos relacionados con Cálculo Estocástico pueden llevar a distintos resultados. 
 
-Para esto mismo me conviene tener en cuenta modulos dentro de la arquitectura que ya esten implementados y no tengan que ver tanto con lo que quiero presentar $\rightarrow$ Para esto es fundamental primero entender bien la arquitectura. Voy a usar toda una arquitectura (U-Net) ya creada. 
+Para esto mismo me conviene tener en cuenta modulos dentro de la arquitectura que ya esten implementados y no tengan que ver tanto con lo que quiero presentar $\rightarrow$ Para esto es fundamental primero entender bien la arquitectura.
+
+> **Nota de estado (2026-07-16).** La red (la variable de control del estudio) se construye **a mano**, no se reusa una de librería: el MLP `ScoreMLP` para la Fase 1 (puntos 2D) y la U-Net convolucional `ScoreUNet` para la Fase 2 (imágenes), ambas en `diffusion.models` (decisión del 05/07/2026). Lo estocástico —el forward SDE, el muestreo de pares de entrenamiento y el sampler reverso— es lo que se varía; la red queda fija. El flujo de datos completo entre módulos está en `dataflow.md`.
 
 ## Referencias
 

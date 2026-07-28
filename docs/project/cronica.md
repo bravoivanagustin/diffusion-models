@@ -248,3 +248,129 @@ Este documento contiene el historial del projecto. Aca se suben creaciones, modi
 **Follow-ups:**
 - No se implementó *resume* (retomar el entrenamiento desde un snapshot): el checkpoint guarda solo el `state_dict` de la red, no el estado del optimizador ni el paso. Si se quiere, es una extensión aparte.
 - El best usa la pérdida DSM (ruidosa), así que es orientativo; para comparar estados suele servir más un snapshot periódico.
+
+**Categoría:** Desarrollo
+
+**Resumen:** `training-resume`: el entrenamiento se vuelve reanudable — cada snapshot periódico gana un sidecar (`…_resume.pt` con optimizer + paso + RNG), `train()` continúa corridas interrumpidas con fidelidad exacta (entera ≡ interrumpida+resumida) y el CLI decide solo entre skip/resume/fresh. Además: primer entrenamiento largo de la celda VP×mixture (19200 pasos → `models/phase_1/`), notebook `05_reconstruct_from_checkpoint.ipynb` y reorganización de dependencias (grupo `analysis`). Suite 327 → **394 passed**. Kiro spec-driven.
+
+**Contexto:** Resuelve el follow-up de la entrada anterior: el checkpointing intermedio dejaba snapshots con solo el `state_dict` — sin estado del optimizador, ni paso, ni RNG —, así que una corrida larga interrumpida (el caso real: la `ScoreUNet` de Fase 2 en CPU/GPU) perdía todo el cómputo previo. En discovery (09/07) se eligió el **sidecar por checkpoint** en vez de embeber el estado en el `.pt`: el estado de Adam pesa ~2× los parámetros e inflaría cada snapshot ~2-3×; el sidecar mantiene el `.pt` de pesos liviano (los samplers lo ignoran) y permite reanudar desde cualquier snapshot.
+
+**Acciones realizadas:**
+- Persistencia: `save_resume_state`/`load_resume_state` en `training` — sidecar `…_resume.pt` con `{optimizer_state, step, torch_rng_state, generator_state}`; el `history` no se duplica (ya vive en el meta del `.pt` de pesos).
+- Loop reanudable: `train()` acepta un payload de resume — carga el estado de Adam, restaura el RNG (global de torch + `generator`), itera `range(start_step, num_steps)` (`num_steps` es el **total** a alcanzar, no pasos extra) y continúa el `history`. El contrato `TrainSnapshot` transporta el payload en `on_checkpoint` para que el caller escriba el sidecar junto al `.pt`.
+- **Gate de fidelidad:** test que exige que interrumpir-y-reanudar dé el mismo modelo y el mismo `history` que la corrida entera — el gate de correctitud de toda la spec.
+- Resolver (`training/resume.py`): descubrimiento del snapshot más nuevo (parseo de `…_stepNNNNN.pt`), decisión skip/resume/fresh, y carga + validación del punto de reanudación (compatibilidad contra la config; falla claro, no migra entre configs distintas).
+- Orquestación del CLI (`scripts/train.py`): si el checkpoint final ya existe → saltea (corrida completa; `--force` reentrena); si no → auto-resume desde el último snapshot con sidecar; sin snapshots → arranca de cero (con aviso). `--resume-from PATH|STEP` elige el punto.
+- Primer entrenamiento largo de Fase 1: `config/vp_mixture.yaml` pasa de la corrida-humo (240 pasos) a una real (**19200 pasos**, `t_eps` 1e-4), con salidas versionadas bajo `models/phase_1/`.
+- Notebook `05_reconstruct_from_checkpoint.ipynb`: como el `02` pero **sin entrenar acá** — carga el checkpoint model-agnóstico entrenado afuera (`load_checkpoint` → `make_model` → `make_sde`), integra el reverso (Euler–Maruyama) desde `N(0,I)` y reconstruye la mezcla; la curva de pérdida sale de `meta["history"]`.
+- `pyproject.toml`: `matplotlib`/`pytest` salen de las dependencias duras al nuevo grupo `analysis` (junto a `jupyter`/`ipykernel`) — el runtime del paquete queda mínimo; lock de `uv` regenerado.
+- Suite completa: **394 passed, 0 skipped** (los 2 skips preexistentes ya corren en el entorno nuevo); `tests/test_resume.py` nuevo. **Proceso Kiro** (discovery → requirements → design → tasks aprobadas → impl por tareas, un commit por tarea); artefactos en `.kiro/specs/training-resume/` — ojo: `.kiro/` quedó gitignored, la spec vive solo local.
+
+**Follow-ups:**
+- **EMA de pesos** quedó fuera de alcance (anotado en el roadmap como paso posterior); también quedaron afuera el resume distribuido/multi-GPU y la migración entre configs distintas.
+- El resume solo tiene puntos de reanudación si la corrida usó `checkpoint_every > 0`; sin snapshots ni checkpoint final, el CLI arranca de cero.
+- `docs/project/training.md` (y `to-do.md`) quedaron sin la sección de resume — estaba en el scope de la spec y no se escribió.
+
+### 10/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Últimos retoques para dejar el repo listo para seguir el trabajo en Linux: afinada la config de la celda VP×mixture (dataset 5000, `lr` 0.001, vuelve `grad_clip`, bloque `model:` explícito con `hidden_dim: 512`, fuera `standardize`), re-entrenada la celda y re-ejecutado el notebook `05` contra el checkpoint nuevo.
+
+**Contexto:** La corrida larga de Fase 1 se va a continuar en Linux; antes de migrar se dejó la config afinada y los artefactos regenerados y consistentes con ella.
+
+**Acciones realizadas:**
+- `config/vp_mixture.yaml`: `n_samples` 4000 → 5000, fuera `standardize`, `lr` 0.002 → 0.001, vuelve `grad_clip: 1.0`, y el bloque `model:` queda explícito y versionado (MLP, `embed_dim` 128, `hidden_dim` **512**, 4 bloques, silu).
+- Re-entrenada la celda con esa config: `models/phase_1/vp_mixture_loss.png` regenerada (el checkpoint `.pt` queda local — `*.pt` está gitignored).
+- Re-ejecutado `05_reconstruct_from_checkpoint.ipynb` contra el checkpoint nuevo (outputs embebidos actualizados).
+
+### 24/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Escala temporal del embedding (`time-embedding-scale`): integrado `time_scale=1000` en el embedding de tiempo (spec Kiro completa, 7 commits, suite 430 en verde); los dos gates de aceptación fallaron y el diagnóstico medido redirige el fix a una spec nueva (muestreo de t + parametrización 1/σ).
+
+**Contexto:** Una sesión de auditoría (notebooks `audit_01`–`audit_04`) midió que las redes de score no aprenden nada del score para t ≤ 0.01 (error ≈ baseline nulo incluso sobre el batch memorizado de los 2 gatos) y rastreó la causa al `SinusoidalEmbedding`: frecuencias de Transformer para posiciones enteras 0..10³ con t continuo en [0,1] — el condicionamiento no distingue t chicos. Se armó la spec Kiro `time-embedding-scale` (requirements → design → tasks, con gates de aceptación numéricos sobre los notebooks de auditoría) para el fix de referencia: escalar t antes del embedding (`t*999` de Song / pasos enteros de DDPM).
+
+**Acciones realizadas:**
+- Implementación por tareas con revisor independiente (commits `02f98eb`, `d409ab8`, `20d9784`, `9954136`, `68249ed`, `7777640`): kwarg `scale` en `SinusoidalEmbedding` (default 1.0 retrocompatible bit a bit, validación fail-fast), passthrough `time_scale` en `ScoreMLP`/`TimeMLP`/`ScoreUNet`, tests de factory/paridad entre redes/round-trip de la receta del checkpoint; suite completa 430 en verde sin modificar tests existentes.
+- `time_scale: 1000` declarado en `config/vp_mixture.yaml` y en los `UNET_KWARGS` del notebook 06; la receta del checkpoint lo persiste y `generate_from_checkpoint` reconstruye con él.
+- Reentrenadas las dos celdas (gatos vía notebook 06; 2D vía CLI, 19200 pasos) — checkpoints reemplazados en su ubicación estándar; los previos quedan obsoletos y no deben mezclarse en comparaciones.
+- Gates medidos re-ejecutando `audit_04` y `audit_02` sin editar su lógica: **FAIL ambos**. Gatos: `eps_total = 0.953` en t=1e-3 (exigía ≤ 0.05), con mejoras del 30–60% en t ≥ 0.05 y el condicionamiento ahora sí resolviendo t chico (distancia del vector temporal 0.089 → 1.12). 2D: ratio de normas 0.708 en t=1e-3 (exigía [0.9, 1.1]), **peor** que la red vieja a t chico (0.84 → 0.71), leve mejora a t medio/alto.
+- Diagnóstico con esa evidencia: el embedding ya no es el cuello de botella; a t chico mandan el ruido/señal del estimador de DSM (~30–94×) y la escasez de muestras con t uniforme, y en gatos además la magnitud ~1/σ del score (dato delta: 2 imágenes memorizadas).
+- Decisión del autor (opción A): **no** escalar al fallback GFF que fijaba R4.4 (es otro embedding y la evidencia lo descarta); `time_scale` queda como cambio necesario-pero-no-suficiente; se abre una spec nueva para atacar la causa medida: muestreo no uniforme de t + parametrización 1/σ de la salida (EMA como complemento opcional).
+
+**Follow-ups:**
+- Inicializar la spec nueva (muestreo de t + parametrización 1/σ) y decidir ahí si EMA entra en alcance.
+- `docs/project/models.md` actualizado con el parámetro nuevo (default, valor recomendado, referencia DDPM/Song) — misma sesión.
+- Los notebooks `audit_01`–`audit_04` quedan como evidencia; todavía sin commitear (decisión pendiente del autor).
+
+### 25/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Señal de entrenamiento a t chico (`small-t-training-signal`): integrados el muestreo de t con importance sampling (log-uniforme + corrección por likelihood ratio, objetivo idéntico en esperanza) y la parametrización ε del score (`EpsilonScoreWrapper`, estilo `get_score_fn` de Song); gates formales FAIL pero con mejoras grandes y atribución por eje medida — la decisión del paso siguiente quedó registrada abajo.
+
+**Contexto:** Sucesora de `time-embedding-scale` (24/07): con la resolución del condicionamiento resuelta, el error del score a t chico persistía por dos causas medidas — ruido/señal del estimador DSM con t uniforme, y magnitud ~1/σ de la salida con dato delta. Spec Kiro completa (requirements → design con corridas de atribución e hipótesis pre-escritas → tasks → impl con revisor por tarea); decisiones de alcance del autor: EMA afuera, reweighting sí. Las tareas 1.1–1.2 las implementó el autor directamente y entraron al loop con revisión adversarial (el test de equivalencia MC fue validado por sabotaje: detecta corrección faltante/invertida/factor errado).
+
+**Acciones realizadas:**
+- Eje 1 (commits `6bc942f`, `026e7c3`, `4e95b8f`): `training/time_sampling.py` (registry/factory, uniforme bit a bit idéntica al histórico por seed, log-uniforme con ~50% de masa en [1e-4, 1e-2]), `sample_weights` en `dsm_loss` y `TrainConfig.time_sampling` con uso en el loop (default probado bit a bit contra el loop previo).
+- Eje 2 (commits `20e5509`, `3b5df38`, `2690ef6`): `EpsilonScoreWrapper` (σ como callable opaco, `state_dict` transparente, sin import de sde), activación por `score_parametrization: epsilon` en `build_run` con persistencia en la receta, y reconstrucción simétrica en `generate_from_checkpoint` (seam probado bit a bit; recetas viejas → red pelada).
+- Configs (commit `0983993`) + celdas de carga de `audit_02`/`audit_04` actualizadas (única edición permitida; medición intacta). Suite completa: 464 en verde sin tocar tests preexistentes.
+- **Corridas de atribución 2D** (ratio en t=1e-3 / banda [0.01, 0.075]): base `time_scale` = 0.708 / 0.69–0.89; (i) solo log-uniforme = 0.713 / **0.80–0.94**; (ii) solo ε = **5.02** (amplificación ruido/σ; mejor t grande: err 0.036 en t=1); (iii) ambos = 3.05 / 0.85–1.03. **Gate 2D: FAIL** (pedía [0.9, 1.1] hasta t=1e-3).
+- **Gatos (ambos ejes, 2000 pasos):** eps_total 0.953 → **0.363** en t=1e-3 (2.6×) y 0.648 → **0.082** en t=0.01 (8×, umbral 0.05); cumple desde t ≥ 0.05. **Gate: FAIL por margen chico.** Denoising t=0.5 → MSE 0.028; generación finita.
+- **Diagnóstico (hipótesis (c) refinada):** las causas eran las correctas — cada eje movió exactamente su palanca. El residuo se concentra en t ≤ 1e-2: en gatos es presupuesto de entrenamiento (2000 pasos, batch 2); en 2D es ruido irreducible del estimador que la parametrización ε amplifica (señal ε óptima ~0.04 vs ruido ~1 → el modo de falla pasa de encogimiento a sobre-disparo). Sin fallback prefijado ni umbrales relajados (regla R3.4).
+
+**Follow-ups:**
+- **Decisión del autor (25/07):** subir el presupuesto de la celda de gatos (num_steps 2000 → 10000) y re-medir su gate; el gate 2D en t ≤ 5e-3 se documenta como límite del estimador (impacto en muestras despreciable: σ(5e-3) ≈ 0.02 vs σ₀ = 0.3). Resultado de la re-medición: se registra al pie de esta entrada al completarse.
+- Checkpoints previos (los de `time-embedding-scale`) obsoletos; no mezclar artefactos pre/post cambio.
+- `docs/project/training.md` y `models.md` actualizados con ambos ejes (misma sesión).
+
+> **Resultado de la re-medición (26/07/2026, cierre de la spec).** El autor corrió la celda de gatos con **5000 pasos** (en vez de los 10000 planeados): `eps_total` = **0.252** en t=1e-3 y **0.069** en t=0.01 (umbral 0.05 — el gate formal sigue FAIL en esos dos t), y **0.015–0.003** en t ≥ 0.05 (5–13× mejor que el punto de partida de la spec). La tendencia 2000→5000 muestra rendimientos decrecientes (error ∝ pasos^(-0.2..-0.4) en la franja chica): cruzar en t=0.01 pediría ~20–40k pasos y en t=1e-3 probablemente no se alcance por pasos solos (2 imágenes, batch 2). El impacto del residuo en las muestras es despreciable (sub-corregir 25% de σ(1e-3)≈0.0105 ≈ 0.003 del rango dinámico). **Decisión del autor: registrar esta medición como final y cerrar la spec**; el residuo a t ≤ 1e-2 queda documentado como límite de presupuesto/estimador, no como defecto de los ejes implementados (la atribución confirmó ambas causas).
+
+### 28/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** EMA de los pesos (`ema-weights`): sombra exponencial opt-in en el loop, publicada en los checkpoints, con hermano de crudos para poder comparar; retiro del checkpoint "best"; reanudación que preserva crudos y sombra. Suite 464 → **519 en verde**. Medición informativa (sin gate): en la celda 2D el EMA mejora el error del score **1.5–7× a todo t** contra los crudos de la misma corrida, y queda **igual que la referencia del 26/07 en t=1e-3** — confirma que el residuo a t chico no es lo que el EMA arregla.
+
+**Contexto:** Sucesora de `small-t-training-signal` (25–26/07). El problema: se sampleaba con los pesos crudos del último paso de Adam —una foto arbitraria de una trayectoria ruidosa (batch 2 en gatos, t aleatorio)— cuando las implementaciones de referencia (Song `score_sde_pytorch`, DDPM) samplean siempre con una media móvil exponencial de los pesos. Spec Kiro completa (discovery → requirements → design → validate-design → tasks → impl con implementador + revisor adversarial independiente por tarea, con mutation testing sobre los tests nuevos y worktree restaurado en cada review). Decisiones de alcance del autor (27/07): **enfoque A** (el checkpoint oficial publica EMA, los crudos viajan en el sidecar), **decay 0.999 con rampa de warmup** estilo Karras, **registro informativo sin gate numérico**, **retiro del "best"**, y **hermano de crudos** `X_raw.pt` para la comparativa crudo-vs-EMA de la misma corrida.
+
+**Acciones realizadas:**
+- **La sombra** (commit `326dad3`): `training/ema.py` con `EmaShadow` — `ema = d_s·ema + (1−d_s)·θ` y `d_s = min(d, (1+s)/(10+s))` (s = pasos completados, 1-indexado); `state_dict()` completo (parámetros EMA clonados + buffers del módulo vivo), `load_state()` para reanudar, validación fail-fast del decay. Indexa por las claves del `state_dict()` del módulo y selecciona los entrenables por identidad de tensor: por eso compone con `EpsilonScoreWrapper` sin saber nada de él (la sombra queda en claves de red pelada). Tests con réplica cerrada independiente, con y sin régimen de warmup — el review confirmó por mutación que la tolerancia estricta (`atol=1e-6`) es lo que las hace load-bearing.
+- **El loop** (commit `430f05b`): `TrainConfig.ema_decay` (default `None` = sin EMA, **bit a bit** idéntico: misma secuencia de RNG, mismos pesos, misma historia), sombra construida fail-fast tras mover la red al device y antes de consumir datos, `update(step+1)` tras cada `optimizer.step()`, foto clonada en `TrainResult.ema_state`. Observador pasivo: no escribe en la red ni consume RNG. `build_run` aceptó `ema_decay` **sin tocar `config.py`** (valida el bloque `train:` por introspección de `fields(TrainConfig)`).
+- **Publicación** (commit `7a2d949`): `save_checkpoint` es el punto único — publica la sombra como `model_state` y marca `meta["ema"] = {"decay": d}`, lo que cubre el final y los intermedios periódicos con un solo cambio; el formato `{model_state, meta}` no cambia, así que generación, wrapper ε y celdas de carga de los audits consumen EMA **sin modificarse**. `raw_sibling=True` escribe además `X_raw.pt` con los crudos finales, marcado `meta["raw_of"]` y **sin** clave `ema` (la ausencia de marca ya significa "pesos crudos": ponerle un dict `ema` a un artefacto crudo lo haría leer como EMA a cualquier consumidor que haga `"ema" in meta`). `discover_snapshots` no lo levanta.
+- **Retiro del "best"** (commit `90189b8`): el loop emite solo la cadencia periódica. Motivo: elegir un checkpoint por la **pérdida cruda per-step** es ruidoso (t aleatorio) y correlaciona mal con la calidad de las muestras — que es justo la razón de ser del EMA; el mecanismo nunca se usó para ninguna decisión del estudio. Los `X_best.pt` que quedaron en disco se siguen tolerando (`discover_snapshots` los excluye). Excepción documentada de R6.2: el retiro obligó a tocar **dos** tests existentes (el que exigía el tag, reescrito para verificar su ausencia, y uno cuyo `assert best_ckpt.exists()` era insatisfacible, con la aserción invertida).
+- **Reanudación** (commit `d51062b`): el hueco que abría el enfoque A —con EMA los intermedios publican la sombra, y `load_resume` devolvía ese `state_dict` como si fueran crudos— se cierra con `raw_model_state` y `ema_state` como claves **opcionales** del sidecar (los requeridos no cambian, así que los sidecars viejos cargan igual) y `load_resume` prefiriendo los crudos cuando están. Al reanudar la sombra se **restaura**, no se reconstruye. Guards fail-fast en ambos sentidos (EMA pedido sin sombra en el sidecar; sombra presente sin EMA pedido), antes de consumir datos y antes de restaurar el optimizador. Test de round-trip por el camino real de persistencia: interrumpida ≡ ininterrumpida en crudos, sombra y checkpoint publicado (`torch.equal`).
+- **Celdas** (commit `9124d74`): `config/vp_mixture.yaml` declara `ema_decay: 0.999`; el notebook 06 lo declara en su `TrainConfig`, activa `raw_sibling=True` en el guardado final y su celda de **denoising ahora reconstruye la red desde el checkpoint recién guardado** (`load_checkpoint` + `make_model(receta)` + wrap por `score_parametrization` + `eval`, el mismo camino que la generación) en vez de usar la red viva de pesos crudos — así las dos demos del notebook consumen los pesos EMA publicados.
+- **Reentreno 2D + medición informativa (celda `vp_mixture`, 19200 pasos):** la métrica es la de la celda `check3` de `audit_02` **sin editar su lógica** (se ejecuta su propio source; lo único que cambia para medir los crudos es el nombre del `.pt`).
+
+| t | ratio EMA | ratio crudo | err rel. EMA | err rel. crudo | crudo/EMA |
+|---|---|---|---|---|---|
+| 1e-3 | 3.093 | 3.752 | 2.155 | 3.287 | 1.5× |
+| 0.01 | 0.968 | 1.159 | 0.212 | 0.753 | 3.6× |
+| 0.075 | 0.901 | 0.923 | 0.149 | 0.287 | 1.9× |
+| 1.0 | 0.981 | 0.988 | 0.028 | 0.119 | 4.3× |
+
+- **Lectura de la tabla (dos conclusiones distintas):** (a) **crudo vs EMA de la misma corrida** — el EMA gana a **todo** t, entre 1.5× y 7× en error relativo (mediana ≈ 2.6×), y la banda [0.01, 0.075] queda en 0.90–0.97 contra 0.92–1.16 de los crudos; (b) **EMA vs la referencia del 26/07** (ratio 3.05 en t=1e-3, banda 0.85–1.03) — **sin cambio**: 3.093 y 0.90–0.97. El EMA reduce la varianza del estimador de los *pesos*, no el residuo del score a t chico, que sigue siendo límite de presupuesto/estimador como quedó documentado el 26/07.
+
+**Follow-ups:**
+- **Celda de gatos: reentrenada por el autor el mismo día** (5000 pasos, pérdida 0.2426 → 0.0081, sin picos; 148/149 tensores difieren entre EMA y crudos). Resultados al pie de esta entrada.
+- **Hallazgo nuevo, sin diagnosticar — picos aislados de pérdida.** La corrida 2D tuvo **8 pasos de 19200 con pérdida > 10** (máximo 8.2e6 en el paso 18045; el último pico, en el 18147) y se recuperó sola cada vez: el p95 por ventana de 960 pasos se mantuvo en ≈0.45 y la ventana final promedió 0.329, igual que antes de los picos. **No es divergencia**, pero el print de media móvil del CLI la hace ver así (mostró 157 y 4317 en las últimas dos ventanas). Con `grad_clip=1.0`, λ(t)=σ_t² y el peso de importance sampling —que **sub**-pondera t chico— una pérdida de 8e6 pide que la red haya emitido ~10³ en ese paso: no está explicado. Candidato a auditoría propia; además impide atribuir limpiamente la comparativa de esta corrida entre "el EMA promedia el jitter normal de Adam" y "el EMA atenuó la secuela de los picos".
+- **No-mezcla:** `models/phase_1/vp_mixture.pt` fue reemplazado (ahora publica EMA) y quedó su hermano `vp_mixture_raw.pt`. Los checkpoints previos a esta entrada son **obsoletos**: no mezclar artefactos pre/post EMA en comparaciones ni figuras.
+- `docs/project/training.md` actualizado con el EMA (contrato, convención de lectura de la marca en la meta, hermano de crudos, qué viaja en el sidecar) y con el retiro del "best"; de paso quedaron corregidas las menciones obsoletas a `X_best.pt` en el YAML de la celda y en el docstring de `config.py`, y el "hueco de cobertura" del subsistema de resume, que ya era falso (`tests/test_resume.py` existe, con 54 tests).
+- **Reproducibilidad, límite conocido:** `build_run` construye la red **antes** de que `train()` aplique `config.seed`, así que dos procesos del CLI con el mismo YAML arrancan de pesos iniciales distintos (el azar inicial sale del RNG global ambiente). Candidato a backlog: sembrar antes de construir la red.
+
+> **Resultado de la celda de gatos (28/07/2026, cierre de la spec).** El autor reentrenó `cats-prueba` con EMA (notebook 06 completo, 5000 pasos — el mismo presupuesto de la referencia del 26/07). Métrica: la de las celdas `load`/`eval` de `audit_04` **sin editar su lógica** (se ejecuta su propio source; lo único que cambia para los crudos es el nombre del `.pt`).
+>
+> | t | `eps_total` EMA | `eps_total` crudo | crudo/EMA | referencia 26/07 |
+> |---|---|---|---|---|
+> | 1e-4 | 0.4277 | 0.6739 | 1.58× | — |
+> | **1e-3** | **0.1366** | 0.2517 | 1.84× | 0.252 |
+> | **0.01** | **0.0274** | 0.0686 | 2.50× | 0.069 |
+> | 0.05 | 0.0050 | 0.0145 | 2.88× | 0.015 |
+> | 1.0 | 0.0014 | 0.0029 | 2.09× | 0.003 |
+>
+> **Lo importante son dos cosas.** (1) **El hermano de crudos reproduce la referencia del 26/07 casi exactamente** (0.2517 vs 0.252 en t=1e-3; 0.0686 vs 0.069 en t=0.01): es el control limpio que faltaba — la única diferencia entre las dos corridas es el EMA, y la mejora se le puede atribuir. (2) **El EMA cruzó el umbral que el presupuesto no había podido cruzar**: el gate de `small-t-training-signal` pedía `eps_total` ≤ 0.05 y el 26/07 quedó en 0.069 en t=0.01, con la proyección de que cruzar pediría ~20–40k pasos; con EMA y los **mismos 5000 pasos** el valor es **0.0274**, holgadamente por debajo. En t=1e-3 sigue arriba (0.1366), como se esperaba: ahí el límite es el estimador/presupuesto, no la varianza de los pesos.
+>
+> Contraste con la celda 2D, donde el EMA **no** movió el ratio en t=1e-3 (3.05 → 3.093): las dos celdas fallan a t chico por razones distintas —en gatos es presupuesto (y promediar pesos equivale a comprar pasos efectivos), en 2D es ruido irreducible del estimador que la parametrización ε amplifica— y el EMA solo ayuda en la primera. La atribución del 25/07 queda confirmada por un camino independiente.

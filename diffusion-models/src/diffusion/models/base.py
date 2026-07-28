@@ -1,7 +1,8 @@
 """El contrato de una red de score: ``(x, t) -> score`` con la misma shape que ``x``.
 
 Define el Protocol :class:`ScoreModel`, la firma común a todas las redes del subpaquete
-(:class:`~diffusion.models.ScoreMLP` para datos 2D, la U-Net de imágenes a futuro). Es
+(:class:`~diffusion.models.ScoreMLP` para datos 2D y :class:`~diffusion.models.ScoreUNet`
+para imágenes). Es
 tipado **estructural** (:class:`typing.Protocol`): ninguna red lo importa ni hereda de él —
 lo satisfacen por tener la firma correcta — y sirve para anotar código que recibe "una red
 de score cualquiera", p. ej. ``def train(model: ScoreModel, ...)``.

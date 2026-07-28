@@ -15,7 +15,7 @@ Ubicación: `diffusion-models/src/diffusion/sde/`. Implementa los **procesos for
                      target del score)
 ```
 
-- **Entrada / salida**: `perturb(x0, t)` toma `x0` de shape `(B, data_dim)` y `t` de shape `(B,)` o `(B, 1)`, samplea el kernel de perturbación y devuelve `(x_t, ε)`; `score_target(x0, t, ε)` devuelve el score real del kernel (el target de la red) y un peso. `sde(x, t)` da el `(drift, diffusion)` y `prior_sampling(shape)` muestrea el ruido inicial `p_T` que los samplers integran hacia atrás.
+- **Entrada / salida**: `perturb(x0, t)` toma `x0` de shape `(B, *E)` (con `E` la forma de evento: `(2,)` en 2D, `(C,H,W)` en imágenes) y `t` de shape `(B,)` o `(B, 1)`, samplea el kernel de perturbación y devuelve `(x_t, ε)`; `score_target(x0, t, ε)` devuelve el score real del kernel (el target de la red) y un peso. `sde(x, t)` da el `(drift, diffusion)` y `prior_sampling(shape)` muestrea el ruido inicial `p_T` (shape `(n, *E)`) que los samplers integran hacia atrás.
 - **Rol en la ablación**: la SDE es el Eje 1, **variable independiente**. La red queda fija; variar la SDE cambia `p_t` y el score que se aprende.
 - **Regla de reentrenamiento**: cambiar el **forward SDE (Eje 1)** define un `p_t` distinto → **un entrenamiento por variante**. Cambiar el **sampler (Eje 2)** reusa el mismo score, sin reentrenar. (Ver `ejes.md`.)
 
@@ -34,19 +34,25 @@ src/diffusion/sde/
   variants.py    # VPSDE, VESDE, SubVPSDE (familia escalar-gaussiana)
   __init__.py    # REGISTRY + make_sde + available_sdes
   __main__.py    # smoke (python -m diffusion.sde)
-tests/test_sde.py   # suite de pytest (47 tests)
+tests/test_sde.py   # suite de pytest (69 tests)
 ```
 
 `schedules.py` aísla la matemática pura (la integral de `β` es idéntica en VP y sub-VP) y es la superficie de mayor valor para tests numéricos.
 
 ### La clase base `ForwardSDE`
 
-ABC con un atributo de clase —`name` (clave del registry)— y `data_dim` como **parámetro del constructor**: el módulo **funciona en cualquier dimensión** (2 por defecto para datos 2D). Tres métodos abstractos por variante: `sde(x,t) -> (drift, diffusion)`, `marginal_prob(x0,t) -> (mean, std)` y `prior_sampling(shape)`.
+ABC con:
+
+- **Atributo de clase** `name` (clave del registry).
+- **Constructor** `__init__(data_dim: int | tuple[int, ...] = 2, T: float = 1.0)`. Guarda `self.T`, el **valor crudo** `self.data_dim` (int o tupla, tal cual se pasó — lo consume el checkpoint) y la **forma de evento normalizada** `self.data_shape` (siempre una tupla, vía `_normalize_shape`). Constante de clase `_std_eps = 1e-5` (piso del `std` en `score_target`).
+- **Tres métodos abstractos** por variante: `sde(x,t) -> (drift, diffusion)`, `marginal_prob(x0,t) -> (mean, std)` y `prior_sampling(shape)`.
+
+**Generalización a N-D (event shapes).** El módulo opera sobre `x` de shape `(B, *E)` para **cualquier** forma de evento `E`: `E=(2,)` para el toy 2D, `E=(C,H,W)` para imágenes. `data_dim` acepta un **entero** (dim plana) o una **tupla** (forma de evento). El truco que lo hace posible sin ramificar es el staticmethod **`_expand_t(t, ref)`**, que reescala `t` a `(B, 1, …, 1)` con tantos unos como el **rango** de `x` (rango 2 → `(B,1)`, byte-idéntico al código pre-generalización; rango 4 → `(B,1,1,1)`), de modo que `std`/`weight`/coeficientes broadcastean solos contra `x`. `_normalize_shape` valida la forma: rechaza tupla vacía y dimensiones `< 1` (`ValueError`).
 
 Para la **familia escalar-gaussiana** el kernel es `p_t(x_t|x_0) = N(mean, std² I)` con `std` escalar por muestra, así que `perturb` y `score_target` son **concretos en la base** y se derivan enteramente de `marginal_prob`:
 
-- `perturb`: `x_t = mean + std·ε`, con `ε ~ N(0, I)`.
-- `score_target`: `∇_{x_t} log p_t(x_t|x_0) = -ε/σ_t`, con peso `λ(t) = σ_t²` (pesado tipo verosimilitud, que vuelve la pérdida equivalente a `‖σ_t·s_θ + ε‖²`).
+- `perturb(x0, t, *, generator=None)`: `x_t = mean + std·ε`, con `ε ~ N(0, I)` (mismo device/dtype que `x0`); devuelve `(x_t, ε)`, ambos `(B, *E)`.
+- `score_target(x0, t, ε)`: `∇_{x_t} log p_t(x_t|x_0) = -ε/σ_t`, con peso `λ(t) = σ_t²` (pesado tipo verosimilitud, que vuelve la pérdida equivalente a `‖σ_t·s_θ + ε‖²`). Sutileza: `std` se **clampea** a `_std_eps=1e-5` **antes** de dividir y de elevar al cuadrado, así que en `t→0` el target y el peso usan `max(σ_t, 1e-5)`, no `σ_t` literal. `marginal_prob`, en cambio, devuelve el `std` **crudo** (VP/sub-VP dan exactamente 0 en `t=0`): quien divida por ese `std` fuera de `score_target` debe poner su propio piso — por eso `t_eps` vive upstream (en el muestreo de `t`), no acá.
 
 ### Las tres SDEs (`t ∈ [0, T]`, `T=1`)
 
@@ -68,7 +74,9 @@ Hiperparámetros por constructor (sin números mágicos):
 | `VESDE` | `sigma_min=0.01, sigma_max=5.0, data_dim=2, T=1.0` (`sigma_max` ≈ escala del toy 2D, **no** el 50 de imágenes) |
 | `SubVPSDE` | `beta_min=0.1, beta_max=20.0, data_dim=2, T=1.0` |
 
-`data_dim` es configurable en todas: la familia escalar acepta cualquier dimensión (el `std` escalar broadcastea). Así el módulo escala a la Fase 2 (imágenes) sin tocar el código.
+`data_dim` es configurable en todas y acepta **entero o tupla**: la familia escalar broadcastea el `std` escalar contra cualquier forma de evento (vía `_expand_t` rank-aware). Así el módulo escala a la Fase 2 (imágenes, `data_dim=(3,H,W)`) sin tocar el código y sin regresión en 2D.
+
+> **Footgun cross-módulo — los hiperparámetros de la SDE no viajan en el checkpoint.** `save_checkpoint` guarda solo `sde_name` y `data_dim`, **no** `beta_min/beta_max/sigma_min/sigma_max/T`. Al generar, `generate_from_checkpoint` reconstruye con `make_sde(sde_name, data_dim=...)` → **defaults del constructor**. Si entrenaste con betas o `sigma_max` no-default, el sampleo usa silenciosamente otros valores. Ver `dataflow.md` (footgun #1). Además el `sigma_max=5.0` de VE está afinado al toy 2D estandarizado, no al `50` de imágenes: hay que ajustarlo por dato (y hoy se perdería al samplear).
 
 ### Dónde SÍ vive la estocasticidad (lo central para el TP)
 
@@ -76,11 +84,11 @@ Acá vive una de las tres fuentes de aleatoriedad del pipeline: `perturb` saca u
 
 ### El target del score (DSM) — y la línea con el módulo de entrenamiento
 
-`score_target` *es* "el target del score" que pide el diseño: el score real del kernel hacia el que se empuja `s_θ`. La pérdida de **denoising score matching** —que combina este target con la salida de la red— y todo el **loop de entrenamiento** (optimizer, épocas, muestreo de `t`, scheduling) viven en un módulo `training/` **futuro**, no acá: este módulo se queda en las primitivas matemáticas de la SDE (`sde`, `marginal_prob`, `prior_sampling`, `perturb`, `score_target`).
+`score_target` *es* "el target del score" que pide el diseño: el score real del kernel hacia el que se empuja `s_θ`. La pérdida de **denoising score matching** —que combina este target con la salida de la red— y todo el **loop de entrenamiento** (optimizer, muestreo de `t`, checkpoints, resume) viven en el módulo `diffusion.training` (ya implementado; ver `training.md`), no acá: este módulo se queda en las primitivas matemáticas de la SDE (`sde`, `marginal_prob`, `prior_sampling`, `perturb`, `score_target`).
 
 ### Tests (`tests/test_sde.py`)
 
-47 tests (pytest, con `importorskip("torch")`): registry/factory (round-trip de tipos, nombre desconocido → `ValueError`, filtrado de kwargs por firma); shapes/dtype `float32` de `marginal_prob`/`perturb`/`sde`; `t` aceptado como `(B,)` y `(B,1)`; determinismo de `perturb` con `Generator` seedeado; **límites del kernel** (VP: `t→0` ⇒ `mean≈x0, std≈0`; `t=T` ⇒ `mean→0, std→1`; VE sin drift y `std(T)≈σ_max`; sub-VP `std < VP` con misma media); **chequeo de cálculo** (`dΣ/dt` por diferencias finitas consistente con `2 f_coef Σ + g²`); `score_target` (`-ε/σ_t`, peso `σ_t²`, signo opuesto a `ε`); varianza del prior; **seam `sde × mlp`** (la salida de `ScoreMLP` calza con `score_target`). Además, **dimensión arbitraria**: la familia escalar en dims 1/3/7. Correr:
+69 tests (pytest, con `importorskip("torch")`): registry/factory (round-trip de tipos, nombre desconocido → `ValueError`, filtrado de kwargs por firma); shapes/dtype `float32` de `marginal_prob`/`perturb`/`sde`; `t` aceptado como `(B,)` y `(B,1)`; determinismo de `perturb` con `Generator` seedeado; **límites del kernel** (VP: `t→0` ⇒ `mean≈x0, std≈0`; `t=T` ⇒ `mean→0, std→1`; VE sin drift y `std(T)≈σ_max`; sub-VP `std < VP` con misma media); **chequeo de cálculo** (`dΣ/dt` por diferencias finitas consistente con `2 f_coef Σ + g²`); `score_target` (`-ε/σ_t`, peso `σ_t²`, signo opuesto a `ε`); varianza del prior; **seam `sde × mlp`** (la salida de `ScoreMLP` calza con `score_target`). Y el bloque **N-D (event shapes)**: la familia escalar en dims 1/3/7, `_expand_t` rank-aware (`(B,1)` en 2D vs `(B,1,1,1)` en `(3,8,8)`), invariancia 2D byte-idéntica tras la generalización, `data_shape` normalizada, y validación de formas inválidas (tupla vacía, dims `< 1`). Correr:
 
 ```
 python -m pytest -q                                  # toda la suite
@@ -104,6 +112,6 @@ El módulo trae un smoke (`__main__.py`): corre `perturb` sobre las 3 SDEs e imp
 
 ---
 
-## 3. Siguiente módulo: el loop de entrenamiento y los samplers
+## 3. Aguas abajo: entrenamiento y samplers (ya implementados)
 
-Con la SDE entregando `(x_t, target)`, lo que sigue es el **loop de entrenamiento** (denoising score matching: minimizar `‖σ_t·s_θ(x_t,t) + ε‖²`, un entrenamiento por variante del Eje 1) y después los **`samplers/`** (Euler–Maruyama, PF-ODE, Heun, predictor–corrector), que consumen `sde.sde(x,t)` (drift/diffusion), `sde.prior_sampling` y el `s_θ` ya entrenado para integrar la ecuación reversa (Eje 2). El diseño completo está en `ejes.md`.
+Con la SDE entregando `(x_t, target)`, el **loop de entrenamiento** (`diffusion.training`) minimiza el denoising score matching `‖σ_t·s_θ(x_t,t) + ε‖²` —un entrenamiento por variante del Eje 1— y los **samplers** (`diffusion.samplers`: Euler–Maruyama, PF-ODE, Heun, predictor–corrector) consumen `sde.sde(x,t)` (drift/diffusion), `sde.prior_sampling` y el `s_θ` ya entrenado para integrar la ecuación reversa (Eje 2). Ambos módulos ya están entregados — ver `training.md`, `samplers.md` y el flujo completo en `dataflow.md`. El diseño experimental está en `ejes.md`.

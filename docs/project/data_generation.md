@@ -8,7 +8,7 @@ Ubicación: `diffusion-models/src/diffusion/data_generation/`. Genera datasets d
 
 En un modelo de difusión la red nunca ve "la imagen" directamente: aprende un **score** `s_θ(x,t) ≈ ∇_x log p_t(x)`, donde `p_t` es la distribución de datos después de un tiempo `t` de ruido. Para eso, lo primero que hace falta es **la distribución de datos misma**, `p_data(x)` — los `x_0` que el proceso *forward* va a destruir hacia ruido. **Este módulo es esa fuente de `x_0`.**
 
-Trabajamos con **puntos** (todavía no imágenes) porque son la pista barata de `ejes.md`: permiten correr la matriz de experimentos (4 SDEs × 4 samplers) en CPU, en segundos, antes de escalar a imágenes. Una "forma" (two moons, espiral, …) es una `p_data` 2D conocida y visualizable, lo que hace fácil ver a ojo si el sampler reverso reconstruye bien la distribución.
+Trabajamos con **puntos** (la pista barata de `ejes.md`) porque permiten correr la matriz de experimentos (**3 SDEs × 4 samplers**) en CPU, en segundos, antes de escalar a imágenes. Una "forma" (two moons, espiral, …) es una `p_data` 2D conocida y visualizable, lo que hace fácil ver a ojo si el sampler reverso reconstruye bien la distribución. Este módulo **también** aloja la fuente de datos de imágenes de la Fase 2 (§3).
 
 **Cómo fluye el dato:**
 
@@ -31,9 +31,12 @@ Trabajamos con **puntos** (todavía no imágenes) porque son la pista barata de 
 src/diffusion/data_generation/
   base.py        # PointDistribution (clase base abstracta)
   shapes.py      # las 5 formas concretas
-  __init__.py    # REGISTRY + make_distribution() + available_shapes()
+  iterators.py   # infinite_bare: envuelve un DataLoader de puntos en iterador infinito
+  images.py      # Fase 2: infinite_batches / CatImages / report_small_images (imports diferidos)
+  __init__.py    # REGISTRY + make_distribution() + available_shapes() (+ re-export de infinite_*)
 scripts/data_generation.py     # CLI: genera, guarda .npz y un PNG de preview
-tests/test_data_generation.py  # suite de pytest
+tests/test_data_generation.py  # suite de pytest de las formas de puntos (24 tests)
+tests/test_image_data.py       # suite de la fuente de imágenes (se saltea sin torchvision)
 ```
 
 ### `PointDistribution` — el contrato común (`base.py`)
@@ -67,6 +70,9 @@ Toda forma hereda de `PointDistribution` e implementa un único método, `_sampl
 - `REGISTRY: dict[name -> clase]` con las 5 formas.
 - `available_shapes() -> list[str]` — los nombres válidos (ordenados); el CLI los usa como `choices`.
 - `make_distribution(name, dim, **kwargs) -> PointDistribution` — crea la forma por nombre y **filtra los `kwargs`** según la firma del constructor de cada forma. Así un caller genérico (el CLI) puede pasar siempre el mismo set de flags y cada forma toma solo los que entiende.
+- `infinite_bare(loader) -> Iterator[torch.Tensor]` (en `iterators.py`, re-exportado) — envuelve un `DataLoader` finito de puntos en un iterador **infinito**: lo recorre en bucle y **desempaqueta la 1-tupla** `(x0,)` a un tensor pelado `(≤batch_size, dim)`. Es el contrato de `data` que consume `diffusion.training.train` con `next()`.
+
+> **Footgun — filtrado silencioso de kwargs.** `make_distribution` **descarta sin avisar** los `kwargs` que no matchean la firma: `make_distribution("gaussian", 2, n_components=8)` o `make_distribution("two_moons", 2, scale=3)` corren pero **ignoran** el parámetro. En particular, `gaussian` y `mixture` **no** aceptan `noise` (su `__init__` no lo declara), aunque el CLI ofrezca `--noise`. Es intencional (caller genérico) pero es una fuente real de mala configuración silenciosa.
 
 ### Dónde vive la estocasticidad (lo central para el TP)
 
@@ -85,7 +91,7 @@ python scripts/data_generation.py --shape two_moons --dim 2 --n-samples 2000 \
 
 Flags: `--shape` (req.), `--dim`, `--n-samples`, `--seed`, `--noise`, `--n-components` (mixture), `--standardize`, `--out` (`.npz`), `--preview` (`.png`). Los errores de dim salen limpios (exit 2) y la salida fuerza UTF-8 para no romper acentos en Windows.
 
-- **`.npz`**: clave `X` (`float32`), `meta` (JSON con shape/dim/n/seed/standardize/noise) y `color`/`mean`/`std` cuando aplican. Se usa `.npz` para meter varios arrays + metadata en un solo archivo, sin pickle (seguro y portable). Cargar:
+- **`.npz`**: clave `X` (`float32`), `meta` (JSON con `shape`/`dim`/`n_samples`/`seed`/`standardize`/`noise` — **no** incluye los params específicos de forma como `scale`/`n_components`/`radius`) y `color`/`mean`/`std` cuando aplican. Se usa `.npz` para meter varios arrays + metadata en un solo archivo, sin pickle (seguro y portable). Cargar:
   ```python
   import numpy as np, json
   d = np.load("data/two_moons.npz"); X = d["X"]; meta = json.loads(str(d["meta"]))
@@ -97,7 +103,7 @@ Flags: `--shape` (req.), `--dim`, `--n-samples`, `--seed`, `--noise`, `--n-compo
 
 ### Tests (`tests/test_data_generation.py`)
 
-22 tests (pytest): shape/dtype/finitud por forma, validación de dims (errores esperados), reproducibilidad por seed, registry/factory, estandarización (media≈0 / std≈1), helpers torch (`importorskip`) y un smoke end-to-end del CLI. Correr:
+24 tests (pytest) en `test_data_generation.py`: shape/dtype/finitud por forma, validación de dims (errores esperados), reproducibilidad por seed, registry/factory, estandarización (media≈0 / std≈1), helpers torch (`importorskip`) y un smoke end-to-end del CLI. La fuente de imágenes tiene su propia suite `test_image_data.py` (§3), que se **saltea** si no hay `torchvision`. Correr:
 
 ```
 cd diffusion-models
@@ -174,19 +180,16 @@ small = report_small_images("data/cats-v1", min_size=64)   # rutas a revisar (no
 
 ---
 
-## 4. Siguiente módulo: redes neuronales
+## 4. Cómo se acopla downstream (todo lo de aguas abajo ya existe)
 
-El próximo paso es la **red que aprende el score** `s_θ(x,t) ≈ ∇_x log p_t(x)` (equivalente, según la parametrización, a predecir el ruido `ε` o el `x_0`). Para **datos de puntos la red es un MLP** —chico, con un embedding del tiempo `t`—; la **U-Net** entra recién cuando pasemos a imágenes.
+Cuando se escribió este módulo, los siguientes eran "a definir por el autor". **Hoy ya están todos implementados**: `models` (`ScoreMLP` + `ScoreUNet`), `sde` (VP/VE/sub-VP), `training` (loop de DSM + checkpoints + resume) y `samplers` (los 4 del reverso). Este módulo es el primer eslabón; el flujo completo está en `dataflow.md`.
 
-**Cómo se acopla con este módulo:**
+**Cómo se acopla con este módulo, en orden:**
 
-- `data_generation` entrega los `x_0` (vía `sample` / `sample_torch` / `dataloader`).
-- El **forward SDE** samplea un `t` y ruido `ε` para construir el par de entrenamiento `(x_t, target)`.
-- La red mapea `(x_t, t) -> score/ε`. Es **determinística y fija** (variable de control): toda la estocasticidad queda afuera, en el dato y en el forward/sampler.
+- `data_generation` entrega los `x_0`. En entrenamiento el camino canónico es `infinite_bare(dist.dataloader(n_samples, batch_size, shuffle))` → un **iterador infinito de tensores crudos** `(B, dim)` que `training.train` consume con `next()` (un batch por paso). La fuente de imágenes (`infinite_batches`, §3) cumple el **mismo** contrato pero con `(B, 3, H, W)` en `[-1,1]`.
+- El **forward SDE** (`sde`) samplea un `t` y ruido `ε` para construir el par `(x_t, target)`; la **red** (`models`) mapea `(x_t, t) → score`, determinística y fija (variable de control); el **sampler** (`samplers`) integra la reversa. La estocasticidad vive en el dato, el forward y el sampler, **nunca** en la red.
 
-**Interfaz esperada para que enganche sin fricción:**
+**Notas de acople (verificadas contra el código, no supuestos):**
 
-- Mantener la salida en `float32` y, para entrenar, usar `standardize=True` (escala sana ≈ N(0,1)), guardando `mean_`/`std_` para des-estandarizar las muestras generadas.
-- El `DataLoader` de este módulo alimenta directamente el loop de entrenamiento.
-
-**Próximos archivos** (a definir por el autor, sin implementar todavía): por ejemplo `models/` (el MLP con embedding de `t`), y después `sde/` (VP/VE/sub-VP) + el loop de entrenamiento. El diseño completo está en `ejes.md`.
+- La salida es `float32` en ambas pistas. `standardize=True` es **opcional** (default `False`): el pipeline de DSM no lo exige; puede ser útil para acercar el toy 2D a ≈ N(0,1), y `mean_`/`std_` quedan guardados para des-estandarizar si hiciera falta.
+- **`build_run` (el camino YAML/CLI de `training`) solo cablea la pista toy 2D**: llama `make_distribution` + `infinite_bare`, no `infinite_batches`. La fuente de imágenes se usa hoy **solo desde notebooks** (ver `dataflow.md` → *Estado del pipeline*).

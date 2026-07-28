@@ -34,8 +34,8 @@ src/diffusion/models/
   mlp.py         # ResidualBlock (lineal) + ScoreMLP (+ smoke block __main__)
   base.py        # ScoreModel: el Protocol (x, t) -> score (tipado estructural)
   unet.py        # TimeMLP + ConvResBlock + AttentionBlock + Down/Upsample + ScoreUNet (imágenes, Fase 2) (+ smoke __main__)
-  __init__.py    # re-exporta ScoreModel, SinusoidalEmbedding, ResidualBlock, ScoreMLP, ScoreUNet
-tests/test_models.py   # suite de pytest
+  __init__.py    # re-exporta ScoreModel, SinusoidalEmbedding, ResidualBlock, ScoreMLP, ScoreUNet + REGISTRY/available_models/make_model
+tests/test_models.py   # suite de pytest (49 tests)
 ```
 
 **La regla de admisión de `layers.py`**: solo entra lo que todas las redes usan **sin modificar**. Por eso el embedding de tiempo vive ahí (es literalmente el mismo en MLP y U-Net) pero el bloque residual **no**: el del MLP es lineal (`nn.Linear`) y el de la U-Net es convolucional con inyección de tiempo (`ConvResBlock` en `unet.py`) — comparten la idea (residual con skip), no el código. Cada red mantiene su propio bloque en su archivo.
@@ -44,22 +44,24 @@ Toda la red es **PyTorch puro** (`nn.Module`). A diferencia de `data_generation`
 
 ### Las piezas compartidas (`layers.py`)
 
-**`SinusoidalEmbedding(embed_dim=128)`** — convierte el escalar de tiempo `t` en un vector, con la codificación de Transformers (senos y cosenos a distintas frecuencias):
+**`SinusoidalEmbedding(embed_dim=128, scale=1.0)`** — convierte el escalar de tiempo `t` en un vector, con la codificación de Transformers (senos y cosenos a distintas frecuencias) aplicada sobre el tiempo **escalado** `t·scale`:
 
 ```
-embed(t)_{2i}   = sin(t / 10000^{2i/d})
-embed(t)_{2i+1} = cos(t / 10000^{2i/d})       i = 0 … d/2-1,  d = embed_dim
+embed(t)_{2i}   = sin(t·scale / 10000^{2i/d})
+embed(t)_{2i+1} = cos(t·scale / 10000^{2i/d})       i = 0 … d/2-1,  d = embed_dim
 ```
 
-Los denominadores `10000^{2i/d}` se **precomputan en `__init__`** y se guardan como **buffer** (`register_buffer`) —no son parámetros: no se aprenden, pero acompañan al módulo en `.to(device)`—. `embed_dim` debe ser **par** (cada frecuencia aporta un seno y un coseno); si no, `ValueError`. Funciona para **cualquier `t` flotante no negativo, sin supuestos sobre su escala**: el rango del tiempo depende de la SDE (`[0, 1]`, `[0, T]`, o pasos enteros), así que el embedding no asume ninguno.
+Los denominadores `10000^{2i/d}` se **precomputan en `__init__`** y se guardan como **buffer** (`register_buffer`) —no son parámetros: no se aprenden, pero acompañan al módulo en `.to(device)`—. `embed_dim` debe ser **par** (cada frecuencia aporta un seno y un coseno); si no, `ValueError`. El **`scale`** (agregado 24/07/2026, spec `time-embedding-scale`) multiplica a `t` antes de codificar: con el default `1.0` la salida es **idéntica bit a bit** al comportamiento histórico (la multiplicación por 1.0 es exacta en IEEE-754), y el valor **recomendado para difusión continua en `[0, 1]` es `1000`** — reproduce el rango de posiciones enteras 0..999 de DDPM y el `labels = t * 999` del repo oficial de Song para VP/sub-VP continuo. Validación **fail-fast**: `scale` no finito o `≤ 0` → `ValueError` con el valor recibido. Las redes lo exponen como kwarg `time_scale` (abajo) y la receta del checkpoint lo persiste.
 
 `layers.py` también aloja el registry de activaciones (`_ACTIVATIONS` / `_make_activation`): `silu`, `relu`, `gelu`, `tanh`; nombre desconocido → `ValueError`.
+
+> **Limitación conocida — ceguera a `t` chico (mitigada en parte; 24/07/2026).** Las frecuencias `10000^{2i/d}` son las del Transformer, pensadas para **posiciones enteras** grandes: con `scale=1.0` y tiempos de difusión en `[t_eps, 1]`, los valores chicos (`t ∈ [1e-4, 1e-2]`) producen embeddings **casi idénticos** y la red no distingue niveles de ruido bajos (medido en `audit_04` y `audit_02`). El `scale=1000` (spec `time-embedding-scale`) **resuelve la resolución del condicionamiento** (la distancia del vector temporal entre `t=1e-4` y `1e-2` crece ~12× medida a través del `time_mlp` entrenado), pero los **gates de aceptación fallaron igual**: el error del score a `t ≲ 0.01` casi no mejoró (gatos: `eps_total` 0.975→0.953 en `t=1e-3`; 2D: ratio 0.84→0.71, peor). Diagnóstico medido: a `t` chico el cuello de botella restante es el **ruido/señal del estimador de DSM** (~30–94×) con muestreo uniforme de `t`, más la **magnitud ~1/σ** del score cuando el dato es tipo delta (gatos memorizados). El fix de eso queda para una spec posterior (muestreo no uniforme de `t` + parametrización 1/σ de la salida); detalle y números en `cronica.md` (24/07/2026).
 
 ### El MLP (`mlp.py`)
 
 **`ResidualBlock(hidden_dim, activation="silu")`** — bloque MLP con conexión residual: `Linear → activación → Linear`, y luego se suma la entrada (skip **identidad**, sin proyección aprendida): `salida = bloque(x) + x`. Entrada y salida tienen la misma shape `(B, hidden_dim)`.
 
-**`ScoreMLP(data_dim=2, embed_dim=128, hidden_dim=256, num_blocks=4, activation="silu")`** — la red completa. Embebe `t`, lo **concatena** con `x`, proyecta a `hidden_dim`, pasa por `num_blocks` bloques residuales y proyecta de vuelta a `data_dim`. La proyección final **no** lleva activación: el score es no acotado (puede ser positivo o negativo).
+**`ScoreMLP(data_dim=2, embed_dim=128, hidden_dim=256, num_blocks=4, activation="silu", time_scale=1.0)`** — la red completa. Embebe `t`, lo **concatena** con `x`, proyecta a `hidden_dim`, pasa por `num_blocks` bloques residuales y proyecta de vuelta a `data_dim`. La proyección final **no** lleva activación: el score es no acotado (puede ser positivo o negativo).
 
 ```
    x ∈ R^data_dim   t ∈ R
@@ -85,8 +87,9 @@ Hiperparámetros (todos argumentos del constructor, sin números mágicos en el 
 | `hidden_dim` | `256` | ancho de las capas ocultas en todos los bloques. |
 | `num_blocks` | `4` | cantidad de bloques residuales. |
 | `activation` | `"silu"` | activación; soporta `silu`, `relu`, `gelu`, `tanh` (nombre desconocido → `ValueError`). |
+| `time_scale` | `1.0` | escala temporal del embedding (passthrough puro a `SinusoidalEmbedding(scale=…)`; el default preserva el comportamiento histórico; recomendado `1000` — lo declara el YAML de cada celda y lo persiste la receta del checkpoint). |
 
-Con los defaults la red tiene **~560 k parámetros entrenables**.
+Con los defaults la red tiene **560 386 parámetros entrenables**. A diferencia de la U-Net, `ScoreMLP` **no valida** shapes en el `forward`: un `x` con última dim distinta de `data_dim` no da un error amistoso sino uno de torch adentro de un `nn.Linear`. `data_dim` se castea con `int(...)`, así que pasar una tupla (una forma de evento de imagen) revienta con `TypeError` — por eso la U-Net, no el MLP, es la red de imágenes.
 
 ### La U-Net (`unet.py`)
 
@@ -96,7 +99,7 @@ Para **imágenes** (Fase 2) la `p_data` es de alta dimensión y con estructura e
 
 **Las piezas** (bloques privados de `unet.py`, no re-exportados; reusan `SinusoidalEmbedding` y `_make_activation` de `layers.py`):
 
-- **`TimeMLP(embed_dim, time_embed_dim, activation)`** — la proyección del tiempo: `SinusoidalEmbedding → Linear → activación → Linear`. Produce el vector de condicionamiento `(B, time_embed_dim)` **una sola vez** por forward, y lo comparten todos los bloques (cada uno lo re-proyecta a sus canales). Acepta `t` en `(B,)` o `(B, 1)` (lo normaliza el embedding reusado).
+- **`TimeMLP(embed_dim, time_embed_dim, activation, time_scale=1.0)`** — la proyección del tiempo: `SinusoidalEmbedding → Linear → activación → Linear` (el `time_scale` es passthrough al embedding). Produce el vector de condicionamiento `(B, time_embed_dim)` **una sola vez** por forward, y lo comparten todos los bloques (cada uno lo re-proyecta a sus canales). Acepta `t` en `(B,)` o `(B, 1)` (lo normaliza el embedding reusado).
 - **`ConvResBlock(in_channels, out_channels, time_embed_dim, groups, activation)`** — el bloque residual convolucional con **inyección aditiva del tiempo**: `GroupNorm → act → Conv 3×3`, luego suma la proyección temporal (`Linear(time_embed_dim, out_channels)` expandida a `(B, out_channels, 1, 1)` para broadcastear sobre `H` y `W`), después `GroupNorm → act → Conv 3×3` y se suma el skip (identidad si `in_channels == out_channels`, si no una conv `1×1`). Ese condicionamiento es lo que hace que dos tiempos distintos den salidas distintas. Es el **análogo convolucional** del `ResidualBlock` lineal del MLP: comparten la idea (residual con skip), **no** el código — por la misma regla de admisión de `layers.py`, cada red mantiene su propio bloque.
 - **`AttentionBlock(channels, groups)`** — auto-atención espacial *single-head* con residual: `GroupNorm → proyección QKV (conv 1×1) → scaled_dot_product_attention → proyección de salida (conv 1×1) + skip`. Aplana cada mapa `(B, C, H, W)` a `(B, H·W, C)` para tratar las `H·W` posiciones como tokens; `torch.nn.functional.scaled_dot_product_attention` calcula la atención (escala `1/√C` interna) y es determinística en CPU. **Preserva la shape**.
 - **`Downsample(channels)`** — reducción espacial ×2: conv `3×3` con `stride 2` (aprende el submuestreo). **`Upsample(channels)`** — ampliación ×2: interpolación *nearest* ×2 + conv `3×3` (separar reescalado y conv evita el *checkerboard* de la conv transpuesta). Ambos conservan los canales.
@@ -115,14 +118,31 @@ Para **imágenes** (Fase 2) la `p_data` es de alta dimensión y con estructura e
 | `attn_resolutions` | `(16,)` | resoluciones **absolutas** donde va `AttentionBlock`; el bottleneck la lleva siempre. |
 | `groups` | `8` | grupos de `GroupNorm`; debe dividir a todos los anchos de canal. |
 | `activation` | `"silu"` | activación; soporta `silu`, `relu`, `gelu`, `tanh` (desconocida → `ValueError`). |
+| `time_scale` | `1.0` | escala temporal del embedding (`ScoreUNet → TimeMLP → SinusoidalEmbedding`, passthrough puro; default = comportamiento histórico; recomendado `1000`). |
 
 **El smoke** (`__main__` del propio `unet.py`): instancia `ScoreUNet()` con los defaults, corre un forward sobre un batch dummy `(2, 3, 64, 64)`, imprime la shape de salida y el conteo de parámetros. Correr (con `diffusion-models/src` en `PYTHONPATH`), **solo vía `-m`** como el MLP (usa imports relativos a `layers.py`): `python -m diffusion.models.unet`.
 
 > **Nota — la mitigación de memorización vive fuera de la red.** `ScoreUNet` **no** lleva dropout (rompería el determinismo, ver más abajo). La mitigación de la **memorización** del dataset de Fase 2 —**flip horizontal** de las imágenes y **EMA** (media móvil exponencial) de los pesos— **no** es parte de la red: vive en el **entrenamiento futuro de Fase 2** (data augmentation y post-proceso de los pesos), no dentro de esta clase. Coherente con la regla del TP: toda la estocasticidad y el tuning de entrenamiento viven *alrededor* de la red, nunca dentro.
 
+### La parametrización ε (`parametrization.py`; 25/07/2026, spec `small-t-training-signal`)
+
+**`EpsilonScoreWrapper(net, marginal_std)`** — el equivalente local del `get_score_fn` de Song: la red interna predice ε (acotado) y el score se computa como $s_\theta(x,t) = -\text{net}(x,t)/\max(\sigma_t, 10^{-5})$. La $\sigma_t$ llega como **callable opaco** `(x, t) -> std` — este módulo sigue sin conocer la SDE; el callable lo construyen los *call sites* que ya la poseen (`build_run` en training y `generate_from_checkpoint` en samplers, ambos con `lambda x, t: sde.marginal_prob(x, t)[1]`). Con el pesado $\lambda = \sigma^2$ vigente, la regresión interna queda automáticamente en unidades de ε: la magnitud del score a $t$ chico sale de la matemática y no de la capacidad de la red.
+
+Claves del diseño: `state_dict()`/`load_state_dict()` **delegan al interno** (el checkpoint sigue siendo de red pelada, reconstruible con `make_model` como siempre); la decisión de envolver viaja como clave opcional `score_parametrization: epsilon` en la **receta** `model_spec` del checkpoint (recetas viejas sin la clave → sin wrap, comportamiento previo); el wrapper **no** entra al registry de `make_model` (no es una red: es una parametrización del score) y se usa **solo top-level** (nunca anidado como submódulo de otro módulo — la delegación de `state_dict` es exacta únicamente en ese uso). Sin parámetros propios ni aleatoriedad; expone `.inner` y `.parametrization`.
+
 ### El contrato (`base.py`)
 
-**`ScoreModel`** — un `typing.Protocol` (`runtime_checkable`) que documenta la firma común: callable `(x, t) -> score` con `score.shape == x.shape`. Es tipado **estructural**: ninguna red lo importa ni hereda de él —lo satisfacen por tener la firma correcta— y sirve para anotar código que recibe "una red de score cualquiera" (p. ej. un futuro `train(model: ScoreModel, ...)` agnóstico a la red).
+**`ScoreModel`** — un `typing.Protocol` (`runtime_checkable`) que documenta la firma común: callable `(x, t) -> score` con `score.shape == x.shape`. Es tipado **estructural**: ninguna red lo importa ni hereda de él —lo satisfacen por tener la firma correcta— y sirve para anotar código que recibe "una red de score cualquiera" (p. ej. `train(model: ScoreModel, ...)`, agnóstico a la red).
+
+### El registry / factory (`__init__.py`)
+
+Igual que `data_generation` y `sde`, el paquete expone un registry por nombre —usado por el camino config-driven de `training` y por `generate_from_checkpoint` para reconstruir la red desde la receta del checkpoint:
+
+- `REGISTRY: dict[str, type]` = `{"mlp": ScoreMLP, "unet": ScoreUNet}`.
+- `available_models() -> list[str]` → `["mlp", "unet"]` (ordenados).
+- `make_model(name, **kwargs) -> ScoreModel` — instancia la red por nombre y **filtra los kwargs por la firma** del constructor (nombre desconocido → `ValueError` listando opciones). A diferencia de `make_distribution`, **no** toma un `dim` posicional: la dimensión va como kwarg (`data_dim` para el MLP; `in_channels`/`image_size` para la U-Net).
+
+> **Footgun — kwargs descartados en silencio.** Como ni `ScoreMLP` ni `ScoreUNet` declaran `**kwargs`, `make_model` **descarta sin avisar** cualquier kwarg que no matchee la firma. Un typo (`datadim=2` en vez de `data_dim=2`) se pierde y la red queda con el default (`data_dim=2`) sin error. Es intencional (caller genérico), pero es una superficie real de mala configuración silenciosa. (En el camino config-driven, `build_run` inyecta `data_dim` en la receta del MLP solo cuando `sde.data_dim` es un entero; para imágenes la U-Net trae su propia config — ver `dataflow.md`, seam 0.)
 
 ### Dónde NO vive la estocasticidad (lo central para el TP)
 
@@ -134,7 +154,7 @@ Para **puntos** la `p_data` es 2D y de baja dimensión: un MLP chico con embeddi
 
 ### Tests (`tests/test_models.py`)
 
-43 tests (pytest, con `importorskip("torch")`). Del **embedding y el MLP**: `embed_dim` impar levanta `ValueError`; shapes del embedding y aceptación de `t` como `(B,)` y `(B, 1)` (mismo resultado); intercalado correcto sin/cos y valores acotados en `[-1, 1]`; `denom` es buffer y no parámetro; el `ResidualBlock` preserva shape y rechaza activaciones inválidas; `ScoreMLP` da salida `(B, 2)` y `(B, 4)`, **determinismo** (dos forwards iguales → salida idéntica), ausencia de dropout/batchnorm, conteo de parámetros > 0, y flujo de gradientes finito. De la **`ScoreUNet`** (sobre una config *tiny* para correr rápido en CPU, más un único test con los defaults de referencia): contrato de shape `(B, C, H, W) → (B, C, H, W)` parametrizado en `C ∈ {1, 3}` × `image_size ∈ {32, 64}`; `t` como `(B,)` y `(B, 1)` (mismo resultado) y salidas finitas en varias escalas de `t`; condicionamiento efectivo (dos `t` distintos → salidas distintas) y salida de ambos signos; `isinstance(net, ScoreModel)`; determinismo, ausencia de dropout/batchnorm, independencia del batch (muestra sola vs en batch), gradientes finitos, conteo de parámetros reproducible, y los `ValueError` fail-fast (activación desconocida, `groups` incompatible, `image_size` no divisible, tamaño de `x` distinto de `image_size`). Correr:
+49 tests (pytest, con `importorskip("torch")`). Del **embedding y el MLP**: `embed_dim` impar levanta `ValueError`; shapes del embedding y aceptación de `t` como `(B,)` y `(B, 1)` (mismo resultado); intercalado correcto sin/cos y valores acotados en `[-1, 1]`; `denom` es buffer y no parámetro; el `ResidualBlock` preserva shape y rechaza activaciones inválidas; `ScoreMLP` da salida `(B, 2)` y `(B, 4)`, **determinismo** (dos forwards iguales → salida idéntica), ausencia de dropout/batchnorm, conteo de parámetros > 0, y flujo de gradientes finito. De la **`ScoreUNet`** (sobre una config *tiny* para correr rápido en CPU, más un único test con los defaults de referencia): contrato de shape `(B, C, H, W) → (B, C, H, W)` parametrizado en `C ∈ {1, 3}` × `image_size ∈ {32, 64}`; `t` como `(B,)` y `(B, 1)` (mismo resultado) y salidas finitas en varias escalas de `t`; condicionamiento efectivo (dos `t` distintos → salidas distintas) y salida de ambos signos; `isinstance(net, ScoreModel)`; determinismo, ausencia de dropout/batchnorm, independencia del batch (muestra sola vs en batch), gradientes finitos, conteo de parámetros reproducible, y los `ValueError` fail-fast (activación desconocida, `groups` incompatible, `image_size` no divisible, tamaño de `x` distinto de `image_size`). Correr:
 
 ```
 python -m pytest -q                                    # toda la suite

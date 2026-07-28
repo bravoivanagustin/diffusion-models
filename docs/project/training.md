@@ -30,7 +30,7 @@ $$\mathcal{L} = \mathbb{E}\big[\lVert \sigma_t\, s_\theta(x_t,t) + \varepsilon \
 
 El loop **no inventa** este peso: lo toma tal cual lo devuelve `sde.score_target`. Esa es la clave que mantiene la matemática en el módulo `sde` y la optimización acá.
 
-> **El muestreo de $t$.** Se sortea uniforme en $[t_\text{eps}, T]$ con $t_\text{eps} > 0$ (default `1e-3`). El piso evita $t = 0$, donde $\sigma_t \to 0$ y el target $-\varepsilon/\sigma_t$ se vuelve inestable. $T = \texttt{sde.T}$.
+> **El muestreo de $t$ (configurable desde 25/07/2026, spec `small-t-training-signal`).** El default sortea uniforme en $[t_\text{eps}, T]$ con $t_\text{eps} > 0$; el piso evita $t = 0$, donde $\sigma_t \to 0$ y el target $-\varepsilon/\sigma_t$ se vuelve inestable. Además, `TrainConfig.time_sampling` permite elegir la distribución por nombre (`"uniform"`, el default bit a bit idéntico al histórico, o `"log_uniform"`): la log-uniforme $q(t) \propto 1/t$ concentra las muestras en $t$ chico (≈50% de la masa en $[10^{-4}, 10^{-2}]$ con `t_eps=1e-4`, contra ~1% de la uniforme) y la pérdida se corrige por el **likelihood ratio** $w(t) = p_\text{unif}(t)/q(t)$ (importance sampling puro: la pérdida esperada queda **matemáticamente idéntica** a la del muestreo uniforme — solo baja la varianza del estimador en la franja de $t$ chico; la equivalencia está verificada por Monte Carlo en la suite, con tolerancia $3\cdot SE$ validada por sabotaje). La corrección la aplica `dsm_loss` vía `sample_weights`; el sampler vive en `training/time_sampling.py` (registry/factory `make_time_sampler`).
 
 ## El seam agnóstico a la SDE
 
@@ -48,17 +48,21 @@ Núcleo (en `losses.py`, sin estado ni I/O — se testea directo):
 
 | Función | Qué hace |
 |---|---|
-| `dsm_loss(net, sde, x0, t, *, generator=None)` | Pérdida DSM de un batch; escalar diferenciable. |
+| `dsm_loss(net, sde, x0, t, *, generator=None, sample_weights=None)` | Pérdida DSM de un batch; escalar diferenciable. Con `sample_weights` (el likelihood ratio del muestreo de $t$) la media es ponderada — con `None` el camino es bit a bit el histórico. |
 | `sample_timesteps(n, T, t_eps, *, generator=None, device=None)` | $n$ tiempos $\sim\mathcal{U}[t_\text{eps},T]$, shape `(n,)`. |
+| `make_time_sampler(name, T, t_eps)` / `available_time_samplers()` | Factory del muestreo de $t$ (`time_sampling.py`): `"uniform"` (delega en `sample_timesteps`, pesos `None`) o `"log_uniform"` (pesos $w(t) = t\,\ln(T/t_\text{eps})/(T-t_\text{eps})$, $E_q[w]=1$). Contrato `sample(n, *, generator, device) -> (t, pesos)`. |
 
 Loop y persistencia (en `trainer.py`):
 
 | Símbolo | Qué es |
 |---|---|
-| `TrainConfig` | Dataclass **acotado al loop**: `num_steps, lr, t_eps, grad_clip, seed, device, log_every, checkpoint_every`. Ya no lleva hiperparámetros de red (van al constructor / `make_model`) ni de dataset (`n_samples`/`batch_size` van a la fuente de datos). `log_every` es **solo para el print** de consola (media móvil), desacoplado del `history`. `checkpoint_every` (default `0`) activa el checkpointing intermedio (ver abajo). |
-| `TrainResult` | `net` entrenada (cualquier `ScoreModel`), `history` (**serie per-step completa**: una entrada por paso, `len == num_steps`), `config`, `sde_name` y `data_dim` (`= sde.data_dim`, lo copia el checkpoint). |
-| `train(sde, model, data, config, *, generator=None, on_checkpoint=None)` | Corre el loop **por pasos** (`num_steps`) y devuelve `TrainResult`. Recibe la red ya construida y un iterador infinito de datos; no instancia la red ni ramifica por su tipo (agnóstico a la red y al origen de datos). `on_checkpoint(tag, snapshot)` es un callback **opcional** de checkpointing intermedio: el loop decide *cuándo* llamarlo, el callback decide *cómo/dónde* persistir — `train` no toca el filesystem. |
-| `save_checkpoint(result, path, *, model_spec=None)` / `load_checkpoint(path)` | Persistencia **model-agnóstica** (R5-c): guarda `state_dict` + `meta{sde_name, data_dim, history, model?}`; `load_checkpoint` devuelve `(state_dict, meta)` sin reconstruir la red (ver más abajo). |
+| `TrainConfig` | Dataclass **acotado al loop**: `num_steps, lr, t_eps, grad_clip, seed, device, log_every, checkpoint_every, time_sampling, ema_decay`. `time_sampling` (default `"uniform"`, retrocompatible) elige la distribución del muestreo de $t$; el loop construye el sampler una vez (fail-fast antes de consumir datos) y pasa los pesos a `dsm_loss`. Ya no lleva hiperparámetros de red (van al constructor / `make_model`) ni de dataset (`n_samples`/`batch_size` van a la fuente de datos). `log_every` es **solo para el print** de consola (media móvil), desacoplado del `history`. `checkpoint_every` (default `0`) activa el checkpointing intermedio (ver abajo). `ema_decay` (default `None` = **sin EMA**) activa la sombra EMA de los pesos (ver abajo). |
+| `TrainResult` | `net` entrenada (cualquier `ScoreModel`), `history` (**serie per-step completa**: una entrada por paso, `len == num_steps`), `config`, `sde_name`, `data_dim` (`= sde.data_dim`, lo copia el checkpoint) y `ema_state` (la foto **clonada** de la sombra EMA — mismas claves que el `state_dict` de la red, con los parámetros promediados—, o `None` sin EMA). |
+| `train(sde, model, data, config, *, generator=None, on_checkpoint=None, resume=None)` | Corre el loop **por pasos** (`num_steps`) y devuelve `TrainResult`. Recibe la red ya construida y un iterador infinito de datos; no instancia la red ni ramifica por su tipo. `on_checkpoint(tag, snapshot)` es un callback **opcional** de checkpointing intermedio (el `snapshot` es un `TrainSnapshot`; ver abajo): el loop decide *cuándo*, el callback decide *cómo/dónde* — `train` no toca el filesystem. `resume` (un `ResumeState` opcional) hace el loop **reanudable** (ver "Reanudación"). |
+| `save_checkpoint(result, path, *, model_spec=None, raw_sibling=False)` / `load_checkpoint(path)` | Persistencia **model-agnóstica** (R5-c): guarda `state_dict` + `meta{sde_name, data_dim, history, model?, ema?}`; es el **punto único de publicación** del EMA (con `result.ema_state` presente guarda la sombra y marca `meta["ema"]`; con `raw_sibling=True` escribe además el hermano `{stem}_raw.pt` de crudos — ver "EMA de los pesos"). `load_checkpoint` devuelve `(state_dict, meta)` sin reconstruir la red (ver más abajo). |
+| `TrainSnapshot` / `ResumeState` | Lo que viaja en cada snapshot intermedio. `TrainSnapshot{result: TrainResult, resume: ResumeState}`: los pesos+history (para `save_checkpoint`) **y** el estado para reanudar. `ResumeState{optimizer_state, start_step, torch_rng_state, generator_state, history}`: lo que los pesos no capturan (Adam + paso + azar), más `ema_state` y `raw_model_state` **opcionales** (`None` sin EMA). |
+| `save_resume_state(path, resume)` / `load_resume_state(path)` | Persistencia del **sidecar** de resume (`…_resume.pt`): guarda `{optimizer_state, step, torch_rng_state, generator_state}` (sin `history`, que vive en el `meta` de los pesos), más `raw_model_state`/`ema_state` **solo si están** (corrida con EMA). `save_resume_state` levanta `ValueError` si falta alguno de los cuatro campos requeridos. |
+| `EmaShadow(module, decay)` | La sombra EMA (en `ema.py`): `update(step)` la avanza un paso, `state_dict()` da la foto publicable (clonada) y `load_state(shadow)` la restaura al reanudar. Es un observador pasivo del módulo (ver abajo). |
 
 > **La curva de pérdida (`history`) es la serie per-step completa** — una entrada por paso, no un promedio por ventana. Es lo más fiel: la pérdida DSM de un paso es de cola pesada (depende mucho del `t` aleatorio que se sortea cada paso), así que promediar la distorsiona; guardando todo, siempre se puede suavizar después para graficar. El print de consola (`log_every`) muestra una media móvil, pero es **solo display** y está desacoplado de lo que se guarda.
 
@@ -76,6 +80,17 @@ Config-driven (en `config.py`):
 | `load_config(path)` | Lee un YAML a `dict` (necesita `pyyaml`). |
 | `build_run(raw)` | Ensambla un `RunSpec` reusando `make_sde`/`make_distribution`/`make_model` y envolviendo el dataloader con `infinite_bare`. Valida `train:` contra los campos de `TrainConfig` (rechaza claves desconocidas). |
 | `RunSpec` | Una corrida lista: `sde` + red (`model`) + fuente de datos infinita (`data`) + `TrainConfig` + `model_spec` (la receta `{name, kwargs}` para el checkpoint) + rutas de salida (`checkpoint`, `loss_curve`). |
+
+Reanudación (en `resume.py`, **puro y sin torch** salvo `load_resume`):
+
+| Símbolo | Qué es |
+|---|---|
+| `resolve_resume(final_checkpoint, *, force=False, resume_from=None) -> ResumePlan` | Decide `skip` / `resume` / `fresh` mirando **solo** el filesystem (no entrena ni escribe). |
+| `ResumePlan{action, weights_path, step}` | DTO con la decisión. |
+| `discover_snapshots(final) -> list[(step, path)]` | Lista los `…_stepNNNNN.pt` hermanos del final, ordenados por paso. Solo matchea ese patrón sobre el mismo stem, así que quedan afuera el final, los sidecars, el hermano `_raw`, las otras corridas del directorio y los `…_best.pt` **legados** (el loop ya no los emite, pero los que quedaron en disco se toleran). |
+| `resume_sidecar_path(weights_path) -> Path` | `X_stepNNNNN.pt` → `X_stepNNNNN.resume.pt`. |
+| `validate_compatible(meta, *, sde_name, model_spec, data_dim)` | Igualdad **exacta** de SDE / `data_dim` / receta de red, antes de reanudar (`ValueError` si difieren). |
+| `load_resume(weights_path, *, expected, map_location="cpu") -> (state_dict, meta, ResumeState)` | Reúne pesos + sidecar en un `ResumeState` listo para `train(resume=…)`; `FileNotFoundError` si falta el sidecar. El `state_dict` que devuelve son los **crudos del sidecar** cuando están (corrida con EMA: el checkpoint publica la sombra) y los del checkpoint cuando no (sidecar viejo = como siempre). |
 
 ## Corridas por config (YAML)
 
@@ -102,6 +117,7 @@ train:               # -> campos de TrainConfig (solo el loop de optimización)
   seed: 0
   device: cpu
   checkpoint_every: 0  # opcional; 0 = solo el checkpoint final. N>0 = snapshots intermedios
+  ema_decay: 0.999     # opcional; sin la clave = sin EMA (pesos crudos, como antes)
 # model:             # opcional: la red es la variable de control (normalmente fija)
 #   name: mlp        #   si falta, se usa {name: mlp} dimensionado desde el dato/SDE
 #   hidden_dim: 256
@@ -114,29 +130,78 @@ Ejemplo listo en `diffusion-models/config/`: `vp_mixture.yaml`.
 
 ## Checkpoint model-agnóstico (R5-c)
 
-`save_checkpoint`/`load_checkpoint` no dependen de ninguna clase de red concreta. El `.pt` guarda el `state_dict` de la red y una `meta` mínima: `{sde_name, data_dim, history}` más —opcionalmente— una **receta genérica** `model = {"name": str, "kwargs": dict}`. Esa receta la aporta el caller vía `save_checkpoint(result, path, model_spec={"name": "mlp", "kwargs": {...}})`; en el camino config-driven la transporta el `RunSpec` (`spec.model_spec`) y `scripts/train.py` la pasa sola.
+`save_checkpoint`/`load_checkpoint` no dependen de ninguna clase de red concreta. El `.pt` guarda el `state_dict` de la red y una `meta` mínima: `{sde_name, data_dim, history}` más —opcionalmente— una **receta genérica** `model = {"name": str, "kwargs": dict}` y la marca `ema` de la sección siguiente. Esa receta la aporta el caller vía `save_checkpoint(result, path, model_spec={"name": "mlp", "kwargs": {...}})`; en el camino config-driven la transporta el `RunSpec` (`spec.model_spec`) y `scripts/train.py` la pasa sola.
 
 `load_checkpoint(path)` devuelve `(state_dict, meta)` **sin reconstruir** la red: es el caller quien arma la red y le carga los pesos. La reconstrucción canónica es `make_model(recipe["name"], **recipe["kwargs"])` seguida de `net.load_state_dict(state_dict)`, y la hace `diffusion.samplers.generate_from_checkpoint`, que cierra el pipeline forward→score→sampleo desde el checkpoint. Si el checkpoint se guardó **sin** receta (`model_spec=None`) sigue siendo válido, pero al generar hay que pasarle una red explícita (`model=`). Así el mismo checkpoint sirve al `ScoreMLP` (Fase 1) y a la `ScoreUNet` (Fase 2) sin que `training` importe ninguna red concreta.
 
+## EMA de los pesos (opt-in, desde 27/07/2026 — spec `ema-weights`)
+
+La pérdida DSM per-step es muy ruidosa (el $t$ se sortea de nuevo en cada paso, y en la celda de gatos el batch es chico), así que **los pesos del último paso de Adam son una foto arbitraria** de una trayectoria que oscila. Las implementaciones de referencia no samplean con esa foto: mantienen durante el entrenamiento una **media móvil exponencial (EMA)** de los parámetros y generan con ella. Song et al. lo hacen en `score_sde_pytorch` (`models/ema.py`, `ExponentialMovingAverage` — es la convención que sigue esta implementación), DDPM (Ho et al., 2020) también, y de EDM (Karras et al., 2022) viene la idea de la **rampa de warmup** para que el promedio no quede dominado por la inicialización en corridas cortas. El módulo suma esa pieza —y solo esa— en `training/ema.py` (`EmaShadow`):
+
+$$\text{ema}_s = d_s\,\text{ema}_{s-1} + (1 - d_s)\,\theta_s, \qquad d_s = \min\!\Big(d,\ \frac{1+s}{10+s}\Big)$$
+
+donde $s$ es la cantidad de **pasos completados** (1-indexado: se llama `update(s)` justo después del `optimizer.step()` número $s$, y la sombra arranca en $\text{ema}_0 = \theta_0$) y $d$ es el decay configurado. El factor $(1+s)/(10+s)$ es la rampa: en $s=1$ vale $2/11 \approx 0.18$ (el arranque es casi un promedio simple) y crece hacia $1$, tocando $d = 0.999$ recién en $s \approx 8990$ — para corridas de 2k–19k pasos la ventana efectiva sigue creciendo durante buena parte de la corrida, que es justo el comportamiento buscado.
+
+- **Opt-in y retrocompatible.** `TrainConfig.ema_decay = None` (**default**) = sin EMA: no se construye ninguna sombra, no hay ramas nuevas activas y la corrida es **bit a bit** la histórica (mismos pesos finales, mismo `history`, misma secuencia de RNG con la misma semilla). El decay recomendado del estudio es **0.999**, y es lo que declara `config/vp_mixture.yaml`.
+- **Fail-fast.** La sombra se construye **después** de mover la red al device (clona sus tensores, tienen que estar en el device final) y **antes** de consumir el primer batch: un `ema_decay` no finito o fuera del intervalo **abierto** $(0,1)$ revienta con `ValueError` —con el valor recibido en el mensaje— antes de entrenar, igual que un `time_sampling` desconocido. También falla si no logró rastrear ningún tensor entrenable del módulo (una sombra vacía publicaría pesos crudos disfrazados de EMA).
+- **Observador pasivo.** La sombra solo *lee* los tensores de la red después del paso del optimizador: no escribe en la red, no toca el optimizador y **no consume RNG**. Con la misma semilla, la trayectoria de optimización (pesos crudos + curva de pérdida) es idéntica a la de una corrida sin EMA — el EMA no cambia lo que se optimiza, solo agrega qué se publica.
+- **Agnóstica a la red.** Opera sobre el `state_dict` del módulo recibido sin ramificar por su tipo (`ScoreMLP`, `ScoreUNet`), así que compone con el `EpsilonScoreWrapper`: su `state_dict` delega al interno, de modo que las claves de la sombra quedan de **red pelada** y el checkpoint publicado sigue siendo reconstruible con `make_model` + la receta.
+- **Parámetros vs buffers.** El promedio se aplica a los tensores **entrenables**; los buffers no entrenables se copian del módulo vivo al publicar. Es la convención de referencia y acá es *exacta*, no aproximada: los buffers del repo son constantes (el `denom` del embedding sinusoidal; GroupNorm no lleva running stats).
+
+**Qué publica el checkpoint.** `save_checkpoint` es el **punto único de publicación**: si `result.ema_state` está presente, lo que guarda como `model_state` es la sombra —no los pesos vivos del último paso— y la `meta` gana la marca de trazabilidad `ema = {"decay": d}`. El formato del blob no cambia (`{model_state, meta}`), así que la generación, el wrapper ε y los notebooks de auditoría consumen los pesos promediados **sin modificarse**. Como *todos* los checkpoints pasan por esa función, la política vale igual para el final y para los snapshots periódicos del callback (cada intermedio publica la sombra de *su* momento). Sin EMA el contenido es idéntico al de antes de la feature (mismos pesos, misma meta, sin la clave `ema`). La convención de lectura de la marca, la que interpretan los consumidores:
+
+| `meta` | Qué son los pesos publicados |
+|---|---|
+| **sin** `ema` | **crudos** — es lo que son todos los checkpoints anteriores a esta feature (retrocompatibilidad). |
+| con `ema = {"decay": d}` | la **sombra EMA** con ese decay. |
+| con `raw_of = "<archivo>.pt"` (y sin `ema`) | **crudos**: el *hermano de crudos* del checkpoint EMA que nombra. |
+
+**El hermano de crudos.** `save_checkpoint(..., raw_sibling=True)` escribe además `{stem}_raw.pt` con los **pesos crudos finales**: un checkpoint estándar (mismo formato, misma receta) cuya meta lleva `raw_of` en lugar de `ema`. Sirve para la comparativa crudo-vs-EMA de la **misma** corrida sin tocar la lógica de medición de los audits. Lo activa el guardado **final** (`scripts/train.py` lo pasa siempre; los snapshots intermedios no lo necesitan, sus crudos ya viajan en el sidecar de resume). Sin EMA activo no escribe nada —el principal ya publica los crudos y el hermano sería un duplicado exacto—, y el sufijo `_raw` no matchea el patrón `_stepNNNNN`, así que nunca se elige como punto de reanudación.
+
+> **Retiro del checkpoint "best" (27/07/2026).** La misma spec **retiró** el tag `best` que emitía el loop: hoy la única cadencia que emite es la periódica (`stepNNNNN`). El motivo es exactamente el que justifica el EMA: elegir un checkpoint por la **pérdida cruda per-step** es ruidoso —el $t$ de cada paso es aleatorio— y correlaciona mal con la calidad de las muestras; además el mecanismo nunca se usó para ninguna decisión del estudio. Los `X_best.pt` que quedaron en disco de corridas previas se siguen **tolerando** (`discover_snapshots` los excluye, como siempre). La decisión está registrada en `.kiro/specs/ema-weights/research.md`.
+
 ## Checkpointing intermedio (opt-in)
 
-Por defecto **solo se guarda el checkpoint final** (el `state_dict` tal como quedó en el último paso): el loop no persiste nada, y `save_checkpoint` lo escribe una vez terminado `train`. Para guardar también estados intermedios está el switch `checkpoint_every` de `TrainConfig`:
+Por defecto **solo se guarda el checkpoint final** (el `state_dict` tal como quedó en el último paso — o la sombra EMA, si la corrida la mantiene): el loop no persiste nada, y `save_checkpoint` lo escribe una vez terminado `train`. Para guardar también estados intermedios está el switch `checkpoint_every` de `TrainConfig`:
 
 - `checkpoint_every = 0` (**default**) — nada intermedio; comportamiento idéntico al histórico (sin regresión).
-- `checkpoint_every = N > 0` — además del final, el loop pide guardar:
-  - un **snapshot periódico** cada `N` pasos (tag `step{N:05d}` → `…_stepNNNNN.pt`), con cadencia propia (se chequea cada paso, así `N` no tiene que ser múltiplo de nada). El **último** paso se omite porque ya lo cubre el checkpoint final.
-  - un **best-so-far** (tag `best` → `…_best.pt`), que se reescribe cada vez que baja una **media de ventana** de la pérdida (cadencia interna `eval_every = num_steps//100`, suavizada — la de un paso suelto es muy ruidosa por el `t` aleatorio). *Nota:* aún así la pérdida DSM es ruidosa, así que "best" es orientativo; para comparar suele ser más útil un snapshot periódico.
+- `checkpoint_every = N > 0` — además del final, el loop pide guardar un **snapshot periódico** cada `N` pasos (tag `step{N:05d}` → `…_stepNNNNN.pt`), con cadencia propia (se chequea cada paso, así `N` no tiene que ser múltiplo de nada). El **último** paso se omite porque ya lo cubre el checkpoint final. Es la **única** cadencia que emite el loop (el tag `best` se retiró; ver arriba).
 
-El diseño mantiene `train` **sin I/O**: el loop decide **cuándo** (la política de cadencia y best) e invoca un callback `on_checkpoint(tag, snapshot)`; el **caller** decide **cómo/dónde** persistir. En el camino config-driven eso lo arma `scripts/train.py`, que deriva rutas hermanas del `out.checkpoint` con `Path.with_stem` (`vp_mixture.pt` → `vp_mixture_step00050.pt`, `vp_mixture_best.pt`) y reusa `save_checkpoint` (con el mismo `model_spec`, así cada snapshot es reconstruible igual que el final). A mano:
+El diseño mantiene `train` **sin I/O**: el loop decide **cuándo** (la política de cadencia) e invoca un callback `on_checkpoint(tag, snapshot)`, donde `snapshot` es un **`TrainSnapshot`** (`snapshot.result` = pesos+history, `snapshot.resume` = estado para reanudar); el **caller** decide **cómo/dónde** persistir. En el camino config-driven eso lo arma `scripts/train.py`, que deriva la ruta hermana del `out.checkpoint` con `Path.with_stem` (`vp_mixture.pt` → `vp_mixture_step00050.pt`) y persiste **dos** artefactos por snapshot: los pesos (`save_checkpoint(snapshot.result, …)`) y el **sidecar** de resume (`save_resume_state(resume_sidecar_path(tagged), snapshot.resume)`), así una interrupción deja un punto reanudable. A mano:
 
 ```python
 base = pathlib.Path("models/vp_mixture.pt")
-def on_checkpoint(tag, snap):
-    save_checkpoint(snap, base.with_stem(f"{base.stem}_{tag}"), model_spec=spec.model_spec)
+def on_checkpoint(tag, snap):                              # snap: TrainSnapshot
+    tagged = base.with_stem(f"{base.stem}_{tag}")
+    save_checkpoint(snap.result, tagged, model_spec=my_model_spec)      # pesos + meta
+    save_resume_state(resume_sidecar_path(tagged), snap.resume)          # sidecar (opcional)
 train(sde, model, data, TrainConfig(num_steps=1000, checkpoint_every=200), on_checkpoint=on_checkpoint)
 ```
 
-Se activa por YAML (`train.checkpoint_every`) o con el override `--checkpoint-every` del CLI. Si `checkpoint_every > 0` pero no hay `out.checkpoint`, el CLI avisa y no escribe snapshots (no hay ruta base de dónde colgarlos).
+> **Ojo:** el callback recibe un `TrainSnapshot`, no un `TrainResult` — hay que pasar `snap.result` a `save_checkpoint` (pasar `snap` directo falla). El sidecar es opcional: sin él tenés snapshots de pesos, pero no podés **reanudar** desde ellos.
+
+Se activa por YAML (`train.checkpoint_every`) o con el override `--checkpoint-every` del CLI. Si `checkpoint_every > 0` pero no hay `out.checkpoint`, el CLI avisa y no escribe snapshots; y si `checkpoint_every = 0`, avisa que la corrida **no deja puntos de reanudación**.
+
+## Reanudación (resume): skip / resume / fresh
+
+Los snapshots intermedios no son solo para inspeccionar: habilitan **reanudar** una corrida larga interrumpida sin perder el estado del optimizador ni el azar. La pieza clave es que un snapshot periódico deja **dos** archivos hermanos:
+
+- `X_stepNNNNN.pt` — los **pesos** + `meta{sde_name, data_dim, history, model?}` (`save_checkpoint`).
+- `X_stepNNNNN.resume.pt` — el **sidecar** (`save_resume_state`): `{optimizer_state, step, torch_rng_state, generator_state}` (+ `raw_model_state`/`ema_state` con EMA activo; ver abajo) — exactamente lo que los pesos no capturan (los momentos de Adam, el paso alcanzado y **ambos** RNG: el global de torch y el `generator` del ruido/muestreo de `t`). El `history` **no** se duplica en el sidecar: vive en el `meta` de los pesos.
+
+Por eso el resume es **fidedigno** (no es weights-only): al reanudar, `train(resume=…)` restaura optimizador + azar + paso + `history` y sigue el mismo stream. `num_steps` se interpreta como el **total** a alcanzar (corre `range(start_step, num_steps)`); reanudar con `num_steps ≤ start_step` es un **no-op** silencioso.
+
+**Con EMA activo** el estado de la corrida queda *partido* entre los dos artefactos: el checkpoint de pesos publica la **sombra**, así que el sidecar gana dos claves más —`raw_model_state` (los pesos **crudos** del momento, clonados: es con lo que hay que seguir optimizando) y `ema_state` (la sombra, para restaurarla en vez de reconstruirla desde los pesos, que valen $\theta_N$ y no el promedio acumulado)—. Son **opcionales**: sin EMA el sidecar no gana ninguna clave, así que los sidecars anteriores a la feature siguen cargando igual que siempre. `load_resume` devuelve entonces los crudos del sidecar como el `state_dict` a cargar en la red (el checkpoint queda solo como fuente de `meta`/`history`), y si esa clave no está —sidecar viejo, corrida sin EMA— se comporta exactamente como antes. Las dos combinaciones incoherentes entre config y sidecar se **rechazan** con `ValueError` antes de entrenar: EMA pedido sin sombra guardada (se perdería el promedio de todos los pasos ya corridos) y sombra guardada sin EMA pedido (se descartaría en silencio, y el final publicaría crudos donde los intermedios publicaron el promedio).
+
+`scripts/train.py` orquesta la decisión con `resolve_resume` (puro, solo mira el filesystem):
+
+1. **`--resume-from PATH|STEP`** → siempre `resume` desde ese snapshot puntual (manda sobre el skip). Si no resuelve (ni ruta existente ni paso descubierto) → error que lista los snapshots disponibles (exit 2).
+2. si no, y el checkpoint final ya existe y **no** hay `--force` → **`skip`** (corrida completa; no se sobrescribe nada, exit 0).
+3. si no (final ausente **o** `--force`): descubre snapshots; si hay → **`resume`** desde el **más nuevo** (mayor paso); si no → **`fresh`** (desde cero).
+
+Antes de reanudar, `load_resume` valida compatibilidad **exacta** (`validate_compatible`): misma SDE, mismo `data_dim` y misma receta de red — reanudar sobre un estado que no corresponde falla con `ValueError`. Si falta el sidecar del snapshot elegido → `FileNotFoundError` que lo nombra (probablemente la corrida original no usó `checkpoint_every>0`).
+
+> **Limitación:** `validate_compatible` compara `sde_name`/`data_dim`/receta, **no** los hiperparámetros de la SDE (betas, `sigma_max`). Como el resume rearma la SDE desde el **mismo** YAML, en la práctica es consistente; pero es el mismo hueco que el footgun del checkpoint (ver `dataflow.md`).
 
 ## Cómo correr
 
@@ -158,12 +223,15 @@ save_checkpoint(result, "models/vp_mixture.pt",
 # CLI por config (desde diffusion-models/):
 python scripts/train.py --config config/vp_mixture.yaml
 python scripts/train.py --config config/vp_mixture.yaml --num-steps 50 --device cpu
+python scripts/train.py --config config/vp_mixture.yaml --checkpoint-every 50   # deja snapshots + sidecars
+python scripts/train.py --config config/vp_mixture.yaml --force                 # reentrena/reanuda aunque exista el final
+python scripts/train.py --config config/vp_mixture.yaml --resume-from 50         # reanuda desde el snapshot del paso 50
 
 # Smoke del módulo (desde diffusion-models/src/):
 python -m diffusion.training
 ```
 
-El CLI guarda el checkpoint (`.pt`) y una curva de pérdida (`.png`) en las rutas de `out`.
+Flags del CLI (`scripts/train.py`): `--config` (req.), `--num-steps`, `--device`, `--checkpoint-every` (overrides del `.yaml`), `--force` (saltea el `skip` si el final existe), `--resume-from PATH|STEP` (reanuda desde un snapshot puntual) y `--quiet` (sin print por paso). El CLI guarda el checkpoint final (`.pt`) y una curva de pérdida (`.png`) en las rutas de `out`; con `checkpoint_every>0` deja además los `…_stepNNNNN.pt` + `…_stepNNNNN.resume.pt`, y con `train.ema_decay` configurado el hermano de crudos `…_raw.pt` junto al final (el guardado final pasa `raw_sibling=True`). El `…_best.pt` que dejaba antes **ya no se emite**.
 
 ## Stack y dependencias
 
@@ -171,14 +239,20 @@ Torch es **dependencia dura** del módulo (como `mlp` y `sde`): importa `torch` 
 
 ## Tests
 
-`diffusion-models/tests/test_training.py` (33 tests, en verde; suite completa sin regresiones):
+`diffusion-models/tests/test_training.py` (111 tests, en verde; suite completa sin regresiones):
 
 - `dsm_loss` para las **3 SDEs**: escalar finito, diferenciable, gradientes finitos en la red; reproducible con `generator`.
 - `sample_timesteps`: shape, rango $[t_\text{eps}, T]$, reproducibilidad, horizonte $T$ distinto.
 - `train`: **usa la red recibida** y registra el `data_dim` correcto por SDE (las 3 variantes); `history` es la **serie per-step completa** (`len == num_steps`), independiente de `log_every`; la **pérdida baja** (medias de bloque) en VP sobre la mezcla de gaussianas; reproducibilidad con misma `seed`; camino `grad_clip`.
 - `TrainConfig`: acotado al loop (no expone campos de red ni de dataset); `checkpoint_every` arranca en `0`.
 - `save_checkpoint`/`load_checkpoint`: ida y vuelta reconstruye la red con los mismos pesos; sin `model_spec` el checkpoint omite la receta `model`.
-- **Checkpointing intermedio**: con `checkpoint_every=0` el callback no se invoca (sin regresión); con `N>0` emite los snapshots periódicos correctos (múltiplos de `N`, excluido el último paso) más al menos un `best`; el wiring estilo-CLI escribe los `…_stepNNNNN.pt`/`…_best.pt` cargables con la metadata esperada.
+- **Checkpointing intermedio**: con `checkpoint_every=0` el callback no se invoca (sin regresión); con `N>0` emite **solo** los snapshots periódicos correctos (múltiplos de `N`, excluido el último paso) y **ningún** `best` (el test del mecanismo retirado se reescribió para verificar su ausencia, incluido que no queda el artefacto `…_best.pt` en disco); el wiring estilo-CLI escribe los `…_stepNNNNN.pt` cargables con la metadata esperada.
+- **Muestreo de $t$ y parametrización ε**: los samplers de `time_sampling.py` (rango, concentración de masa, fórmula de los pesos y $E_q[w]=1$, reproducibilidad), la equivalencia en esperanza de la log-uniforme por Monte Carlo, el camino bit a bit del default y el round-trip de la receta con `score_parametrization: epsilon` hasta `generate_from_checkpoint`.
+- **EMA** (`ema-weights`): la matemática de `EmaShadow` contra una **réplica cerrada** dentro y cruzando el warmup; validación del decay y del contador; claves y clones del `state_dict` (parámetros EMA + buffers del módulo vivo); pasividad (no escribe en la red, no consume RNG) y determinismo; `load_state` y su rechazo de fotos incompletas; el default `ema_decay=None` **bit a bit** idéntico al loop previo; el loop promediando la trayectoria cruda de Adam sin alterarla; publicación de la sombra + marca `ema.decay` en el checkpoint final y en los intermedios, contenido idéntico al actual sin EMA, hermano de crudos (y su no-escritura sin EMA, y que `discover_snapshots` no lo levanta), composición con el wrapper ε; `build_run` aceptando `ema_decay` desde `dict` y desde YAML sin romper la validación estricta; y los dos guards de coherencia al reanudar.
 - `build_run`/`load_config`: ensamblado desde `dict` y desde YAML; el bloque `model:` sobreescribe el default; `train.checkpoint_every` se pasa al `TrainConfig`; falla ante claves faltantes (`sde.name`, `data.shape`) o desconocidas en `train:`.
 
+`diffusion-models/tests/test_resume.py` (54 tests, en verde) cubre el subsistema de **reanudación**: el round-trip del sidecar y su fail-fast (sin duplicar el `history`, sin tocar el checkpoint de pesos), `train(resume=…)` corriendo solo los pasos restantes y el no-op si ya está completo, el contrato del callback (`TrainSnapshot`), `discover_snapshots` (orden y exclusiones), `resolve_resume` en sus cuatro caminos (`skip`/`force`/auto-resume/`fresh`) y `--resume-from` por paso y por ruta con sus errores accionables, `validate_compatible` (SDE / `data_dim` / receta), `load_resume` (happy path, `history` del `meta`, sidecar faltante, incompatibilidad), el wiring del CLI de punta a punta (`scripts/train.py` cargado como módulo), y las claves de EMA del sidecar (crudos + sombra van y vuelven; sin EMA no aparece ninguna clave nueva; `load_resume` devuelve los crudos del sidecar cuando están y se comporta como siempre cuando no).
+
 > La convergencia solo se asserta para VP (el smoke de aprendizaje); de las demás variantes se testea la mecánica (finitud, shapes, reproducibilidad).
+
+> **La fidelidad del resume está testeada**, con y sin EMA: hay un round-trip que compara una corrida **interrumpida y reanudada** contra la **ininterrumpida** por igualdad exacta (`torch.equal` tensor a tensor + `history` idéntico), y un test de sabotaje que confirma que sin restaurar el optimizador el resultado **difiere** (o sea que la igualdad no es trivial). La versión con EMA recorre el camino real del CLI (`save_checkpoint` + `save_resume_state` → `load_resume`) y exige coincidencia de las **tres** cosas: pesos crudos, sombra y checkpoint publicado.

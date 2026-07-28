@@ -6,15 +6,15 @@ Ubicación: `diffusion-models/src/diffusion/samplers/`. Implementa el **proceso 
 
 ## 1. Objetivo del módulo y cómo se acopla al pipeline
 
-`sde` define el forward que ruidea `x_0`; `mlp` aprende `(x_t, t) -> score`; `training` entrena esa red. Lo que faltaba es cerrar el ciclo: **integrar la ecuación reversa para volver de ruido a datos.** Este módulo es esa última caja:
+`sde` define el forward que ruidea `x_0`; `models` (`ScoreMLP`/`ScoreUNet`) aprende `(x_t, t) -> score`; `training` entrena esa red. Lo que faltaba es cerrar el ciclo: **integrar la ecuación reversa para volver de ruido a datos.** Este módulo es esa última caja:
 
 ```
  data_generation     ►   forward SDE    ►      red        ►   training   ►   SAMPLER REVERSO
      x_0                  x_t = α_t·x_0          s_θ(x_t,t)      s_θ ya       integra la SDE/ODE
-                          + σ_t·ε                (módulo mlp)   entrenado    inversa  ──►  x_0 nuevo
+                          + σ_t·ε                (módulo models) entrenado   inversa  ──►  x_0 nuevo
 ```
 
-- **Entrada / salida**: un sampler se construye con una `ForwardSDE` y un **score** (una función `(x, t) -> score`); `sample(n_samples)` arranca del prior `p_T` (`sde.prior_sampling`) e integra hacia atrás hasta `t≈0`, devolviendo `x_0` de shape `(n_samples, data_dim)`. Opcionalmente devuelve la **trayectoria** completa.
+- **Entrada / salida**: un sampler se construye con una `ForwardSDE` y un **score** (una función `(x, t) -> score`); `sample(n_samples)` arranca del prior `p_T` (`sde.prior_sampling`) e integra hacia atrás hasta `t = t_eps`, devolviendo `x_0` de shape `(n_samples, *sde.data_shape)` — `(N, 2)` en el toy 2D, `(N, C, H, W)` en imágenes (el driver arma el prior desde `sde.data_shape`, así que es N-D). Opcionalmente devuelve la **trayectoria** completa `(n_steps+1, N, *data_shape)`. Las muestras salen en **espacio crudo** (no des-normalizadas): para imágenes en `[-1,1]` hay que des-normalizar aparte para verlas.
 - **Rol en la ablación**: el sampler es el Eje 2, **variable independiente**. La red y la SDE quedan fijas; variar el sampler cambia solo la integración numérica de la reversa.
 - **Regla de reentrenamiento**: cambiar el **sampler (Eje 2)** reusa el mismo `s_θ` —**no** se reentrena—. (Reentrenar es del Eje 1; ver `sde.md` y `ejes.md`.)
 
@@ -86,13 +86,28 @@ PF-ODE y Heun son **determinísticos** (ignoran `generator`); EM y PC son **esto
 
 Acá vive la **tercera** fuente de aleatoriedad del pipeline (junto con el dato y el forward): el ruido que inyectan EM y PC durante la integración. Es, de nuevo, el reflejo de la red determinística — toda la estocasticidad vive *afuera* de ella. PF-ODE y Heun, en cambio, son el extremo determinístico del mismo eje. Por eso el ruido se sortea siempre con un `torch.Generator` opcional: explícito y reproducible.
 
+### Footguns (verificados contra el código)
+
+- **Ruido en el último paso.** EM y el predictor de PC inyectan `g·√|dt|·Z` en **todos** los pasos, incluido el que aterriza en `t_eps` (no hay rama "ruido apagado al final", a diferencia de varias implementaciones de referencia). El `x_0` devuelto es técnicamente `x_{t_eps}`, nunca exactamente `t=0`. Lo confirma el notebook `audit_03`.
+- **NFE no está igualado.** `n_steps` es la cantidad de pasos, pero la NFE real es `n_steps` (EM/PF-ODE), `2·n_steps` (Heun) y `n_steps·(1+n_corrector)` (PC). Comparar samplers "justo" (a NFE igualado, como pide la matriz de `ejes.md`) es responsabilidad del caller; el módulo no da una perilla de presupuesto de NFE.
+- **`sample()` no pone la red en `eval()`.** Corre bajo `torch.no_grad()` pero **no** toca el flag train/eval de la red; solo `generate_from_checkpoint` llama `net.eval()`. Inocuo para `ScoreMLP`/`ScoreUNet` (no tienen dropout/batchnorm), pero es un hueco del contrato si se cablea `sample()` a mano.
+- **Generación CPU-only.** `sample()` no toma dispositivo; el prior sale en CPU (`prior_sampling` con `device=None`) y el `generator` de `generate_from_checkpoint` es de CPU. Un checkpoint entrenado en CUDA igual samplea en CPU.
+- **Hiperparámetros de la SDE perdidos.** `generate_from_checkpoint` reconstruye la SDE solo con `sde_name`+`data_dim` → defaults del constructor (ver `dataflow.md`, footgun #1). Con betas/`sigma_max` no-default, la reversa usa otros valores en silencio.
+
 ### Generación desde checkpoint (config-driven)
 
-`generate_from_checkpoint(checkpoint_path, sampler_name, *, n_samples, n_steps=500, seed=None, out=None, save_trajectory=False, ...)` cierra el camino de extremo a extremo, reusando `training.load_checkpoint`: carga la red entrenada y su metadata, reconstruye la SDE desde `meta` (`make_sde(meta["sde_name"], data_dim=meta["data_dim"])`), arma el sampler con la factory, genera y —si se da `out`— guarda un `.npz` (clave `samples`, más `trajectory` opcional). El checkpoint ya transporta todo lo necesario, así que el sampleo corre **sin** el config de entrenamiento original. La CLI `scripts/sample.py` (argparse) es un wrapper fino sobre esta función.
+`generate_from_checkpoint(checkpoint_path, sampler_name, *, n_samples, n_steps=500, seed=None, out=None, save_trajectory=False, map_location="cpu", model=None, **sampler_kwargs)` cierra el camino de extremo a extremo, reusando `training.load_checkpoint`. Secuencia real:
+
+1. `load_checkpoint(path)` → `(state_dict, meta)` (crudos; **no** reconstruye la red). Path inexistente → `FileNotFoundError`; blob mal formado → `KeyError`.
+2. **Reconstruye la red**: si `meta["model"]` trae la receta `{name, kwargs}` → `make_model(...)` + `load_state_dict`; si no hay receta y se pasó `model=` → usa esa instancia; si no hay ninguna → `ValueError`. **La receta gana sobre `model=`** si ambas están. Después `net.eval()`.
+3. **Reconstruye la SDE**: `make_sde(meta["sde_name"], data_dim=meta["data_dim"])` — solo nombre + `data_dim` (⚠️ los demás hiperparámetros de la SDE **no** están en el checkpoint; ver footguns).
+4. Arma el sampler con la factory, genera (`generator` sembrado con `seed` si se dio, **CPU**), y —si se da `out`— guarda un `.npz` (clave `samples`, más `trajectory` si `save_trajectory`). **Devuelve solo `x_0`** (la trayectoria va únicamente al `.npz`).
+
+El checkpoint config-driven ya transporta la receta, así que el sampleo corre **sin** el config de entrenamiento original. La CLI `scripts/sample.py` (argparse) es un wrapper fino sobre esta función.
 
 ### Tests (`tests/test_samplers.py`)
 
-Suite de pytest (en verde, `importorskip("torch")`), parametrizada sobre **los 4 samplers × las 3 SDEs escalares** (VP/VE/sub-VP). Cubre:
+153 tests (pytest, `importorskip("torch")`), parametrizados sobre **los 4 samplers × las 3 SDEs escalares** (VP/VE/sub-VP), más el bloque N-D `(3,8,8)` y la generación checkpoint-driven. Cubre:
 
 - **Contrato y factory**: shapes `(N, data_dim)`, `float32`, finitud; grilla `T→t_eps`; trayectoria con shape coherente; `t` como `(B,)` y `(B,1)`; `n_steps` configurable; `make_sampler`/`available_samplers`, nombre desconocido → `ValueError`, filtrado de kwargs en ambos sentidos; los parámetros de la red **no cambian** tras `sample()`.
 - **Determinismo / reproducibilidad**: PF-ODE y Heun idénticos con el mismo `init` (e idénticos aunque cambie el seed → ignoran el ruido); EM y PC reproducibles con el mismo `generator` sembrado y distintos con otra semilla.
@@ -110,17 +125,31 @@ python -m pytest -q diffusion-models/tests/test_samplers.py   # solo este módul
 
 ### Ejemplo de uso (API)
 
+La forma canónica es `generate_from_checkpoint` (reconstruye red + SDE por vos):
+
+```python
+from diffusion.samplers import generate_from_checkpoint
+
+x0 = generate_from_checkpoint("models/vp_mixture.pt", "heun",
+                              n_samples=2000, n_steps=200, seed=0)   # tensor (2000, *data_shape)
+```
+
+Si querés armar el sampler a mano, **ojo**: `load_checkpoint` devuelve `(state_dict, meta)` — el `state_dict` **crudo**, no una red. Hay que reconstruir la red con `make_model` y cargarle los pesos:
+
 ```python
 from diffusion.sde import make_sde
+from diffusion.models import make_model
 from diffusion.training import load_checkpoint
-from diffusion.samplers import make_sampler, available_samplers
+from diffusion.samplers import make_sampler
 
-net, meta = load_checkpoint("models/vp_mixture.pt")     # red entrenada + metadata
+state_dict, meta = load_checkpoint("models/vp_mixture.pt")   # (state_dict, meta), NO una red
+net = make_model(meta["model"]["name"], **meta["model"]["kwargs"])
+net.load_state_dict(state_dict); net.eval()
 sde = make_sde(meta["sde_name"], data_dim=meta["data_dim"])
 
-sampler = make_sampler("heun", sde, net, n_steps=200)   # "euler" / "pf_ode" / "heun" / "pc"
-x0 = sampler.sample(2000)                                # muestras (2000, data_dim)
-x0, traj = sampler.sample(2000, return_trajectory=True)  # + trayectoria para visualizar
+sampler = make_sampler("heun", sde, net, n_steps=200)    # "euler" / "pf_ode" / "heun" / "pc"
+x0 = sampler.sample(2000)                                 # muestras (2000, *data_shape)
+x0, traj = sampler.sample(2000, return_trajectory=True)   # + trayectoria para visualizar
 ```
 
 El módulo trae un smoke (`__main__.py`): corre los cuatro samplers sobre una red **sin entrenar** y reporta shape/finitud. Correr (desde `diffusion-models/src/`): `python -m diffusion.samplers`. La CLI de generación (desde `diffusion-models/`): `python scripts/sample.py <checkpoint> --sampler heun --n-samples 2000 --out muestras.npz`.
@@ -132,4 +161,4 @@ El módulo trae un smoke (`__main__.py`): corre los cuatro samplers sobre una re
 Con los samplers entregados, la **matriz 3×4 del estudio** ya es ejecutable: 3 SDEs (VP/VE/sub-VP, las tres convergen) × 4 samplers, todas reusando el score sin reentrenar. Pendientes, en orden:
 
 - **Evaluación / visualización** — campos de score, trayectorias de partículas, reconstrucción de densidad y la comparación contra el score analítico de la mezcla. Los samplers ya exponen `return_trajectory` para alimentarlo; el ploteo y las métricas (FID/IS en Fase 2) van en un módulo aparte.
-- **Fase 2 (imágenes + U-Net)** — el mismo marco escala reusando una U-Net de librería; los samplers son agnósticos a `data_dim`, así que no requieren cambios estructurales. El diseño completo está en `ejes.md`.
+- **Fase 2 (imágenes + U-Net)** — el mismo marco escala usando la `ScoreUNet` **propia** (construida a mano, no de librería); los samplers ya operan sobre event shapes N-D `(N,C,H,W)` sin cambios (probado en `test_samplers.py` y en el notebook `06`). Lo que resta es el camino CLI/YAML para imágenes y el dataset final. El diseño completo está en `ejes.md`; el flujo cross-módulo en `dataflow.md`.

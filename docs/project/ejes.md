@@ -14,6 +14,8 @@ In both phases, the neural network is the **control variable** — the architect
 
 The study has two independent axes that combine into a matrix of experiments.
 
+> **Implementation status (2026-07-16).** This document is the experimental *design*; part of it is aspirational. What the code actually implements today: the toy shapes are `gaussian`, `mixture`, `two_moons`, `spiral`, `swiss_roll` (there is **no** concentric-circles generator — see the datasets section); Axis 1 is **VP / VE / sub-VP** (CLD was dropped on 05/07/2026, so the matrix is **3×4**, not 4×3); both networks (`ScoreMLP`, `ScoreUNet`) are hand-written and live in `diffusion.models`. Phase 1 (2D) runs end-to-end through the YAML/CLI pipeline; Phase 2 (images) works **only through notebooks** and has been exercised only on a 2-image `cats-prueba` overfit test at 32×32 with a ~1M-parameter U-Net — the final image dataset and the FID/IS evaluation module are still pending (author's decision). For the exact module-to-module data flow, contracts, and known cross-module problems, see `dataflow.md`.
+
 ---
 
 ## The Score Network: Architecture and Its Role in the Project
@@ -168,11 +170,11 @@ A spiral that curls around itself roughly two full turns. The data lies on a one
 
 Eight Gaussian blobs with small variance arranged evenly on a circle. The gaps between modes are the challenge: the score must be nearly zero in dead zones and strongly directional near each cluster. This is the best dataset for testing **mode coverage** (if the model drops a mode, you see an empty cluster immediately) and the only one where the **true analytical score** can be computed for comparison — a Gaussian mixture convolved with Gaussian noise remains a Gaussian mixture.
 
-### Two concentric circles
+### Two moons / spiral (the manifold-with-a-gap role)
 
-An inner ring at radius $r_1$ and an outer ring at radius $r_2$, both with slight radial noise. Tests whether the reverse process respects the topological gap — generated points should fall *on* the rings, not between them. Visually clean and immediately interpretable.
+> **Status:** the originally-planned "two concentric circles" dataset was **never implemented**. The code instead ships `two_moons` (two interleaving half-moons, sklearn `make_moons`) and `spiral` (one or more arms, numpy) — both play the same role: a low-dimensional manifold with curvature and a gap the reverse process must respect (generated points should fall *on* the manifold, not across the gap). If concentric circles are wanted later they are a one-liner (`make_circles`) but are not in `make_distribution` today.
 
-All three are one-liners to generate with scikit-learn (`make_swiss_roll`, `make_blobs`, `make_circles`).
+The implemented shapes are one-liners over scikit-learn / numpy: `make_swiss_roll` (swiss roll), `make_blobs` (mixture), `make_moons` (two moons), plus a hand-written spiral. `gaussian` is a plain isotropic Gaussian. Only `gaussian` and `mixture` accept any dimension ≥ 1; `two_moons`/`spiral` are 2D-only and `swiss_roll` is 3D-only.
 
 ### Why 2D toy data matters
 
@@ -207,12 +209,12 @@ However, within **Axis 2** (varying the reverse sampler), no retraining is neede
 | Changing the forward SDE (Axis 1) | **Yes** — one full training run per SDE variant | Different forward SDE → different $p_t(x)$ → different score target |
 | Changing the reverse sampler (Axis 2) | **No** — swap the sampling loop only | All samplers use the same learned score $s_\theta(x,t)$ |
 
-**Training time estimates:**
+**Training time estimates** (Phase 2 figures are aspirational — only a small 32×32 overfit test has actually run):
 
-| Phase | Dataset | Network | Time per run | Total (4 SDEs) |
+| Phase | Dataset | Network | Time per run | Total (3 SDEs) |
 |---|---|---|---|---|
-| Phase 1 | 2D toy data | MLP | ~2–5 minutes (CPU) | ~10–20 minutes |
-| Phase 2 | CIFAR-10 / FashionMNIST | U-Net | ~12–20 hours (RTX 3060) | ~2–4 days |
+| Phase 1 | 2D toy data | MLP | ~2–5 minutes (CPU) | ~6–15 minutes |
+| Phase 2 | images (dataset TBD; cats so far) | U-Net | ~12–20 hours (RTX 3060), *estimate* | ~1.5–3 days |
 
 ---
 
@@ -343,7 +345,7 @@ The poster gets the 2D trajectory visualizations and a FID heatmap; the monograp
 | Week | Milestone |
 |---|---|
 | 1–2 | Build the MLP, training loop, and VP-SDE forward/reverse pipeline for 2D data. Get end-to-end generation working on Swiss roll. |
-| 3–4 | Add VE-SDE, sub-VP variants. Implement all four samplers. Run the full 4×3 matrix on all three 2D datasets. Produce score-field and trajectory visualizations. |
+| 3–4 | Add VE-SDE, sub-VP variants. Implement all four samplers. Run the full 3×4 matrix on the 2D datasets. Produce score-field and trajectory visualizations. |
 | 5 | Build the `ScoreUNet` and train VP-SDE on CIFAR-10 or FashionMNIST. Verify image generation works. |
 | 6 | Train VE-SDE and sub-VP on images. Run sampler ablation. Compute FID/IS. |
 | 7–8 | Write monograph and design poster. Buffer for re-runs or debugging. |
