@@ -38,7 +38,7 @@ import pathlib
 from collections.abc import Iterator
 from dataclasses import dataclass, fields
 
-from ..data_generation import infinite_bare, make_distribution
+from ..data_generation import infinite_bare, infinite_batches, make_distribution
 from ..models import EpsilonScoreWrapper, ScoreModel, make_model
 from ..sde import ForwardSDE, make_sde
 from .trainer import TrainConfig
@@ -49,7 +49,7 @@ _DEFAULT_N_SAMPLES = 4000
 _DEFAULT_BATCH_SIZE = 256
 
 # Valores válidos del discriminador ``data.kind`` (fuente de datos). ``points`` es el default
-# retrocompatible; ``images`` se cablea en tareas posteriores de la feature config-image-training.
+# retrocompatible; ``images`` arma la fuente de imágenes desde ``data:`` (feature config-image-training).
 _VALID_KINDS = ("points", "images")
 
 
@@ -104,22 +104,31 @@ def build_data_source(
     Es el **único dueño** del parseo del bloque ``data:``: :func:`build_run` obtiene su fuente
     a través de este resolver, sin duplicar el parseo. Para puntos arma la distribución de
     juguete y la envuelve en un iterador infinito de tensores crudos; la forma de evento es
-    ``None`` (dato plano, la dimensión la lleva la SDE).
+    ``None`` (dato plano, la dimensión la lleva la SDE). Para imágenes arma la fuente infinita
+    con :func:`~diffusion.data_generation.infinite_batches`, deriva la forma de evento
+    ``(3, image_size, image_size)`` (canales fijos en 3) y la valida **peekeando** el primer
+    batch del iterador real, que devuelve tal cual (ya posicionado tras ese batch).
 
     Args:
         data_raw: El bloque ``data:`` del config (se copia; no se muta el ``dict`` del caller).
             ``kind`` ausente ⇒ ``points``. Para puntos: ``shape``/``name`` (obligatorio),
             ``dim`` (default 2), ``n_samples``/``batch_size`` (defaults de la corrida previa),
-            ``shuffle`` (default True), + params de la forma (p. ej. ``n_components``).
+            ``shuffle`` (default True), + params de la forma (p. ej. ``n_components``). Para
+            imágenes: ``root`` (obligatorio), ``image_size`` (default 64),
+            ``batch_size`` (default de la corrida previa), ``augment``/``crop``/``shuffle``
+            (default True), ``seed`` (default None). Otras claves se rechazan
+            (``infinite_batches`` no filtra por firma).
 
     Returns:
         ``(data, event_shape)``: el iterador infinito de tensores crudos y la forma de evento
         ``(C, H, W)`` para imágenes o ``None`` para puntos.
 
     Raises:
-        ValueError: Si ``kind`` no está reconocido (lista los válidos); o —camino de puntos— si
-            falta ``data.shape``/``data.name``.
-        NotImplementedError: Para ``kind: images`` (se cablea en la Task 1.2 de la feature).
+        ValueError: Si ``kind`` no está reconocido (lista los válidos); —camino de puntos— si
+            falta ``data.shape``/``data.name``; —camino de imágenes— si falta ``data.root``, si
+            quedan claves desconocidas, si la carpeta no existe/está vacía/tiene menos imágenes
+            que ``batch_size`` (propagado desde ``infinite_batches``), o si la forma emitida no
+            coincide con la derivada.
     """
     data_raw = dict(data_raw or {})
     kind = data_raw.pop("kind", "points")
@@ -142,11 +151,45 @@ def build_data_source(
         return data, None  # dato plano: sin forma de evento (la dimensión la lleva la SDE)
 
     if kind == "images":
-        # Seam para la Task 1.2: el camino de imágenes (infinite_batches + forma de evento) se
-        # cablea después. Se levanta explícito para no confundirlo con un kind desconocido.
-        raise NotImplementedError(
-            "config: data.kind 'images' todavía no está implementado (Task 1.2)."
+        # Camino de imágenes: se mapean SOLO los params conocidos de infinite_batches (que NO
+        # filtra kwargs por firma), así que las claves sobrantes se rechazan explícitamente. La
+        # forma de evento se deriva de image_size (canales fijos en 3) y se valida peekeando el
+        # primer batch del iterador REAL, que se devuelve tal cual (ya posicionado tras el batch 1;
+        # inocuo en una fuente infinita reshuffled y evita un segundo escaneo de la carpeta).
+        root = data_raw.pop("root", None)
+        if root is None:
+            raise ValueError("config: falta 'data.root' para kind: images.")
+        image_size = data_raw.pop("image_size", 64)
+        batch_size = data_raw.pop("batch_size", None) or _DEFAULT_BATCH_SIZE
+        augment = data_raw.pop("augment", True)
+        crop = data_raw.pop("crop", True)
+        shuffle = data_raw.pop("shuffle", True)
+        seed = data_raw.pop("seed", None)
+        if data_raw:
+            raise ValueError(
+                f"config: claves desconocidas en data: para kind: images: "
+                f"{sorted(data_raw)}."
+            )
+        data = infinite_batches(
+            root,
+            batch_size,
+            image_size=image_size,
+            augment=augment,
+            crop=crop,
+            shuffle=shuffle,
+            seed=seed,
         )
+        event_shape = (3, image_size, image_size)
+        # Peek de validación sobre el iterador real (infinite_batches fail-fast-ea root
+        # faltante/vacío/pocas imágenes al construirse, así que ese ValueError ya propagó arriba).
+        first = next(data)
+        obtained = tuple(first.shape[1:])
+        if obtained != event_shape:
+            raise ValueError(
+                f"config: la fuente de imágenes emite forma {obtained}, se esperaba "
+                f"{event_shape} (derivada de image_size={image_size}, canales=3)."
+            )
+        return data, event_shape
 
     raise ValueError(
         f"config: data.kind desconocido: {kind!r}. Válidos: {', '.join(_VALID_KINDS)}."

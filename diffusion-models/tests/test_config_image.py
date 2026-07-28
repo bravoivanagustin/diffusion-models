@@ -117,3 +117,83 @@ def test_build_data_source_no_muta_dict_del_caller():
     snapshot = dict(raw)
     build_data_source(raw)
     assert raw == snapshot
+
+
+# ------------------------------------------------------------------- imágenes
+
+# La fuente de imágenes necesita torchvision (transforms + ImageFolder-like).
+torchvision = pytest.importorskip("torchvision")
+Image = pytest.importorskip("PIL.Image")
+
+import diffusion.training.config as config_module  # noqa: E402
+
+
+@pytest.fixture
+def carpeta_imagenes(tmp_path):
+    """Carpeta temporal con un puñado de imágenes RGB chicas (count ≥ batch_size)."""
+    for i in range(8):
+        Image.new("RGB", (32, 32), color=(i * 20, 40, 200 - i * 10)).save(
+            tmp_path / f"x{i}.png"
+        )
+    return tmp_path
+
+
+def test_build_data_source_imagenes_happy_path(carpeta_imagenes):
+    """``kind: images`` arma la fuente y deriva ``(3, image_size, image_size)`` (1.3, 2.1, 3.1).
+
+    El iterador devuelto yield-ea un tensor ``(B, 3, image_size, image_size)`` float32; la forma
+    de evento fija los canales en 3.
+    """
+    data, event_shape = build_data_source(
+        {"kind": "images", "root": str(carpeta_imagenes), "image_size": 16, "batch_size": 4}
+    )
+
+    assert event_shape == (3, 16, 16)
+    batch = next(data)
+    assert isinstance(batch, torch.Tensor)
+    assert batch.shape == (4, 3, 16, 16)
+    assert batch.dtype == torch.float32
+
+
+def test_build_data_source_imagenes_falta_root_es_value_error():
+    """Sin ``root`` el resolver falla con ``ValueError`` claro (2.3)."""
+    with pytest.raises(ValueError, match="root"):
+        build_data_source({"kind": "images"})
+
+
+def test_build_data_source_imagenes_root_inexistente_propaga_value_error(tmp_path):
+    """Un ``root`` inexistente propaga el ``ValueError`` de ``infinite_batches`` (2.3)."""
+    inexistente = tmp_path / "no_existe"
+    with pytest.raises(ValueError):
+        build_data_source({"kind": "images", "root": str(inexistente), "batch_size": 2})
+
+
+def test_build_data_source_imagenes_clave_desconocida_es_value_error(carpeta_imagenes):
+    """Una clave no mapeada en ``data:`` para imágenes falla enumerándola (rechazo de unknowns)."""
+    with pytest.raises(ValueError, match="bogus") as exc:
+        build_data_source(
+            {"kind": "images", "root": str(carpeta_imagenes), "batch_size": 4, "bogus": 1}
+        )
+
+    assert "desconocida" in str(exc.value).lower()
+
+
+def test_build_data_source_imagenes_forma_inesperada_es_value_error(
+    carpeta_imagenes, monkeypatch
+):
+    """Si la fuente emite una forma distinta de la derivada, el peek levanta ``ValueError`` (3.2).
+
+    La fuente real siempre coacciona al tamaño pedido, así que para ejercitar genuinamente el
+    guard del peek se falsea ``infinite_batches`` con una que yield-ea la forma equivocada.
+    """
+
+    def fake_infinite_batches(root, batch_size, **kwargs):
+        while True:
+            yield torch.zeros(batch_size, 3, 8, 8)  # 8x8 ≠ image_size=16 pedido
+
+    monkeypatch.setattr(config_module, "infinite_batches", fake_infinite_batches)
+
+    with pytest.raises(ValueError, match="emite forma|esperaba"):
+        build_data_source(
+            {"kind": "images", "root": str(carpeta_imagenes), "image_size": 16, "batch_size": 4}
+        )
