@@ -1363,3 +1363,289 @@ def test_generate_from_checkpoint_rechaza_parametrizacion_desconocida(tmp_path):
 
     with pytest.raises(ValueError, match="otra"):
         generate_from_checkpoint(path, "euler", n_samples=4, n_steps=3, seed=0)
+
+
+# ------------- ema-weights: la sombra EMA como pieza aislada (task 1)
+
+from diffusion.training import EmaShadow  # noqa: E402  (sección append-only, task 1)
+
+
+class _EmaToyModule(torch.nn.Module):
+    """Módulo mínimo para ejercitar la matemática de la sombra sin optimizador.
+
+    Un único parámetro entrenable (``w``, que el test pisa a mano paso a paso para simular la
+    trayectoria de Adam) y un buffer constante (``denom``, que imita el del embedding
+    sinusoidal): así se puede verificar de una vez la fórmula del EMA sobre los parámetros y la
+    política de buffers (copiados del módulo vivo al publicar).
+    """
+
+    def __init__(self, w0: torch.Tensor) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(w0.clone())
+        self.register_buffer("denom", torch.tensor([2.0, 4.0]))
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:  # noqa: ARG002
+        return self.w.sum() * x
+
+
+def _replica_ema(theta0: torch.Tensor, thetas: list[torch.Tensor], decay: float) -> torch.Tensor:
+    """Réplica cerrada e independiente de la sombra (misma convención de contador).
+
+    ``ema_0 = θ_0`` (los pesos con los que se construyó la sombra) y, para cada paso completado
+    ``s = 1, 2, …`` (1-indexado), ``ema_s = d_s·ema_{s−1} + (1−d_s)·θ_s`` con la rampa de warmup
+    ``d_s = min(d, (1+s)/(10+s))`` — la convención fijada en `research.md` ("Ponderación y warmup").
+    """
+    ema = theta0.clone()
+    for s, theta in enumerate(thetas, start=1):
+        d = min(decay, (1.0 + s) / (10.0 + s))
+        ema = d * ema + (1.0 - d) * theta
+    return ema
+
+
+def _corrida_sintetica(net: _EmaToyModule, shadow: EmaShadow, thetas: list[torch.Tensor]) -> None:
+    """Simula la corrida: pisa el parámetro con cada ``θ_s`` y actualiza la sombra (1-indexado)."""
+    for s, theta in enumerate(thetas, start=1):
+        with torch.no_grad():
+            net.w.copy_(theta)
+        shadow.update(s)
+
+
+def _thetas(n: int, seed: int, dim: int = 3) -> list[torch.Tensor]:
+    g = torch.Generator().manual_seed(seed)
+    return [torch.randn(dim, generator=g) for _ in range(n)]
+
+
+def test_ema_shadow_matematica_replica_cerrada_en_warmup():
+    """La sombra iguala la réplica cerrada mientras la rampa de warmup manda (1.3).
+
+    Con ``d = 0.999`` y 6 pasos, ``(1+s)/(10+s) ≤ 7/16 = 0.4375 < d``: **todos** los pasos usan
+    el peso de la rampa, nunca el decay configurado. La comparación es contra una réplica
+    aritmética independiente (no contra la propia implementación) con tolerancia ajustada de
+    forma cerrada en float32.
+    """
+    theta0 = torch.tensor([0.5, -1.0, 2.0])
+    net = _EmaToyModule(theta0)
+    shadow = EmaShadow(net, decay=0.999)
+    thetas = _thetas(6, seed=11)
+
+    _corrida_sintetica(net, shadow, thetas)
+
+    esperado = _replica_ema(theta0, thetas, 0.999)
+    assert torch.allclose(shadow.state_dict()["w"], esperado, rtol=0, atol=1e-6)
+    # Sentinela: la sombra promedia de verdad (ni la última foto ni la inicial).
+    assert not torch.allclose(esperado, thetas[-1], atol=1e-3)
+    assert not torch.allclose(esperado, theta0, atol=1e-3)
+
+
+def test_ema_shadow_matematica_replica_cerrada_cruza_el_warmup():
+    """La sombra iguala la réplica cerrada cruzando warmup → régimen estacionario (1.3).
+
+    Con ``d = 0.5`` la rampa alcanza el decay configurado en ``(1+s)/(10+s) = 0.5 ⇒ s = 8``: en
+    12 pasos los primeros 7 usan la rampa (peso < 0.5) y del 8º en adelante manda ``d`` fijo. El
+    decay chico es deliberado (distingue los dos regímenes en pocos pasos). Además se verifica
+    que la rampa **está aplicada**: una réplica con ``d`` constante (sin warmup) da otro valor.
+    """
+    theta0 = torch.tensor([1.0, 0.0, -0.5])
+    net = _EmaToyModule(theta0)
+    shadow = EmaShadow(net, decay=0.5)
+    thetas = _thetas(12, seed=5)
+
+    # Los dos regímenes quedan efectivamente ejercitados por esta secuencia.
+    assert (1.0 + 7) / (10.0 + 7) < 0.5  # paso 7: manda la rampa
+    assert (1.0 + 8) / (10.0 + 8) == 0.5  # paso 8: la rampa toca el decay configurado
+
+    _corrida_sintetica(net, shadow, thetas)
+
+    esperado = _replica_ema(theta0, thetas, 0.5)
+    assert torch.allclose(shadow.state_dict()["w"], esperado, rtol=0, atol=1e-6)
+
+    sin_warmup = theta0.clone()
+    for theta in thetas:
+        sin_warmup = 0.5 * sin_warmup + 0.5 * theta
+    assert not torch.allclose(esperado, sin_warmup, atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "bad", [0.0, 1.0, -0.5, 1.5, float("inf"), float("-inf"), float("nan")]
+)
+def test_ema_shadow_rechaza_decay_invalido(bad):
+    """Decay no finito o fuera del intervalo abierto (0, 1) ⇒ ``ValueError`` con el valor (1.6).
+
+    Fail-fast en construcción, antes de tocar la trayectoria de entrenamiento; el mensaje debe
+    incluir el valor recibido (mismo criterio que la validación de ``t_eps`` del time sampler).
+    """
+    net = _EmaToyModule(torch.zeros(3))
+    with pytest.raises(ValueError) as exc:
+        EmaShadow(net, decay=bad)
+    assert str(bad) in str(exc.value)
+
+
+@pytest.mark.parametrize("ok", [1e-8, 0.5, 0.999, 1 - 1e-8])
+def test_ema_shadow_acepta_decay_valido(ok):
+    """Cualquier decay finito en el intervalo abierto (0, 1) se acepta (1.6, borde permitido)."""
+    net = _EmaToyModule(torch.zeros(3))
+    assert EmaShadow(net, decay=ok).decay == pytest.approx(ok)
+
+
+@pytest.mark.parametrize("bad_step", [0, -1, -10])
+def test_ema_shadow_rechaza_step_invalido(bad_step):
+    """``update`` exige el contador 1-indexado de pasos completados (precondición ``step >= 1``)."""
+    net = _EmaToyModule(torch.zeros(3))
+    shadow = EmaShadow(net, decay=0.9)
+    with pytest.raises(ValueError) as exc:
+        shadow.update(bad_step)
+    assert str(bad_step) in str(exc.value)
+
+
+def _modulos_para_agnosticismo() -> dict[str, torch.nn.Module]:
+    """Tres módulos de forma distinta para probar la agnosticismo de la sombra (1.5)."""
+    sde = make_sde("vp")
+    return {
+        "mlp": ScoreMLP(data_dim=2, embed_dim=16, hidden_dim=32, num_blocks=1),
+        "dummy": _DummyScoreNet(),
+        "wrapper": EpsilonScoreWrapper(
+            ScoreMLP(data_dim=2, embed_dim=16, hidden_dim=32, num_blocks=1),
+            lambda x, t: sde.marginal_prob(x, t)[1],
+        ),
+    }
+
+
+@pytest.mark.parametrize("clave", ["mlp", "dummy", "wrapper"])
+def test_ema_shadow_claves_iguales_a_las_del_modulo(clave):
+    """Las claves de ``state_dict()`` == las del ``state_dict`` del módulo, sea cual sea la red (1.5).
+
+    Invariante de compatibilidad: lo que publica la sombra se carga en la red reconstruida con
+    ``load_state_dict(strict=True)``. Se cubren tres formas de módulo sin ramificar por tipo:
+    el ``ScoreMLP`` (parámetros + buffer del embedding), una red mínima de un solo parámetro y
+    el :class:`EpsilonScoreWrapper` — cuyo ``state_dict`` delega al interno, así que las claves
+    de la sombra son **de red pelada** (sin prefijo ``_net.``), lo que hace componer EMA con la
+    parametrización ε sin traducción de claves.
+    """
+    net = _modulos_para_agnosticismo()[clave]
+    shadow = EmaShadow(net, decay=0.9)
+    shadow.update(1)
+
+    foto = shadow.state_dict()
+    assert set(foto) == set(net.state_dict())
+    if clave == "wrapper":
+        assert not any(k.startswith("_net.") for k in foto)  # claves de red pelada
+    net.load_state_dict(foto)  # strict=True: encaja sin faltantes ni sobrantes
+
+
+def test_ema_shadow_publica_parametros_ema_y_buffers_del_modulo_vivo():
+    """``state_dict()`` = parámetros EMA + buffers copiados del módulo vivo (decisión de research)."""
+    theta0 = torch.tensor([0.5, -1.0, 2.0])
+    net = _EmaToyModule(theta0)
+    shadow = EmaShadow(net, decay=0.9)
+    _corrida_sintetica(net, shadow, _thetas(4, seed=3))
+
+    with torch.no_grad():  # el buffer del vivo cambia ⇒ la foto lo refleja tal cual
+        net.denom.copy_(torch.tensor([7.0, 9.0]))
+
+    foto = shadow.state_dict()
+    assert torch.equal(foto["denom"], net.denom)  # buffer: copia del vivo, no promediado
+    assert not torch.equal(foto["w"], net.w.detach())  # parámetro: EMA, ≠ pesos crudos
+
+
+def test_ema_shadow_state_dict_devuelve_clones():
+    """La foto es un clon estable: ni la sombra ni el llamador se pisan entre sí.
+
+    Postcondición del diseño (fotos estables para snapshots/checkpoints): actualizar la sombra
+    después de tomar la foto no cambia la foto, y mutar la foto no cambia la sombra.
+    """
+    net = _EmaToyModule(torch.zeros(3))
+    shadow = EmaShadow(net, decay=0.9)
+    _corrida_sintetica(net, shadow, _thetas(3, seed=1))
+
+    foto = shadow.state_dict()
+    congelada = {k: v.clone() for k, v in foto.items()}
+
+    _corrida_sintetica(net, shadow, _thetas(3, seed=2))  # la sombra sigue moviéndose
+    assert all(torch.equal(foto[k], congelada[k]) for k in foto)
+    assert not torch.equal(shadow.state_dict()["w"], foto["w"])
+
+    antes = shadow.state_dict()["w"].clone()
+    foto["w"].add_(100.0)  # mutar la foto no toca la sombra
+    assert torch.equal(shadow.state_dict()["w"], antes)
+
+
+def test_ema_shadow_es_pasiva_y_no_consume_rng():
+    """La sombra observa: no escribe en el módulo ni consume RNG (1.4, 1.5).
+
+    Invariante de pasividad a nivel de la pieza: tras construir, actualizar y publicar, los
+    parámetros y buffers del módulo quedan **exactamente** como los dejó el "optimizador", y el
+    estado del RNG global de torch no se movió (la actualización es aritmética determinística).
+    """
+    net = _EmaToyModule(torch.tensor([0.5, -1.0, 2.0]))
+    thetas = _thetas(4, seed=8)
+
+    torch.manual_seed(123)
+    rng_antes = torch.get_rng_state()
+    shadow = EmaShadow(net, decay=0.9)
+    _corrida_sintetica(net, shadow, thetas)
+    shadow.state_dict()
+
+    assert torch.equal(net.w.detach(), thetas[-1])  # el módulo quedó donde lo dejó el paso
+    assert torch.equal(net.denom, torch.tensor([2.0, 4.0]))
+    assert torch.equal(torch.get_rng_state(), rng_antes)  # sin RNG
+
+
+def test_ema_shadow_determinista_ante_la_misma_secuencia():
+    """Misma secuencia de pesos ⇒ misma sombra, bit a bit (1.5: determinismo por seed)."""
+    theta0 = torch.tensor([0.25, 0.5, -0.75])
+    thetas = _thetas(7, seed=4)
+
+    fotos = []
+    for _ in range(2):
+        net = _EmaToyModule(theta0)
+        shadow = EmaShadow(net, decay=0.99)
+        _corrida_sintetica(net, shadow, thetas)
+        fotos.append(shadow.state_dict()["w"])
+    assert torch.equal(fotos[0], fotos[1])
+
+
+def test_ema_shadow_load_state_reanuda_la_sombra():
+    """``load_state`` restaura la sombra: interrumpir y reanudar == corrida seguida (1.3, R3).
+
+    Sombra A corre 9 pasos. Sombra B arranca de cero, corre 4, se le carga la foto de A al paso
+    4 (como haría el resume desde el sidecar) y sigue los 5 pasos restantes con el mismo
+    contador global: el resultado es idéntico bit a bit al de A.
+    """
+    theta0 = torch.tensor([1.5, -0.5, 0.25])
+    thetas = _thetas(9, seed=2)
+
+    net_a = _EmaToyModule(theta0)
+    shadow_a = EmaShadow(net_a, decay=0.95)
+    fotos_a = []
+    for s, theta in enumerate(thetas, start=1):
+        with torch.no_grad():
+            net_a.w.copy_(theta)
+        shadow_a.update(s)
+        fotos_a.append(shadow_a.state_dict())
+
+    net_b = _EmaToyModule(theta0)
+    shadow_b = EmaShadow(net_b, decay=0.95)
+    for s, theta in enumerate(thetas[:4], start=1):
+        with torch.no_grad():
+            net_b.w.copy_(theta)
+        shadow_b.update(s)
+    shadow_b.load_state(fotos_a[3])  # restauración desde la foto del paso 4
+    for s, theta in enumerate(thetas[4:], start=5):
+        with torch.no_grad():
+            net_b.w.copy_(theta)
+        shadow_b.update(s)
+
+    assert torch.equal(shadow_b.state_dict()["w"], shadow_a.state_dict()["w"])
+
+
+def test_ema_shadow_load_state_rechaza_foto_incompleta():
+    """Una foto sin las claves de la sombra se rechaza con ``ValueError`` que las nombra.
+
+    Nunca continuar con una sombra a medias en silencio (mismo criterio fail-fast del resto del
+    módulo).
+    """
+    net = _EmaToyModule(torch.zeros(3))
+    shadow = EmaShadow(net, decay=0.9)
+    with pytest.raises(ValueError) as exc:
+        shadow.load_state({"denom": torch.tensor([2.0, 4.0])})
+    assert "w" in str(exc.value)

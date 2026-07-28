@@ -30,6 +30,7 @@ Uso típico (config-driven, una celda del estudio por archivo)::
 from __future__ import annotations
 
 from .config import RunSpec, build_run, load_config
+from .ema import EmaShadow
 from .losses import dsm_loss, sample_timesteps
 from .time_sampling import (
     LogUniformTimeSampler,
@@ -66,6 +67,7 @@ __all__ = [
     "LogUniformTimeSampler",
     "make_time_sampler",
     "available_time_samplers",
+    "EmaShadow",
     "TrainConfig",
     "TrainResult",
     "train",
