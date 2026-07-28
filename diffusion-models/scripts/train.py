@@ -12,8 +12,10 @@ Ejemplos (correr desde ``diffusion-models/``)::
 Guarda los pesos entrenados (``.pt`` con ``state_dict`` + metadata) y una curva de pérdida
 (``.png``) en las rutas de la sección ``out`` del config (relativas al cwd). Con
 ``train.checkpoint_every > 0`` (o ``--checkpoint-every``) guarda además, junto al checkpoint
-final, un snapshot periódico ``…_stepNNNNN.pt`` cada N pasos y un ``…_best.pt`` con la menor
-pérdida vista.
+final, un snapshot periódico ``…_stepNNNNN.pt`` cada N pasos (con su sidecar de resume). El
+``…_best.pt`` que se guardaba antes **ya no se emite** (retirado el 27/07/2026, R2.6 de
+``ema-weights``: elegir un checkpoint por la pérdida cruda per-step es ruidoso y correlaciona mal
+con la calidad de las muestras — el problema que resuelve el EMA).
 
 Con ``train.ema_decay`` configurado los checkpoints publican la **sombra EMA** de los pesos (ver
 :func:`diffusion.training.save_checkpoint`) y el guardado final escribe además el **hermano de
@@ -137,8 +139,8 @@ def main(argv=None) -> int:
         return 0
 
     # --- Callback de checkpointing intermedio + advertencias sobre puntos de reanudación ---
-    # El callback deriva rutas hermanas (…_stepNNNNN.pt / …_best.pt) del checkpoint final y
-    # persiste AMBOS artefactos: los pesos (save_checkpoint) y el sidecar de resume
+    # El callback deriva la ruta hermana (…_stepNNNNN.pt, el único tag que emite el loop) del
+    # checkpoint final y persiste AMBOS artefactos: los pesos (save_checkpoint) y el sidecar de resume
     # (save_resume_state), así una interrupción deja un punto reanudable (1.1). train() sigue sin
     # tocar el filesystem: decide *cuándo*; esto decide *dónde/cómo*.
     on_checkpoint = None

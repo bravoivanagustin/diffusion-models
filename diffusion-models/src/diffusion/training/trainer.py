@@ -53,9 +53,9 @@ class TrainConfig:
     device: str = "cpu"
     log_every: int = 0  # 0 = silencioso; N = imprime (media móvil) cada N pasos. Solo consola.
     # Checkpointing intermedio: 0 = solo el checkpoint final (comportamiento por defecto, sin
-    # regresión); N>0 = además, snapshot cada N pasos y un checkpoint "best" (menor pérdida
-    # vista). El *cómo/dónde* persistir lo decide el callback ``on_checkpoint`` de :func:`train`
-    # (el loop no toca el filesystem); sin ese callback este campo no hace nada.
+    # regresión); N>0 = además, un snapshot periódico cada N pasos. El *cómo/dónde* persistir lo
+    # decide el callback ``on_checkpoint`` de :func:`train` (el loop no toca el filesystem); sin
+    # ese callback este campo no hace nada.
     checkpoint_every: int = 0
     # Distribución de muestreo de t del loop (ver :mod:`diffusion.training.time_sampling`):
     # "uniform" = el default retrocompatible (misma secuencia por seed que antes del campo);
@@ -167,14 +167,22 @@ def train(
             crea si hace falta el objeto pero su estado se **restaura** desde el ``ResumeState``
             (no se re-siembra).
         on_checkpoint: Callback **opcional** de checkpointing intermedio. Se invoca con
-            ``(tag, snapshot)`` donde ``tag`` es ``"step{N:05d}"`` (snapshot periódico cada
-            ``config.checkpoint_every`` pasos) o ``"best"`` (nueva pérdida mínima de intervalo),
-            y ``snapshot`` es un :class:`TrainSnapshot` — el :class:`TrainResult` con la red en
+            ``(tag, snapshot)`` donde ``tag`` es siempre ``"step{N:05d}"`` (snapshot **periódico**
+            cada ``config.checkpoint_every`` pasos: es la única cadencia que emite el loop) y
+            ``snapshot`` es un :class:`TrainSnapshot` — el :class:`TrainResult` con la red en
             ese punto **más** el :class:`ResumeState` (optimizador + paso + azar + history) para
             poder reanudar. El loop decide **cuándo** llamar; el callback decide **cómo/dónde**
             persistir — ``train`` no toca el filesystem. Sin este callback (o con
             ``checkpoint_every=0``) solo se entrena; el checkpoint final lo guarda el caller con
             :func:`save_checkpoint`.
+
+            Hubo además un tag ``"best"`` (mínimo de una media de ventana de la pérdida)
+            **retirado** el 27/07/2026 por decisión del autor (R2.6): seleccionar un checkpoint por
+            la pérdida cruda per-step es ruidoso —el ``t`` de cada paso es aleatorio— y correlaciona
+            mal con la calidad de las muestras, que es exactamente el problema que resuelve la
+            sombra EMA; el mecanismo nunca se usó para ninguna decisión del estudio. Los
+            ``X_best.pt`` que quedaron en disco siguen tolerados (excluidos) por
+            :func:`diffusion.training.discover_snapshots`.
         resume: Estado de resume **opcional**. Si es ``None`` (default) el loop entrena desde
             cero (sin regresión). Si se provee, restaura el optimizador (``load_state_dict``) y el
             azar (``torch.set_rng_state`` + ``generator.set_state``) **sin re-sembrar**, arranca
@@ -242,16 +250,13 @@ def train(
         start_step = resume.start_step
         history = list(resume.history)  # continuar la curva previa (2.3)
 
-    # ``history`` guarda la pérdida de CADA paso (serie completa, la fuente de verdad). ``log_every``
-    # gobierna solo el print de consola, desacoplado. Para el "best" se usa una cadencia interna
-    # propia (media de ventana suavizada), también desacoplada de ``log_every``.
-    eval_every = max(1, config.num_steps // 100)
+    # ``history`` guarda la pérdida de CADA paso (serie completa, la fuente de verdad).
+    # ``log_every`` gobierna solo el print de consola, desacoplado.
 
     # Checkpointing intermedio (opt-in): activo solo si el caller inyecta un callback y
-    # ``checkpoint_every > 0``. El loop decide *cuándo* (cadencia periódica + best por pérdida);
-    # el callback decide *cómo/dónde* persistir — ``train`` no toca el filesystem.
+    # ``checkpoint_every > 0``. El loop decide *cuándo* (una única cadencia periódica); el callback
+    # decide *cómo/dónde* persistir — ``train`` no toca el filesystem.
     do_checkpoints = on_checkpoint is not None and config.checkpoint_every > 0
-    best_loss = float("inf")
 
     def _result() -> TrainResult:
         # Foto del TrainResult actual (pesos vía la red viva + copia del history + foto de la
@@ -315,15 +320,6 @@ def train(
         # caller, así que se excluye acá.
         if do_checkpoints and not is_last and (step + 1) % config.checkpoint_every == 0:
             on_checkpoint(f"step{step + 1:05d}", _snapshot(step + 1))
-
-        # Best-so-far sobre una media de ventana (suavizada; la pérdida de un paso suelto es muy
-        # ruidosa por el t aleatorio), a una cadencia interna desacoplada de log_every/history.
-        if do_checkpoints and ((step + 1) % eval_every == 0 or is_last):
-            window = history[-eval_every:]
-            window_mean = sum(window) / len(window)
-            if window_mean < best_loss:
-                best_loss = window_mean
-                on_checkpoint("best", _snapshot(step + 1))
 
         # Print de progreso (solo consola, desacoplado del history): media móvil de los últimos
         # log_every pasos, más legible que un paso suelto.

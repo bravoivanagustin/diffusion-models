@@ -366,12 +366,18 @@ def test_train_sin_checkpoint_every_no_llama_callback():
     assert result.history
 
 
-def test_train_checkpoint_every_emite_periodicos_y_best():
-    """Con ``checkpoint_every=N`` el loop emite snapshots periódicos y al menos un "best".
+def test_train_checkpoint_every_emite_solo_periodicos():
+    """Con ``checkpoint_every=N`` el loop emite **solo** snapshots periódicos (ningún "best").
 
     Los tags periódicos son ``step{N:05d}`` en los múltiplos de ``checkpoint_every``, **excluido
     el último paso** (lo cubre el checkpoint final del caller). Con ``num_steps=9`` y
     ``checkpoint_every=3`` se esperan los pasos 3 y 6 (el 9 es el último y se omite).
+
+    NB (excepción documentada, R6.2 / tarea 2.3 de la spec ``ema-weights``): este test **existía**
+    y exigía el tag ``"best"``; se reescribió para verificar su **ausencia** cuando el mecanismo se
+    retiró (R2.6, decisión del autor 27/07/2026: la selección por pérdida cruda per-step es ruidosa
+    —``t`` aleatorio— y correlaciona mal con calidad de muestras, que es justo la razón de ser del
+    EMA). Es la única excepción a la convención de no modificar tests existentes.
     """
     sde = make_sde("vp")
     dist = make_distribution("gaussian", 2, seed=0)
@@ -386,9 +392,8 @@ def test_train_checkpoint_every_emite_periodicos_y_best():
     )
 
     tags = [tag for tag, _ in calls]
-    periodic = [t for t in tags if t.startswith("step")]
-    assert periodic == ["step00003", "step00006"]  # múltiplos de 3, sin el último (9)
-    assert "best" in tags  # al menos un mínimo de pérdida de intervalo registrado
+    assert tags == ["step00003", "step00006"]  # múltiplos de 3, sin el último (9)
+    assert "best" not in tags  # el mecanismo "best" ya no existe (R2.6)
     # Cada snapshot es un TrainSnapshot cuyo TrainResult apunta a la MISMA red que se entrena.
     assert all(
         isinstance(snap, TrainSnapshot) and snap.result.net is net for _, snap in calls
@@ -397,7 +402,7 @@ def test_train_checkpoint_every_emite_periodicos_y_best():
 
 
 def test_train_checkpoints_intermedios_persisten_y_cargan(tmp_path):
-    """El callback estilo-CLI escribe snapshots hermanos (…_stepNNNNN.pt / …_best.pt) cargables.
+    """El callback estilo-CLI escribe snapshots hermanos (…_stepNNNNN.pt) cargables.
 
     Reproduce el wiring de ``scripts/train.py``: deriva rutas del checkpoint base con
     ``Path.with_stem`` y persiste con ``save_checkpoint``. Verifica que los archivos existen, que
@@ -427,7 +432,7 @@ def test_train_checkpoints_intermedios_persisten_y_cargan(tmp_path):
     step_ckpt = tmp_path / "vp_gaussian_step00002.pt"
     best_ckpt = tmp_path / "vp_gaussian_best.pt"
     assert step_ckpt.exists()  # paso 2 (el 4 es el último: lo omite el periódico)
-    assert best_ckpt.exists()
+    assert not best_ckpt.exists()  # el tag "best" se retiró (R2.6): no hay artefacto que escribir
     assert not (tmp_path / "vp_gaussian_step00004.pt").exists()  # último paso excluido
 
     _, meta = load_checkpoint(step_ckpt)

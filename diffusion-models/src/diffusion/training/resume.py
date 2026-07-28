@@ -6,9 +6,11 @@ checkpoint final del ``.yaml``— si una corrida ya está **completa** (``skip``
 descubre los snapshots intermedios que dejó una corrida previa.
 
 Convención de nombres (la del CLI ``scripts/train.py``): el checkpoint final es ``X.pt`` y sus
-snapshots hermanos son ``X_stepNNNNN.pt`` (periódicos) / ``X_best.pt`` (mejor pérdida); cada
-snapshot periódico lleva además un *sidecar* de resume ``X_stepNNNNN.resume.pt`` (el estado del
-optimizador + paso + azar; ver :mod:`diffusion.training.trainer`).
+snapshots hermanos son ``X_stepNNNNN.pt`` (periódicos); cada snapshot periódico lleva además un
+*sidecar* de resume ``X_stepNNNNN.resume.pt`` (el estado del optimizador + paso + azar; ver
+:mod:`diffusion.training.trainer`). Puede haber también ``X_best.pt`` **legados** en disco: el
+loop dejó de emitir ese tag el 27/07/2026 (R2.6 de ``ema-weights``), pero los archivos que
+quedaron de corridas previas se siguen tolerando (se excluyen del descubrimiento).
 
 La **política de decisión** (``discover_snapshots`` / ``resolve_resume``) solo mira el filesystem por
 **existencia/glob** (no lo muta) y no importa torch. La **carga y validación** del punto elegido
@@ -79,8 +81,10 @@ def discover_snapshots(
 
     Busca en el directorio del checkpoint final los archivos ``{stem}_stepNNNNN.pt`` (donde
     ``stem`` es el nombre del final sin extensión) y parsea el entero del paso. **Excluye** el
-    checkpoint final mismo, el ``{stem}_best.pt`` y los sidecars ``{stem}_stepNNNNN.resume.pt``;
-    y solo considera snapshots del **mismo** ``stem`` (no los de otras corridas del directorio).
+    checkpoint final mismo, los sidecars ``{stem}_stepNNNNN.resume.pt`` y cualquier
+    ``{stem}_best.pt`` **legado** (tolerancia a artefactos de corridas previas: el loop ya no emite
+    ese tag, R2.6); y solo considera snapshots del **mismo** ``stem`` (no los de otras corridas del
+    directorio).
 
     Args:
         final_checkpoint: Ruta del checkpoint final ``X.pt`` de la corrida (puede no existir; se
@@ -96,7 +100,7 @@ def discover_snapshots(
         return []  # no hay dónde buscar
 
     # Ancla al stem del final: ``{stem}_step(\d+)\.pt`` (fullmatch) → no cuela snapshots de otras
-    # corridas del mismo directorio ni el final/best/sidecar.
+    # corridas del mismo directorio, ni el final, ni el sidecar, ni un ``_best.pt`` legado.
     pattern = re.compile(re.escape(final.stem) + r"_step(\d+)\.pt$")
     snaps: list[tuple[int, pathlib.Path]] = []
     for entry in parent.iterdir():
