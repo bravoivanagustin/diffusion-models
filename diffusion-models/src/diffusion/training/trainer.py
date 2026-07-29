@@ -35,6 +35,20 @@ from .losses import dsm_loss
 from .time_sampling import make_time_sampler
 
 
+def _enable_cudnn_autotune(device: torch.device) -> None:
+    """Autotune de kernels convolucionales en GPU (R4.1–4.3).
+
+    Con un device **CUDA** prende ``torch.backends.cudnn.benchmark`` para que cuDNN elija los kernels
+    convolucionales más rápidos para los shapes fijos de la corrida (la arquitectura es la variable de
+    control del estudio: los shapes no cambian entre pasos). Es **auto-on en CUDA**, sin flag de
+    config. En **CPU** no toca **nada** (R4.2): el estado global de autotune queda como estaba, así que
+    el camino CPU —el de la suite de tests— no tiene efecto observable. Solo cambia la **elección de
+    kernels**, no la arquitectura ni el objetivo (R4.3).
+    """
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+
 @dataclass
 class TrainConfig:
     """Hiperparámetros del **loop** de entrenamiento (solo optimización y corrida).
@@ -256,6 +270,9 @@ def train(
             coinciden en el uso del EMA (R3.4). Todos antes de consumir el primer batch.
     """
     device = torch.device(config.device)
+    # Autotune de kernels convolucionales: auto-on en GPU (aprovecha los shapes fijos de la corrida),
+    # sin efecto en CPU (R4.1–4.3). Setup de device, antes de mover la red o consumir data.
+    _enable_cudnn_autotune(device)
     if resume is None:
         # Corrida desde cero: siembra el azar con config.seed (comportamiento histórico).
         if config.seed is not None:
@@ -432,7 +449,10 @@ def train(
     # ``num_steps`` es el TOTAL a alcanzar: se corren solo los pasos restantes (2.2). Si el paso
     # inicial ya lo alcanzó/superó, el rango es vacío y no se ejecuta ningún paso (no-op, 2.4).
     for step in range(start_step, config.num_steps):
-        x0 = next(data_iter).to(device)
+        # Transferencia no bloqueante (R3.3): `non_blocking=True` es INCONDICIONAL — inofensivo sin
+        # memoria fijada y en CPU (torch lo ignora si no aplica); su beneficio real aparece con
+        # `pin_memory=True` + CUDA. `train()` no conoce el `pin_memory` del loader, así que no se gatea.
+        x0 = next(data_iter).to(device, non_blocking=True)
         # Tiempos y pesos por paso: la uniforme devuelve weights=None (camino idéntico al
         # previo); una variante no uniforme devuelve el likelihood ratio y la pérdida lo aplica.
         t, sample_weights = time_sampler.sample(

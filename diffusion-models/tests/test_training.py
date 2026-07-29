@@ -2761,3 +2761,109 @@ def test_train_amp_on_con_ema_publica_pesos_float32(tmp_path):
     save_checkpoint(result, path)
     state_dict, _ = load_checkpoint(path)
     assert all(v.dtype == torch.float32 for v in state_dict.values())
+
+
+# ------------------------- NonBlocking · CudnnSetup: setup de device (tarea 5)
+#
+# Feature `gpu-training-efficiency`, tarea 5: transferencia de batch no bloqueante (R3.3) + autotune
+# de kernels convolucionales en GPU (R4.1–4.3). Es setup/plumbing puro: en CPU no hay cambio
+# observable (el `non_blocking=True` es transparente; `cudnn.benchmark` no se toca), así que la rama
+# CUDA se ejercita SIN GPU con un `torch.device("cuda")` —un descriptor, no requiere hardware— sobre
+# el helper de gate, y la rama CPU se verifica corriendo `train()` real. El estado global
+# `torch.backends.cudnn.benchmark` se salva/restaura alrededor de cada test para no filtrarlo.
+
+from diffusion.training import trainer as _trainer_mod  # noqa: E402
+
+
+@pytest.fixture
+def _cudnn_benchmark_restaurado():
+    """Salva y restaura `torch.backends.cudnn.benchmark` para no filtrar estado global entre tests."""
+    previo = torch.backends.cudnn.benchmark
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = previo
+
+
+def test_enable_cudnn_autotune_prende_benchmark_en_cuda(_cudnn_benchmark_restaurado):
+    """En un device CUDA el helper prende `cudnn.benchmark` (R4.1).
+
+    `torch.device("cuda")` es solo un descriptor (no requiere GPU), así que la rama gateada se
+    ejercita sin hardware. Se parte de `benchmark=False` para probar que el helper lo lleva a True.
+    """
+    torch.backends.cudnn.benchmark = False
+    _trainer_mod._enable_cudnn_autotune(torch.device("cuda"))
+    assert torch.backends.cudnn.benchmark is True
+
+
+def test_enable_cudnn_autotune_no_toca_benchmark_en_cpu(_cudnn_benchmark_restaurado):
+    """En CPU el helper NO toca `cudnn.benchmark` (R4.2): queda con el valor que tenía."""
+    for previo in (True, False):
+        torch.backends.cudnn.benchmark = previo
+        _trainer_mod._enable_cudnn_autotune(torch.device("cpu"))
+        assert torch.backends.cudnn.benchmark is previo
+
+
+def test_train_en_cpu_no_altera_cudnn_benchmark(_cudnn_benchmark_restaurado):
+    """Una corrida real de `train()` en CPU deja `cudnn.benchmark` intacto (R4.2/R4.3).
+
+    Guard de no-regresión del camino CPU: el setup de device no debe tocar el estado global de
+    autotune cuando el device no es CUDA, y el resultado sigue siendo válido (R4.3).
+    """
+    torch.backends.cudnn.benchmark = False
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    dist = make_distribution("gaussian", 2, seed=0)
+    result = train(sde, net, _data(dist), _tiny_config(num_steps=2))
+    assert torch.backends.cudnn.benchmark is False
+    assert len(result.history) == 2  # y el resultado sigue siendo válido (R4.3)
+
+
+class _BatchGrabadora:
+    """Envuelve un batch para registrar los kwargs con que el loop llama a `.to(...)` (R3.3).
+
+    Solo se le pide `.to(...)` (es lo único que el loop invoca sobre el batch crudo). Devuelve un
+    tensor REAL, así que el resto del paso entrena normal y el resultado no se altera.
+    """
+
+    def __init__(self, tensor, registro):
+        self._tensor = tensor
+        self._registro = registro
+
+    def to(self, *args, **kwargs):
+        self._registro.append(kwargs)
+        return self._tensor.to(*args, **kwargs)
+
+
+class _FuenteGrabadora:
+    """Fuente infinita que envuelve cada batch en `_BatchGrabadora` para espiar la transferencia."""
+
+    def __init__(self, base, registro):
+        self._base = iter(base)
+        self._registro = registro
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return _BatchGrabadora(next(self._base), self._registro)
+
+
+def test_train_transfiere_batch_no_bloqueante():
+    """El loop transfiere cada batch con `non_blocking=True` (R3.3).
+
+    Se espía el `.to(...)` del batch crudo: el loop debe pasar `non_blocking=True` (incondicional —
+    inofensivo en CPU). El envoltorio devuelve un tensor real, así que la corrida entrena normal y el
+    resultado no se altera (los tests de reproducibilidad existentes son el guard de no-regresión).
+    """
+    registro: list[dict] = []
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    dist = make_distribution("gaussian", 2, seed=0)
+    fuente = _FuenteGrabadora(_data(dist), registro)
+
+    result = train(sde, net, fuente, _tiny_config(num_steps=3))
+
+    assert len(registro) == 3  # un `.to` por paso
+    assert all(kw.get("non_blocking") is True for kw in registro)
+    assert len(result.history) == 3  # entrena normal: el resultado no se altera
