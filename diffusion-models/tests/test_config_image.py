@@ -437,3 +437,93 @@ def test_smoke_e2e_imagenes_build_run_y_train(carpeta_imagenes):
     # El loop completó los pasos pedidos con pérdidas finitas (no ramifica por tipo de fuente).
     assert len(result.history) == 2
     assert all(torch.isfinite(torch.tensor(loss)) for loss in result.history)
+
+
+# ----------------------------------- smoke end-to-end: gpu-training-efficiency
+
+
+def test_smoke_e2e_imagenes_amp_y_knobs_build_run_train_resume(carpeta_imagenes):
+    """Smoke integral de ``gpu-training-efficiency`` (R5.1/R5.2): config → build_run → train → resume.
+
+    Arma una corrida de IMÁGENES **desde config** con las palancas de la feature activas por el
+    camino de config: precisión mixta (``train.amp: true``) y los knobs de dataloader
+    (``data.num_workers``/``data.pin_memory``, con la fuente REAL — sin espías — para probar que no
+    rompen); ``non_blocking`` (transferencia de batch) y ``cudnn.benchmark`` son incondicionales/auto
+    en el loop, así que quedan ejercitados sin flag. Todo en CPU: el autocast usa bfloat16 y el
+    escalador va en passthrough — se verifica **no-regresión** (el camino completo no rompe), no el
+    speedup (solo observable en GPU). Ejercita el camino de punta a punta: ensamblado por
+    :func:`build_run`, loop de :func:`train` con ``amp=True`` y un ciclo de **reanudación** (snapshot
+    intermedio → restaurar → completar), con el ``scaler_state`` viajando en el snapshot (R2.1).
+    """
+    image_size = 8
+    total, corte = 4, 2
+
+    def _raw():
+        # Config de una celda de imágenes con las tres palancas de la feature activas por config.
+        # U-Net mínima (mismos parámetros que el smoke base): corre forward/backward en CPU en
+        # segundos. ``num_workers=0`` mantiene la carga in-process (estable en Windows CI).
+        return {
+            "sde": {"name": "vp"},
+            "data": {
+                "kind": "images",
+                "root": str(carpeta_imagenes),
+                "image_size": image_size,
+                "batch_size": 4,
+                "augment": False,      # determinístico y más rápido para el smoke
+                "crop": True,
+                "shuffle": False,      # orden fijo de la fuente
+                "num_workers": 0,      # ← knob de carga: proceso principal (estable en CI)
+                "pin_memory": False,   # ← knob de carga: sin memoria fijada (CPU)
+                "seed": 0,
+            },
+            "model": {
+                "name": "unet",
+                "image_size": image_size,
+                "base_channels": 8,
+                "channel_mults": [1, 2],
+                "num_res_blocks": 1,
+                "attn_resolutions": [],
+                "embed_dim": 16,
+                "time_embed_dim": 32,
+                "groups": 4,
+            },
+            "train": {
+                "num_steps": total,
+                "checkpoint_every": corte,  # emite un snapshot intermedio para reanudar
+                "lr": 1e-3,
+                "seed": 0,
+                "device": "cpu",
+                "amp": True,           # ← precisión mixta activada desde la config
+            },
+        }
+
+    # --- config → build_run: la corrida queda cableada como imágenes + U-Net, con AMP en el config. ---
+    spec = build_run(_raw())
+    assert spec.sde.data_dim == (3, image_size, image_size)
+    assert isinstance(spec.model, ScoreUNet)
+    assert spec.config.amp is True  # el nuevo campo llegó al TrainConfig por el validador estricto
+
+    # --- loop con AMP: corre en CPU (autocast bf16 + escalador passthrough) y captura un snapshot. ---
+    frozen: dict = {}
+
+    def _capture(tag, snap):
+        frozen[tag] = snap
+
+    result = train(spec.sde, spec.model, spec.data, spec.config, on_checkpoint=_capture)
+
+    assert len(result.history) == total
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result.history)
+
+    snap = frozen[f"step{corte:05d}"]
+    assert snap.resume.start_step == corte
+    # El estado del escalador AMP viajó en el snapshot (presente aun en CPU: {} ≠ None) (R2.1).
+    assert snap.resume.scaler_state is not None
+
+    # --- resume: red fresca (misma config) con los pesos del corte, reanudada con AMP (R2.2). ---
+    spec_b = build_run(_raw())
+    spec_b.model.load_state_dict(snap.result.net.state_dict())
+    result_b = train(spec_b.sde, spec_b.model, spec_b.data, spec_b.config, resume=snap.resume)
+
+    # La reanudación completó hasta el total sin romper, con la curva previa continuada (R2.2/R2.3).
+    assert len(result_b.history) == total
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result_b.history)
