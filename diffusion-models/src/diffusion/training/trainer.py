@@ -68,6 +68,14 @@ class TrainConfig:
     # exponencial con rampa de warmup que después publican los checkpoints; es lo que samplean las
     # implementaciones de referencia (Song, DDPM, EDM) en lugar de la foto del último paso de Adam.
     ema_decay: float | None = None
+    # Precisión mixta (AMP, ver el núcleo de :func:`train`): ``False`` = **desactivada**, el default
+    # retrocompatible bit a bit (R1.4 — cero ramas nuevas activas, camino de optimización idéntico al
+    # actual). Con ``True`` el forward y la pérdida se computan bajo ``torch.autocast`` y —en GPU— el
+    # gradiente se escala con un ``torch.amp.GradScaler`` para el paso del optimizador; en CPU el
+    # autocast usa bfloat16 y el escalador queda en passthrough (el camino se ejercita igual en los
+    # tests, sin GPU). Es opt-in y **booleano estricto**: un valor no ``bool`` revienta fail-fast en
+    # :func:`train` antes de consumir el primer batch (R1.5).
+    amp: bool = False
 
 
 @dataclass
@@ -227,10 +235,18 @@ def train(
         usado, el nombre de la SDE, su ``data_dim`` y la foto de la sombra EMA en ``ema_state``
         (``None`` si el EMA no está activo).
 
+    Con ``config.amp=True`` activa **precisión mixta** (opt-in, R1.1): el forward y la pérdida se
+    computan bajo ``torch.autocast`` (bfloat16 en CPU) y —en GPU— el gradiente se escala con un
+    ``torch.amp.GradScaler`` para el paso del optimizador, des-escalándolo **antes** del recorte
+    (``grad_clip``) para que este opere sobre la norma real (R1.2). La sombra EMA se actualiza
+    **después** del paso real (igual que sin AMP) y los pesos/sombra viven en float32, así que el
+    checkpoint publica lo mismo y su formato no cambia (R1.3). Con el default (``False``) no se
+    construye escalador y el núcleo de optimización queda **byte-idéntico** al previo (R1.4).
+
     Raises:
-        ValueError: Si ``config.ema_decay`` es inválido (R1.6), si ``config.time_sampling`` no
-            existe, o si al reanudar la config y el sidecar no coinciden en el uso del EMA (R3.4).
-            Todos antes de consumir el primer batch.
+        ValueError: Si ``config.ema_decay`` es inválido (R1.6), si ``config.amp`` no es ``bool``
+            (R1.5), si ``config.time_sampling`` no existe, o si al reanudar la config y el sidecar no
+            coinciden en el uso del EMA (R3.4). Todos antes de consumir el primer batch.
     """
     device = torch.device(config.device)
     if resume is None:
@@ -262,6 +278,25 @@ def train(
     # a la previa (R1.2). La sombra es un observador **pasivo**: lee los pesos después del paso del
     # optimizador, no escribe en la red y no consume RNG (R1.4).
     ema = EmaShadow(net, config.ema_decay) if config.ema_decay is not None else None
+
+    # Precisión mixta (AMP, opt-in, R1.1): fail-fast ante un ``amp`` mal formado —antes de mover más
+    # estado o de consumir data— con el mismo criterio que el time sampler / el decay del EMA (R1.5).
+    # ``bool`` estricto: un ``int`` (incluidos 0/1) o un ``float`` NO son booleanos (``isinstance(1,
+    # bool)`` es ``False``), así que se rechazan en vez de degradar en silencio.
+    if not isinstance(config.amp, bool):
+        raise ValueError(
+            f"config.amp debe ser bool (True/False); recibido {config.amp!r} "
+            f"(tipo {type(config.amp).__name__})."
+        )
+    # Escalador de gradiente CONDICIONAL (calca EMA): se construye SOLO con AMP activo. En CPU el
+    # escalado no aplica (autocast usa bfloat16), así que queda ``enabled=False`` (passthrough) pero
+    # EXISTE para uniformar el camino; en GPU se habilita. Con ``amp=False`` el escalador es ``None`` y
+    # el núcleo de optimización queda byte-idéntico al actual (R1.4).
+    scaler = (
+        torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
+        if config.amp
+        else None
+    )
 
     # Coherencia config ↔ sidecar al reanudar (R3.4). Con EMA el estado de la corrida vive PARTIDO
     # (el checkpoint publica la sombra; los crudos y la sombra van en el sidecar), así que las dos
@@ -365,13 +400,31 @@ def train(
         t, sample_weights = time_sampler.sample(
             x0.shape[0], generator=generator, device=device
         )
-        loss = dsm_loss(net, sde, x0, t, generator=generator, sample_weights=sample_weights)
+        # Forward + pérdida bajo autocast (R1.1): con ``amp=False`` es ``enabled=False``, no-op bit a
+        # bit (R1.4); con ``amp=True`` computa en la precisión reducida del device (bfloat16 en CPU).
+        # El ``backward`` queda FUERA del autocast (contrato de torch.amp).
+        with torch.autocast(device_type=device.type, enabled=config.amp):
+            loss = dsm_loss(
+                net, sde, x0, t, generator=generator, sample_weights=sample_weights
+            )
 
         optimizer.zero_grad()
-        loss.backward()
-        if config.grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
-        optimizer.step()
+        if scaler is None:
+            # Camino sin AMP: exactamente el núcleo previo (R1.4) — byte-idéntico.
+            loss.backward()
+            if config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
+            optimizer.step()
+        else:
+            # Camino con AMP (R1.1): backward sobre la pérdida escalada. El recorte debe operar sobre
+            # la norma REAL del gradiente, así que se DES-ESCALA antes del clip (R1.2); recién después
+            # el escalador da el paso y actualiza su factor.
+            scaler.scale(loss).backward()
+            if config.grad_clip is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
 
         # La sombra se actualiza DESPUÉS del paso del optimizador, con el contador de pasos
         # completados que fija la convención de :class:`EmaShadow` (1-indexado): el ``step`` del

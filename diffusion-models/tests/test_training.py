@@ -2607,3 +2607,157 @@ def test_amp_gradscaler_estado_hace_round_trip():
 
     otro = torch.amp.GradScaler("cpu", enabled=False)
     otro.load_state_dict(estado)  # no debe levantar
+
+
+# --------------------------------------------- AmpLoop: precisión mixta en el loop (tarea 2)
+#
+# Feature `gpu-training-efficiency`, tarea 2 (AmpLoop): el campo opt-in `TrainConfig.amp` y su
+# semántica en el núcleo de `train()` —autocast sobre forward/pérdida, escalador de gradiente
+# condicional, `unscale_` ANTES del recorte, sombra EMA en float32 tras el paso real, fail-fast ante
+# un `amp` mal formado—. Todo verificado en CPU (autocast bf16 + escalador passthrough): la rama on
+# se ejercita sin GPU y la rama off queda byte-idéntica al loop previo (R1.1–R1.5, R5.1–R5.3).
+
+
+def test_trainconfig_amp_default_off():
+    """`TrainConfig()` sin el campo nuevo declara `amp=False` — sin precisión mixta (R1.4, R5.1)."""
+    cfg = TrainConfig()
+    assert cfg.amp is False
+    # El campo es configurable como cualquier otro del dataclass.
+    assert TrainConfig(amp=True).amp is True
+
+
+def test_train_amp_off_bit_identico_al_loop_previo():
+    """Con `amp=False` (default) `train()` es BIT-IDÉNTICO al loop previo (R1.4/R5.1).
+
+    Mismo patrón que el guard del default de EMA/time_sampling: una réplica manual del loop crudo
+    (sin escalador ni autocast) contra `train()` con la config default. Se comparan historia
+    (igualdad EXACTA de floats), pesos finales (`torch.equal`) y el azar consumido (RNG global +
+    estado del generator): si construir el escalador o envolver en autocast tocara el camino off,
+    alguna fallaría. El escalador se construye SOLO con `amp=True`, así que off no gana rama alguna.
+    """
+    sde, net_a, data, cfg = _fresh_ema()  # amp=False, ema off (defaults)
+    g_a = _generador(cfg)
+    res_a = train(sde, net_a, data, cfg, generator=g_a)
+    rng_a = torch.get_rng_state()
+
+    sde, net_b, data, cfg = _fresh_ema()
+    g_b = _generador(cfg)
+    torch.manual_seed(cfg.seed)  # lo que hace train() al arrancar desde cero
+    hist_b, _ = _replica_loop_crudo(sde, net_b, data, cfg, g_b)
+    rng_b = torch.get_rng_state()
+
+    assert res_a.history == hist_b  # igualdad exacta de floats por paso, no aproximada
+    sd_a, sd_b = net_a.state_dict(), net_b.state_dict()
+    assert sd_a.keys() == sd_b.keys()
+    for key in sd_a:
+        assert torch.equal(sd_a[key], sd_b[key]), f"peso final distinto en {key}"
+    assert torch.equal(rng_a, rng_b)  # misma secuencia del RNG global
+    assert torch.equal(g_a.get_state(), g_b.get_state())  # mismo stream del generator
+
+
+def test_train_amp_off_reproducible_por_seed():
+    """Dos corridas `amp=False` con la misma semilla dan la MISMA trayectoria (R1.4)."""
+
+    def run():
+        torch.manual_seed(0)  # pesos iniciales idénticos entre corridas
+        sde = make_sde("vp")
+        net = _small_net(sde)
+        dist = make_distribution("gaussian", 2, seed=1)
+        data = _data(dist, n=256, batch_size=64)
+        return train(sde, net, data, TrainConfig(num_steps=20, seed=7, amp=False)).history
+
+    assert run() == pytest.approx(run())
+
+
+def test_train_amp_on_corre_en_cpu_y_baja_la_perdida():
+    """Con `amp=True` el loop corre en CPU (autocast bf16 + escalador passthrough) y aprende (R1.1/R5.2).
+
+    Se compara la **tendencia** con medias de bloque (primer vs último quinto): la pérdida per-step
+    es ruidosa por el t aleatorio. El punto es que la rama AMP es ejercitable sin GPU y no rompe.
+    """
+    sde = make_sde("vp")
+    dist = make_distribution("mixture", 2, n_components=8, seed=0)
+    torch.manual_seed(0)
+    net = ScoreMLP(data_dim=sde.data_dim, hidden_dim=64, num_blocks=2)
+    data = _data(dist, n=512, batch_size=128)
+    result = train(sde, net, data, TrainConfig(num_steps=240, seed=0, amp=True))
+
+    assert len(result.history) == 240
+    assert all(math.isfinite(v) for v in result.history)
+    hist = result.history
+    k = max(1, len(hist) // 5)
+    assert sum(hist[-k:]) / k < sum(hist[:k]) / k
+
+
+def test_train_amp_on_con_grad_clip_desescala_antes_del_clip(monkeypatch):
+    """Con AMP y `grad_clip`, el `unscale_` ocurre ANTES del recorte y este antes del `step` (R1.2).
+
+    El recorte debe operar sobre la norma REAL del gradiente, así que hay que des-escalar primero.
+    Se instrumenta el escalador (subclase spy sobre el real) y `clip_grad_norm_` para registrar el
+    orden de llamadas del núcleo de optimización; se exige `unscale_` < `clip` < `step`.
+    """
+    orden: list[str] = []
+    _RealScaler = torch.amp.GradScaler
+
+    class _SpyScaler(_RealScaler):
+        def unscale_(self, optimizer):  # noqa: D102
+            orden.append("unscale_")
+            return super().unscale_(optimizer)
+
+        def step(self, optimizer, *args, **kwargs):  # noqa: D102
+            orden.append("step")
+            return super().step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.amp, "GradScaler", _SpyScaler)
+
+    _real_clip = torch.nn.utils.clip_grad_norm_
+
+    def _spy_clip(*args, **kwargs):
+        orden.append("clip")
+        return _real_clip(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _spy_clip)
+
+    sde = make_sde("vp")
+    dist = make_distribution("gaussian", 2, seed=0)
+    net = _small_net(sde)
+    train(sde, net, _data(dist), _tiny_config(num_steps=2, grad_clip=1.0, amp=True))
+
+    assert {"unscale_", "clip", "step"} <= set(orden)
+    assert orden.index("unscale_") < orden.index("clip") < orden.index("step")
+
+
+@pytest.mark.parametrize("bad", ["true", 1, 0, None, 1.0])
+def test_train_rechaza_amp_malformado_antes_de_entrenar(bad):
+    """Un `amp` no booleano revienta con `ValueError` ANTES de consumir data (R1.5/R5.3).
+
+    Mismo criterio fail-fast que `time_sampling`/`ema_decay`: la fuente centinela convierte
+    cualquier consumo prematuro en un `AssertionError` distinto del `ValueError` esperado. Un `int`
+    (incluidos `0`/`1`) o un `float` no son `bool` (`isinstance(1, bool)` es `False`): se rechazan.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    cfg = TrainConfig(num_steps=2, seed=0, amp=bad)
+    with pytest.raises(ValueError):
+        train(sde, net, _DataProhibidaEma(), cfg)
+
+
+def test_train_amp_on_con_ema_publica_pesos_float32(tmp_path):
+    """Con AMP + EMA la sombra y los pesos publicados quedan en float32 (R1.3).
+
+    autocast no cambia el dtype de los parámetros (viven en float32); la sombra los promedia en
+    float32 y el checkpoint publica float32 —mismo formato y contrato de consumo que sin AMP—.
+    """
+    decay = 0.9
+    sde, net, data, cfg = _fresh_ema(ema_decay=decay, amp=True)
+    result = train(sde, net, data, cfg, generator=_generador(cfg))
+
+    assert result.ema_state is not None
+    assert all(v.dtype == torch.float32 for v in result.ema_state.values())
+    # Los pesos crudos de la red también siguen en float32 (autocast no cambia sus dtypes).
+    assert all(v.dtype == torch.float32 for v in net.state_dict().values())
+
+    path = tmp_path / "ckpt_amp_ema.pt"
+    save_checkpoint(result, path)
+    state_dict, _ = load_checkpoint(path)
+    assert all(v.dtype == torch.float32 for v in state_dict.values())
