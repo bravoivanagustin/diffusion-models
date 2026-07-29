@@ -125,6 +125,12 @@ class ResumeState:
             EMA. Es lo que :func:`~diffusion.training.load_resume` devuelve para cargar en la red
             cuando el checkpoint de pesos publica EMA; sin esta clave (sidecar viejo = corrida sin
             EMA) el checkpoint ya trae los crudos y se usa ese.
+        scaler_state: Estado del escalador de gradiente AMP (``GradScaler.state_dict()``) o ``None``
+            sin AMP. Campo **opcional** (calca ``ema_state``): con AMP el loop restaura este estado
+            en su ``GradScaler`` para que la reanudación sea fiel; sin AMP queda en ``None`` y el
+            sidecar no gana ninguna clave (R2.4). En CPU el escalador va deshabilitado, así que su
+            ``state_dict()`` es ``{}`` (un dict **vacío**, no ``None``): "presencia" se decide por
+            ``is None``, no por dict vacío.
     """
 
     optimizer_state: dict
@@ -134,6 +140,7 @@ class ResumeState:
     history: list[float]
     ema_state: dict | None = None
     raw_model_state: dict | None = None
+    scaler_state: dict | None = None
 
 
 @dataclass
@@ -325,6 +332,33 @@ def train(
             # cargados), no el promedio acumulado hasta el paso N.
             ema.load_state(resume.ema_state)
 
+        # Coherencia del ESCALADOR AMP (R2.5), calca los guards de EMA. El escalador existe (no
+        # ``None``) exactamente cuando ``config.amp`` está activo; "presencia" del estado guardado se
+        # decide por ``is None`` (en CPU el escalador va deshabilitado y su ``state_dict()`` es ``{}``,
+        # que cuenta como presente). Las dos combinaciones cruzadas arrancarían de un estado de
+        # precisión inconsistente, así que se fallan las dos antes de restaurar el optimizador.
+        if scaler is not None and resume.scaler_state is None:
+            raise ValueError(
+                "La corrida configuró amp=True pero el punto de reanudación no trae el estado del "
+                "escalador de gradiente: el sidecar de resume del checkpoint elegido no lo "
+                "persistió (¿la corrida original entrenó sin AMP?). No se reanuda con un escalador "
+                "inventado —el factor de escala continuaría desde un valor que no corresponde a la "
+                "corrida—: entrená desde cero o reanudá con la misma configuración de precisión que "
+                "la corrida original."
+            )
+        if scaler is None and resume.scaler_state is not None:
+            raise ValueError(
+                "El punto de reanudación trae el estado del escalador de gradiente en su sidecar de "
+                "resume (la corrida original usaba amp=True) pero esta corrida no configuró amp: "
+                "continuar descartaría el escalador en silencio y la reanudación no sería fiel a la "
+                "corrida original. Declará amp=True como en la corrida original o reanudá desde otro "
+                "punto."
+            )
+        if scaler is not None:
+            # Restaurado, no reconstruido: el escalador recién construido arriba arranca con el
+            # factor de escala inicial, no con el que la corrida ya había ajustado hasta el paso N.
+            scaler.load_state_dict(resume.scaler_state)
+
     data_iter = iter(data)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.lr)
 
@@ -388,6 +422,10 @@ def train(
                     if ema is not None
                     else None
                 ),
+                # Estado del escalador AMP (R2.1): presente exactamente cuando el escalador existe
+                # (AMP activo). En CPU es ``{}`` (deshabilitado) pero se persiste igual —presencia por
+                # ``is None``—; sin AMP queda ``None`` y el sidecar no gana ninguna clave (R2.4).
+                scaler_state=scaler.state_dict() if scaler is not None else None,
             ),
         )
 
@@ -608,6 +646,11 @@ def save_resume_state(
     sin EMA queda idéntico en contenido al de antes de la feature y los sidecars viejos siguen
     siendo válidos (R3.3).
 
+    Con **AMP activo** el sidecar lleva además la clave **opcional** ``scaler_state`` (el estado del
+    ``GradScaler``, para restaurarlo en el loop y que la reanudación sea fiel — R2.1). Igual que las
+    de EMA, se escribe **solo si está**: sin AMP el sidecar no gana ninguna clave y los sidecars
+    previos siguen siendo válidos (R2.4).
+
     Args:
         path: Ruta de salida del sidecar (se crean los directorios intermedios). Convención de
             nombre: ``X_stepNNNNN.resume.pt`` hermano de ``X_stepNNNNN.pt``.
@@ -645,6 +688,10 @@ def save_resume_state(
         blob["raw_model_state"] = resume.raw_model_state
     if resume.ema_state is not None:
         blob["ema_state"] = resume.ema_state
+    # Estado del escalador AMP: presente solo en corridas con AMP (R2.1). Mismo patrón que EMA — el
+    # ``if`` sostiene la retrocompatibilidad por construcción: sin AMP el blob no gana la clave (R2.4).
+    if resume.scaler_state is not None:
+        blob["scaler_state"] = resume.scaler_state
     torch.save(blob, out)
     return out
 
@@ -661,8 +708,9 @@ def load_resume_state(
     Returns:
         ``{optimizer_state, step, torch_rng_state, generator_state}`` (sin ``history``: se toma del
         ``meta`` del checkpoint de pesos al reanudar), más ``raw_model_state`` y ``ema_state`` **si
-        el sidecar los trae** (corrida con EMA, R3.1). Un sidecar anterior a esa feature no tiene
-        esas claves y se lee igual que siempre (R3.3), así que el consumidor las pide con ``get``.
+        el sidecar los trae** (corrida con EMA, R3.1) y ``scaler_state`` **si lo trae** (corrida con
+        AMP, R2.1). Un sidecar anterior a esas features no tiene esas claves y se lee igual que
+        siempre (R3.3/R2.4), así que el consumidor las pide con ``get``.
     """
     # weights_only=False: es nuestro propio archivo (incluye el state_dict del optimizador).
     return torch.load(path, map_location=map_location, weights_only=False)

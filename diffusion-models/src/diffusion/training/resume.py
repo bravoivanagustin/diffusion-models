@@ -294,7 +294,8 @@ def load_resume(
     3. Exige el sidecar hermano (:func:`resume_sidecar_path`); si falta → error claro que lo nombra
        (3.6). Sin él no hay optimizador/paso/azar para reanudar.
     4. Carga el sidecar y arma el :class:`ResumeState` (optimizador + paso + azar del sidecar;
-       ``history`` del ``meta``, 1.3; la sombra EMA del sidecar si está, R3.1).
+       ``history`` del ``meta``, 1.3; la sombra EMA del sidecar si está, R3.1; el estado del
+       escalador AMP del sidecar si está, R2.1).
 
     **Corridas con EMA**: el checkpoint de pesos publica la **sombra** (ver
     :func:`~diffusion.training.save_checkpoint`), así que los pesos con los que hay que *continuar
@@ -364,5 +365,8 @@ def load_resume(
         # La sombra la restaura ``train`` con ``EmaShadow.load_state``; los crudos NO se duplican
         # acá: ya se devuelven como ``state_dict`` para que el caller los cargue en la red.
         ema_state=sc.get("ema_state"),
+        # El escalador AMP lo restaura ``train`` con ``GradScaler.load_state_dict``. Se pide con
+        # ``get``: un sidecar sin AMP (o anterior a la feature) no tiene la clave → ``None`` (R2.4).
+        scaler_state=sc.get("scaler_state"),
     )
     return state_dict, meta, resume

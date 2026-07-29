@@ -1339,3 +1339,195 @@ def test_load_resume_sidecar_viejo_sin_claves_de_ema_como_hoy(tmp_path):
     assert "ema" not in meta
     assert resume.start_step == 5
     assert torch.equal(resume.generator_state, saved.generator_state)
+
+
+# =============================================================================
+# gpu-training-efficiency task 3 — persistencia/restauración del escalador AMP
+# =============================================================================
+#
+# Con AMP activo el loop mantiene un ``GradScaler`` cuyo estado (el *scale factor* y su tracker de
+# crecimiento) debe viajar en el sidecar para que la reanudación sea fiel (R2.1/R2.2). La clave es
+# **opcional** —calca ``ema_state``—: sin AMP el sidecar no gana ninguna clave y los sidecars
+# previos siguen válidos (R2.4). Los dos config↔sidecar incoherentes se rechazan (R2.5). En CPU el
+# escalador va deshabilitado (``state_dict() == {}``), así que "presencia" se decide por ``is None``,
+# no por dict vacío.
+
+#: Claves del sidecar de una corrida CON AMP: las de siempre más la nueva.
+_SIDECAR_KEYS_AMP = SIDECAR_KEYS | {"scaler_state"}
+
+
+def _scaler_state_no_vacio() -> dict:
+    """``state_dict()`` de un ``GradScaler`` HABILITADO (no vacío), para un round-trip real.
+
+    En CPU el loop usa un escalador **deshabilitado** (``state_dict() == {}``); acá se fuerza uno
+    habilitado para que el round-trip pruebe que las claves del escalador (scale + tracker)
+    sobreviven la serialización, igual que ``_net_with_optimizer_state`` fuerza estado en Adam.
+    """
+    return torch.amp.GradScaler("cpu", enabled=True).state_dict()
+
+
+def _data_prohibida_amp():
+    """Fuente que revienta si se la consume: prueba que los guards fallan ANTES de tocar datos."""
+    raise AssertionError("no se debe consumir datos: el guard de AMP falla fail-fast antes")
+    yield  # pragma: no cover  (nunca se alcanza; hace de esto un generador)
+
+
+# ------------------------------------------------- round-trip del sidecar (2.1)
+
+
+def test_sidecar_con_amp_persiste_scaler_state(tmp_path):
+    """Con AMP el sidecar incluye ``scaler_state`` y vuelve por disco intacto (2.1).
+
+    Las claves requeridas no cambian; la clave nueva se suma y round-trippea (el *scale factor* y
+    su tracker se preservan). El ``history`` sigue afuera (1.3).
+    """
+    _, opt = _net_with_optimizer_state()
+    scaler_state = _scaler_state_no_vacio()
+    resume = _resume_state(opt, start_step=5)
+    resume.scaler_state = scaler_state
+
+    path = tmp_path / "vp_gaussian_step00005.resume.pt"
+    save_resume_state(path, resume)
+    loaded = load_resume_state(path)
+
+    assert set(loaded) == _SIDECAR_KEYS_AMP
+    assert "history" not in loaded  # el contrato del sidecar no cambia (1.3)
+    assert loaded["scaler_state"] == scaler_state  # scale + tracker preservados
+
+
+def test_sidecar_sin_amp_no_agrega_scaler_state(tmp_path):
+    """Sin AMP el sidecar es **el de hoy**: ni ``scaler_state`` (2.4).
+
+    La clave nueva se persiste **solo si está**, así que el contenido del sidecar de una corrida
+    sin AMP queda idéntico al de antes de esta feature — retrocompatibilidad por construcción.
+    """
+    _, opt = _net_with_optimizer_state()
+    resume = _resume_state(opt, start_step=2)
+    assert resume.scaler_state is None  # default del dataclass: sin AMP
+
+    path = tmp_path / "sin_amp.resume.pt"
+    save_resume_state(path, resume)
+    loaded = load_resume_state(path)
+
+    assert set(loaded) == SIDECAR_KEYS
+    assert "scaler_state" not in loaded
+
+
+# ----------------------------------- load_resume expone el scaler_state (2.2)
+
+
+def test_load_resume_devuelve_scaler_state_del_sidecar(tmp_path):
+    """El sidecar trae ``scaler_state`` ⇒ ``load_resume`` lo devuelve en el ``ResumeState`` (2.2)."""
+    net, opt = _net_with_optimizer_state()
+    history = [1.0, 0.5, 0.25, 0.2, 0.1]
+    result = TrainResult(net=net, history=list(history), sde_name="vp", data_dim=2)
+    weights = tmp_path / "vp_gaussian_step00005.pt"
+    save_checkpoint(result, weights, model_spec=_MODEL_SPEC)
+
+    scaler_state = _scaler_state_no_vacio()
+    saved = _resume_state(opt, start_step=5, history=history)
+    saved.scaler_state = scaler_state
+    save_resume_state(resume_sidecar_path(weights), saved)
+
+    _sd, _meta, resume = load_resume(
+        weights, expected={"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+    )
+
+    assert resume.scaler_state == scaler_state
+
+
+def test_load_resume_sidecar_sin_scaler_state_es_none(tmp_path):
+    """Sidecar sin la clave (corrida sin AMP / anterior a la feature) ⇒ ``scaler_state is None`` (2.4)."""
+    weights, sidecar, _ = _build_checkpoint_and_sidecar(
+        tmp_path, model_spec=_MODEL_SPEC, start_step=5
+    )
+    assert "scaler_state" not in load_resume_state(sidecar)  # sidecar "viejo"
+
+    _sd, _meta, resume = load_resume(
+        weights, expected={"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+    )
+    assert resume.scaler_state is None
+
+
+# ------------------------------------------------- guards cruzados (2.5)
+
+
+def test_train_con_amp_rechaza_reanudar_sin_scaler_en_el_sidecar():
+    """AMP pedido + sidecar sin escalador ⇒ ``ValueError`` fail-fast antes de entrenar (2.5).
+
+    No se reanuda con un escalador inventado: el punto de reanudación no lo guardó (¿la corrida
+    original corrió sin AMP?). El guard va con el resto del fail-fast (la fuente prohibida convierte
+    cualquier consumo de datos en un ``AssertionError`` distinto del error esperado).
+    """
+    sde = make_sde("vp")
+    _, opt = _net_with_optimizer_state()
+    resume = _resume_state(opt, start_step=5)  # scaler_state None por defecto
+    cfg = TrainConfig(num_steps=8, seed=0, amp=True)
+
+    with pytest.raises(ValueError) as exc:
+        train(sde, _small_net(sde), _data_prohibida_amp(), cfg, resume=resume)
+
+    assert "escalador" in str(exc.value).lower() or "amp" in str(exc.value).lower()
+
+
+def test_train_sin_amp_rechaza_reanudar_con_scaler_en_el_sidecar():
+    """Escalador en el sidecar + AMP no pedido ⇒ ``ValueError`` (2.5, simetría del guard).
+
+    La corrida original usaba AMP; continuar sin AMP descartaría el escalador en silencio. Se falla
+    con el mismo criterio fail-fast.
+    """
+    sde = make_sde("vp")
+    _, opt = _net_with_optimizer_state()
+    resume = _resume_state(opt, start_step=5)
+    resume.scaler_state = _scaler_state_no_vacio()
+    cfg = TrainConfig(num_steps=8, seed=0)  # sin AMP
+
+    with pytest.raises(ValueError) as exc:
+        train(sde, _small_net(sde), _data_prohibida_amp(), cfg, resume=resume)
+
+    assert "escalador" in str(exc.value).lower() or "amp" in str(exc.value).lower()
+
+
+# ------------------------------------------------- fidelidad en CPU (2.3)
+
+
+def test_resume_con_amp_equivalente_a_corrida_ininterrumpida():
+    """Gate de fidelidad (2.3): con AMP activo y orden fijo, reanudar equivale a no interrumpir.
+
+    Mismo montaje que ``test_resume_equivalente_a_corrida_ininterrumpida`` pero con ``amp=True``: el
+    snapshot del paso ``_N`` lleva el ``scaler_state`` (en CPU va deshabilitado ⇒ ``{}``, pero
+    **presente**, no ``None``), y la corrida B —red fresca con los pesos del paso ``_N``, reanudada
+    con AMP— reproduce A: ``history`` idéntico y pesos ``allclose``.
+    """
+    sde = make_sde("vp")
+    batch = _fixed_batch()
+    frozen: dict[str, TrainSnapshot] = {}
+
+    def capture(tag, snap):
+        frozen[tag] = copy.deepcopy(snap)
+
+    net_a = _equiv_net()
+    result_a = train(
+        sde,
+        net_a,
+        _const_source(batch),
+        TrainConfig(num_steps=_TOTAL, checkpoint_every=_N, seed=0, amp=True),
+        on_checkpoint=capture,
+    )
+
+    snap = frozen[f"step{_N:05d}"]
+    assert snap.resume.start_step == _N
+    assert snap.resume.scaler_state is not None  # el escalador viajó en el sidecar (2.1)
+
+    net_b = _equiv_net()
+    net_b.load_state_dict(snap.result.net.state_dict())  # pesos congelados del paso _N
+    result_b = train(
+        sde,
+        net_b,
+        _const_source(batch),  # misma fuente de orden fijo
+        TrainConfig(num_steps=_TOTAL, seed=0, amp=True),
+        resume=snap.resume,
+    )
+
+    assert result_b.history == result_a.history
+    assert _weights_allclose(net_a, net_b)
