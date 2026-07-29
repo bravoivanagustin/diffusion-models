@@ -116,8 +116,9 @@ def build_data_source(
             ``shuffle`` (default True), + params de la forma (p. ej. ``n_components``). Para
             imágenes: ``root`` (obligatorio), ``image_size`` (default 64),
             ``batch_size`` (default de la corrida previa), ``augment``/``crop``/``shuffle``
-            (default True), ``seed`` (default None). Otras claves se rechazan
-            (``infinite_batches`` no filtra por firma).
+            (default True), ``seed`` (default None), ``num_workers`` (default 0: carga en el
+            proceso principal), ``pin_memory`` (default False: sin memoria fijada). Otras claves
+            se rechazan (``infinite_batches`` no filtra por firma).
 
     Returns:
         ``(data, event_shape)``: el iterador infinito de tensores crudos y la forma de evento
@@ -165,6 +166,12 @@ def build_data_source(
         crop = data_raw.pop("crop", True)
         shuffle = data_raw.pop("shuffle", True)
         seed = data_raw.pop("seed", None)
+        # Knobs de carga eficiente en GPU (feature gpu-training-efficiency, R3.1/R3.2): se popean
+        # ANTES del rechazo de unknowns (así se suman a las claves conocidas) y se pasan tal cual a
+        # infinite_batches, que ya los acepta. Sus defaults (0 / False) reproducen el comportamiento
+        # actual —carga en el proceso principal, sin memoria fijada— sin cambio observable.
+        num_workers = data_raw.pop("num_workers", 0)
+        pin_memory = data_raw.pop("pin_memory", False)
         if data_raw:
             raise ValueError(
                 f"config: claves desconocidas en data: para kind: images: "
@@ -178,6 +185,8 @@ def build_data_source(
             crop=crop,
             shuffle=shuffle,
             seed=seed,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
         event_shape = (3, image_size, image_size)
         # Peek de validación sobre el iterador real (infinite_batches fail-fast-ea root

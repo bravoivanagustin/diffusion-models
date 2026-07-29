@@ -199,6 +199,88 @@ def test_build_data_source_imagenes_forma_inesperada_es_value_error(
         )
 
 
+# --------------------------------------------- knobs de carga (num_workers/pin_memory)
+
+
+def _spy_infinite_batches(captura, image_size):
+    """Fábrica de un doble de ``infinite_batches`` que captura kwargs y yield-ea la forma pedida.
+
+    Guarda ``root``/``batch_size`` y todos los kwargs en ``captura`` (dict) y devuelve tensores
+    ``(B, 3, image_size, image_size)`` para que el peek de validación de la forma pase. Evita
+    spawnear procesos de carga reales en Windows CI.
+    """
+
+    def fake(root, batch_size, **kwargs):
+        captura["root"] = root
+        captura["batch_size"] = batch_size
+        captura.update(kwargs)
+        while True:
+            yield torch.zeros(batch_size, 3, image_size, image_size)
+
+    return fake
+
+
+def test_build_data_source_imagenes_propaga_knobs_de_carga(carpeta_imagenes, monkeypatch):
+    """Declarar ``num_workers``/``pin_memory`` los propaga a la fuente de imágenes (3.1).
+
+    Se espía ``infinite_batches`` en el módulo de config para capturar los kwargs con los que se
+    construye la fuente, sin spawnear workers reales.
+    """
+    captura: dict = {}
+    monkeypatch.setattr(
+        config_module, "infinite_batches", _spy_infinite_batches(captura, image_size=16)
+    )
+
+    data, event_shape = build_data_source(
+        {
+            "kind": "images",
+            "root": str(carpeta_imagenes),
+            "image_size": 16,
+            "batch_size": 4,
+            "num_workers": 3,
+            "pin_memory": True,
+        }
+    )
+
+    assert event_shape == (3, 16, 16)
+    assert captura["num_workers"] == 3
+    assert captura["pin_memory"] is True
+
+
+def test_build_data_source_imagenes_knobs_defaults(carpeta_imagenes, monkeypatch):
+    """Sin declarar los knobs, la fuente se arma con los defaults actuales (3.2).
+
+    ``num_workers=0`` (carga en el proceso principal) y ``pin_memory=False`` (sin memoria fijada):
+    sin cambio de comportamiento observable respecto de antes de la feature.
+    """
+    captura: dict = {}
+    monkeypatch.setattr(
+        config_module, "infinite_batches", _spy_infinite_batches(captura, image_size=16)
+    )
+
+    build_data_source(
+        {"kind": "images", "root": str(carpeta_imagenes), "image_size": 16, "batch_size": 4}
+    )
+
+    assert captura["num_workers"] == 0
+    assert captura["pin_memory"] is False
+
+
+def test_build_data_source_imagenes_clave_de_carga_desconocida_es_value_error(carpeta_imagenes):
+    """Una clave de carga desconocida sigue fallando enumerándola tras sumar los knobs (3.4, 5.3)."""
+    with pytest.raises(ValueError, match="num_workerss") as exc:
+        build_data_source(
+            {
+                "kind": "images",
+                "root": str(carpeta_imagenes),
+                "batch_size": 4,
+                "num_workerss": 2,  # typo: clave desconocida, no debe colarse
+            }
+        )
+
+    assert "desconocida" in str(exc.value).lower()
+
+
 # ------------------------------------------------- build_run: cableado imágenes
 
 from diffusion.models import ScoreUNet  # noqa: E402
