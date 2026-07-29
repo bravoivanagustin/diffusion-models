@@ -2505,3 +2505,105 @@ def test_resume_sin_ema_no_cambia_con_sidecar_viejo(tmp_path):
     crudos_b = net_b.state_dict()
     for key in crudos_a:
         assert torch.equal(crudos_b[key], crudos_a[key]), f"peso crudo distinto en {key}"
+
+
+# --------------------------------------------- gate de la API torch.amp (AMP)
+#
+# Feature `gpu-training-efficiency`, tarea 1 (Foundation / gate): antes de cablear la precisión
+# mixta en el loop (tarea 2), el resume (tarea 3) o la config, estos tests fijan de primera mano el
+# contrato de `torch.amp` del que dependen AmpLoop y AmpResume en torch 2.12. Si una versión futura
+# rompe alguna de estas propiedades, fallan acá —el punto más barato— y no en medio del loop.
+#
+# Contrato afirmado (todo en CPU, sin GPU):
+#   1. `autocast(enabled=False)` es no-op bit a bit  -> sostiene R1.4 (default off = sin regresión).
+#   2. `GradScaler(device, enabled=False)` es passthrough (scale/unscale_/step/update no alteran nada)
+#      y su estado hace round-trip -> sostiene R2.1/R2.2 y el sentinel de los guards (R2.5).
+# Verificado en el entorno objetivo (torch 2.12.0+cpu): la API unificada `torch.amp.*` está
+# disponible, así que NO se necesita el fallback documentado en design.md (§Implementation Order &
+# API Fallback). Si estos tests fallan en otro entorno, aplicar ese fallback.
+
+
+def test_amp_autocast_desactivado_es_noop():
+    """`autocast(device_type="cpu", enabled=False)` no altera el forward (R1.4).
+
+    Es la base de "AMP off = sin regresión": envolver el forward/pérdida en un autocast
+    desactivado debe dar exactamente el mismo resultado que no envolverlo.
+    """
+    torch.manual_seed(0)
+    net = torch.nn.Linear(4, 4)
+    x = torch.randn(3, 4)
+
+    y_plain = net(x)
+    with torch.autocast(device_type="cpu", enabled=False):
+        y_off = net(x)
+
+    assert torch.equal(y_plain, y_off)
+
+
+def test_amp_autocast_habilitado_corre_en_cpu():
+    """`autocast(device_type="cpu", enabled=True)` corre y computa en bfloat16 dentro del contexto.
+
+    Confirma que el camino "AMP on" es ejercitable en CPU (sin GPU): el diseño testea la rama
+    activada con la forma CPU del autocast (R5.2).
+    """
+    torch.manual_seed(0)
+    net = torch.nn.Linear(4, 4)
+    x = torch.randn(3, 4)
+
+    with torch.autocast(device_type="cpu", enabled=True):
+        y_on = net(x)
+
+    assert y_on.dtype is torch.bfloat16
+
+
+def test_amp_gradscaler_desactivado_es_passthrough():
+    """Un `GradScaler(device, enabled=False)` reproduce el paso plano del optimizador bit a bit.
+
+    Con el escalador desactivado, `scale(loss).backward()` + `unscale_` + `step` + `update` deben
+    dejar los pesos idénticos a `loss.backward()` + `optimizer.step()`. Es lo que permite construir
+    el escalador solo cuando AMP está activo y confiar en que la rama con escalador (deshabilitado en
+    CPU) no perturba la trayectoria (R1.2, R2.3).
+    """
+
+    def _un_paso(*, con_escalador: bool) -> dict:
+        torch.manual_seed(0)
+        net = torch.nn.Linear(4, 4)
+        opt = torch.optim.Adam(net.parameters(), lr=1e-2)
+        x = torch.randn(3, 4)  # mismas extracciones de RNG en ambos caminos
+
+        loss = net(x).sum()
+        opt.zero_grad()
+        if con_escalador:
+            scaler = torch.amp.GradScaler("cpu", enabled=False)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
+        return {k: v.detach().clone() for k, v in net.state_dict().items()}
+
+    plano = _un_paso(con_escalador=False)
+    escalado = _un_paso(con_escalador=True)
+
+    for key in plano:
+        assert torch.equal(plano[key], escalado[key]), f"peso distinto en {key}"
+
+
+def test_amp_gradscaler_estado_hace_round_trip():
+    """El estado del escalador se guarda y se restaura sin error (R2.1/R2.2).
+
+    Un escalador desactivado (el caso CPU) tiene `state_dict()` vacío; el round-trip debe funcionar
+    igual. Además fija el sentinel de los guards: el estado es un `dict` (posiblemente vacío), NUNCA
+    `None` cuando el escalador existe —por eso los guards distinguen AMP on/off por `is None`, no por
+    dict vacío (R2.4/R2.5)—.
+    """
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    estado = scaler.state_dict()
+    assert isinstance(estado, dict)  # dict (vacío en CPU), no None
+
+    otro = torch.amp.GradScaler("cpu", enabled=False)
+    otro.load_state_dict(estado)  # no debe levantar
