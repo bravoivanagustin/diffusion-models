@@ -50,7 +50,7 @@ model:                      # U-Net moderada (~pocos M de params): suficiente pa
   time_scale: 1000.0
 
 train:
-  num_steps: 100            # smoke corto; subilo si querés ver la pérdida bajar más
+  num_steps: 1000            # smoke corto; subilo si querés ver la pérdida bajar más
   lr: 1.0e-4
   t_eps: 1.0e-4
   device: cuda              # <- la diferencia con test_pipeline.yaml
