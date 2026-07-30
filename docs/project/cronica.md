@@ -395,3 +395,20 @@ Este documento contiene el historial del projecto. Aca se suben creaciones, modi
 - **El speedup no está medido** (fuera de alcance por decisión: no hay GPU en CI). Cuando haya una corrida real de Fase 2 en GPU, medir throughput/VRAM con y sin AMP a presupuesto de pasos igualado.
 - **DDP / multi-GPU** quedó **explícitamente diferido**; reintroducir solo con pedido del autor (igual que CLD).
 - Las celdas de imágenes que quieran las palancas deben declararlas en su `.yaml` (`train.amp: true`, `data.num_workers`/`pin_memory`); sin las claves, la corrida es la de siempre.
+
+### 29/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Barra de progreso (`tqdm`) en el entrenamiento: porcentaje, ETA e it/s en vivo, con la pérdida (media móvil) como postfix. **Opt-in y display-only** — no cambia el resultado ni el `history`. Implementación directa (sin ciclo kiro), por ser de bajo riesgo y solo de consola.
+
+**Contexto:** El loop solo imprimía una media móvil de la pérdida cada `log_every` pasos: no había forma de ver cuánto avanzaba ni estimar cuánto faltaba. Se agregó una barra real. Decisiones: `tqdm` como dependencia nueva (chica y estándar, da ETA/it/s gratis) en vez de una barra a mano; la barra vive en `train()` detrás de un flag `progress` (default `False`, para no ensuciar tests/notebooks ni cambiar el comportamiento actual), y el CLI la prende salvo `--quiet`.
+
+**Acciones realizadas:**
+- `train(..., progress: bool = False)`: envuelve el rango de pasos con `tqdm` (import diferido) usando `initial=start_step`, `total=num_steps` → al reanudar el % y el ETA son correctos. La media móvil de `log_every` pasa a `pbar.set_postfix` cuando la barra está activa (si no, el print de siempre). La barra escribe a stderr y se cierra al terminar; con `progress=False` el núcleo es idéntico al previo.
+- `scripts/train.py`: pasa `progress=not args.quiet`; los mensajes de checkpoint intermedio salen por `tqdm.write` para no romper la línea de la barra.
+- `tqdm==4.70.0` agregado al `pyproject.toml` (+ `uv.lock`).
+- Test `test_train_progress_no_altera_resultado`: con la misma semilla, `progress=True` y `progress=False` dan el mismo `history` (garantía display-only). **Suite completa en verde: 568 tests.** Smoke real del CLI: la barra muestra `%/ETA/it/s` + `perdida` y no escribe artefactos cuando el `.yaml` no define `out`.
+
+**Follow-ups:**
+- Si alguna vez molesta la barra en un entorno sin TTY (logs de CI/cron), `--quiet` ya la apaga; `tqdm` igual degrada bien a líneas sueltas.

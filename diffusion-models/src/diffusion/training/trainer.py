@@ -184,6 +184,7 @@ def train(
     generator: torch.Generator | None = None,
     on_checkpoint: Callable[[str, TrainSnapshot], None] | None = None,
     resume: ResumeState | None = None,
+    progress: bool = False,
 ) -> TrainResult:
     """Entrena la red ``model`` para aproximar el score de ``sde`` por DSM.
 
@@ -234,6 +235,11 @@ def train(
             ``range(start_step, num_steps)``. Si ``start_step >= num_steps`` no corre ningún paso
             y devuelve el resultado ya completo. Si trae ``ema_state`` (corrida con EMA) la sombra
             se restaura desde ahí; ver los guards de coherencia más abajo.
+        progress: Si es ``True``, muestra una barra de progreso (``tqdm``) con porcentaje, ETA e
+            it/s mientras entrena; la pérdida (media móvil de ``log_every``) va como postfix. Es
+            **display-only** (default ``False``): no cambia el resultado ni el ``history``, escribe a
+            stderr, y al reanudar la barra va de ``start_step`` a ``num_steps`` (así el % y el ETA
+            son correctos). El import de ``tqdm`` es diferido: solo se carga si ``progress=True``.
 
     Mantiene además, si ``config.ema_decay`` está configurado, una **sombra EMA** de los pesos
     (:class:`~diffusion.training.ema.EmaShadow`): se construye antes de consumir datos (fail-fast
@@ -448,7 +454,25 @@ def train(
 
     # ``num_steps`` es el TOTAL a alcanzar: se corren solo los pasos restantes (2.2). Si el paso
     # inicial ya lo alcanzó/superó, el rango es vacío y no se ejecuta ningún paso (no-op, 2.4).
-    for step in range(start_step, config.num_steps):
+    step_iter = range(start_step, config.num_steps)
+    pbar = None
+    if progress:
+        # Barra de progreso opt-in (display-only). Import diferido: ``tqdm`` no se arrastra si no se
+        # pide. ``initial``/``total`` hacen que el % y el ETA sean correctos al reanudar (la barra va
+        # de ``start_step`` a ``num_steps``). Escribe a stderr; no altera el resultado ni el history.
+        from tqdm.auto import tqdm
+
+        pbar = tqdm(
+            step_iter,
+            initial=start_step,
+            total=config.num_steps,
+            unit="paso",
+            desc=sde.name,
+            dynamic_ncols=True,
+        )
+        step_iter = pbar
+
+    for step in step_iter:
         # Transferencia no bloqueante (R3.3): `non_blocking=True` es INCONDICIONAL — inofensivo sin
         # memoria fijada y en CPU (torch lo ignora si no aplica); su beneficio real aparece con
         # `pin_memory=True` + CUDA. `train()` no conoce el `pin_memory` del loader, así que no se gatea.
@@ -501,14 +525,22 @@ def train(
         if do_checkpoints and not is_last and (step + 1) % config.checkpoint_every == 0:
             on_checkpoint(f"step{step + 1:05d}", _snapshot(step + 1))
 
-        # Print de progreso (solo consola, desacoplado del history): media móvil de los últimos
-        # log_every pasos, más legible que un paso suelto.
+        # Progreso en consola (solo display, desacoplado del history): media móvil de los últimos
+        # log_every pasos. Con la barra activa va como postfix (para no romper la línea de la barra);
+        # sin barra, un print como siempre.
         if config.log_every > 0 and ((step + 1) % config.log_every == 0 or is_last):
             recent = history[-config.log_every:]
-            print(
-                f"[{sde.name}] paso {step + 1}/{config.num_steps}  "
-                f"pérdida(móvil)={sum(recent) / len(recent):.6f}"
-            )
+            avg = sum(recent) / len(recent)
+            if pbar is not None:
+                pbar.set_postfix(perdida=f"{avg:.6f}")
+            else:
+                print(
+                    f"[{sde.name}] paso {step + 1}/{config.num_steps}  "
+                    f"pérdida(móvil)={avg:.6f}"
+                )
+
+    if pbar is not None:
+        pbar.close()
 
     return TrainResult(
         net=net,

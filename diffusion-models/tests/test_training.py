@@ -2867,3 +2867,26 @@ def test_train_transfiere_batch_no_bloqueante():
     assert len(registro) == 3  # un `.to` por paso
     assert all(kw.get("non_blocking") is True for kw in registro)
     assert len(result.history) == 3  # entrena normal: el resultado no se altera
+
+
+# --------------------------------------------- barra de progreso (display-only)
+
+
+def test_train_progress_no_altera_resultado():
+    """La barra de progreso (`progress=True`) es display-only: no cambia el resultado.
+
+    Con la misma semilla, `progress=True` y `progress=False` producen el MISMO `history`
+    (la barra solo envuelve la iteración y escribe a stderr; no toca el RNG ni el cómputo).
+    """
+
+    def run(progress):
+        torch.manual_seed(0)  # pesos iniciales idénticos entre corridas
+        sde = make_sde("vp")
+        net = _small_net(sde)
+        dist = make_distribution("gaussian", 2, seed=1)
+        data = _data(dist, n=256, batch_size=64)
+        return train(
+            sde, net, data, TrainConfig(num_steps=12, seed=7), progress=progress
+        ).history
+
+    assert run(progress=True) == pytest.approx(run(progress=False))

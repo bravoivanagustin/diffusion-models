@@ -34,6 +34,8 @@ _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from tqdm import tqdm
+
 from diffusion.training import (
     build_run,
     load_config,
@@ -152,7 +154,9 @@ def main(argv=None) -> int:
                 tagged = base.with_stem(f"{base.stem}_{tag}")
                 save_checkpoint(snapshot.result, tagged, model_spec=spec.model_spec)
                 save_resume_state(resume_sidecar_path(tagged), snapshot.resume)
-                print(f"Checkpoint ({tag}) -> {tagged}  (+ sidecar de resume)")
+                # tqdm.write en vez de print: escribe por encima de la barra de progreso sin
+                # romperla (y se comporta como print cuando la barra no está activa).
+                tqdm.write(f"Checkpoint ({tag}) -> {tagged}  (+ sidecar de resume)")
         else:
             print(
                 "nota: 'train.checkpoint_every' > 0 pero falta 'out.checkpoint'; "
@@ -193,9 +197,10 @@ def main(argv=None) -> int:
         f"con {type(spec.model).__name__}: pasos={spec.config.num_steps} "
         f"device={spec.config.device}"
     )
+    # Barra de progreso (%, ETA, it/s) salvo --quiet, que apaga tanto la barra como el print.
     result = train(
         spec.sde, spec.model, spec.data, spec.config,
-        on_checkpoint=on_checkpoint, resume=resume,
+        on_checkpoint=on_checkpoint, resume=resume, progress=not args.quiet,
     )
     hist = result.history
     k = max(1, len(hist) // 20)  # media de extremos: la pérdida per-step es ruidosa
