@@ -21,7 +21,7 @@ model:                    # arquitectura U-Net "Premium" (~50M parámetros)
   in_channels: 3
   image_size: 64          # DEBE coincidir con data.image_size
   base_channels: 128      # mayor capacidad expresiva inicial
-  channel_mults: [1, 2, 2, 2] # 4 niveles (128 -> 256 -> 256 -> 256)
+  channel_mults: [1, 2, 2, 2] # 4 niveles
   num_res_blocks: 2       # red más profunda
   embed_dim: 256
   time_embed_dim: 512     # respeta la regla de 4x base_channels (aprox)
