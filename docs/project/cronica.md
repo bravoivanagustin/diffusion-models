@@ -412,3 +412,19 @@ Este documento contiene el historial del projecto. Aca se suben creaciones, modi
 
 **Follow-ups:**
 - Si alguna vez molesta la barra en un entorno sin TTY (logs de CI/cron), `--quiet` ya la apaga; `tqdm` igual degrada bien a líneas sueltas.
+
+### 30/07/2026
+
+**Categoría:** Desarrollo
+
+**Resumen:** Retención rolling de checkpoints intermedios: un knob `keep_last_checkpoints` (config) / `--keep-last N` (CLI) que conserva solo los N snapshots `…_stepNNNNN` más nuevos y borra los viejos a medida que se generan. **Opt-in** (default `None` = conservar todos). Implementación directa (bajo riesgo, reusa `discover_snapshots`), con tests fuertes por ser destructiva.
+
+**Contexto:** Con `checkpoint_every` dejando muchos snapshots (p. ej. 10 en `cats_vp.yaml`, cada uno con su sidecar de resume, que con la U-Net de ~50M params + Adam pesa bastante), el disco se llena. Faltaba una política de retención para quedarse solo con los últimos N. Decisiones: `keep_last` cuenta **snapshots intermedios** (el final y su `_raw` nunca cuentan ni se borran); el borrado corre en el `on_checkpoint` del CLI (`train()` sigue sin tocar el filesystem); `pathlib` (no `os`) por consistencia con el resto.
+
+**Acciones realizadas:**
+- `prune_snapshots(final_checkpoint, keep_last)` en `resume.py`: **puro filesystem** (sin torch), reusa `discover_snapshots` (que ya excluye final/`_raw`/`_best`), conserva los `keep_last` de mayor paso y borra el resto **junto con su sidecar** (`unlink` idempotente: un sidecar ausente no es error). Nunca toca el final; con `keep_last>=1` siempre queda el más nuevo → el auto-resume sigue andando. Fail-fast si `keep_last<1`.
+- `TrainConfig.keep_last_checkpoints: int | None = None` (default = conservar todos). El CLI lo lee, lo valida fail-fast (`>=1`), acepta `--keep-last N` como override, y en `on_checkpoint` llama a `prune_snapshots` tras guardar el snapshot nuevo (mensajes por `tqdm.write` para no romper la barra). Exportado en `diffusion.training`.
+- Tests en `test_resume.py` (5): conserva los N más nuevos + borra viejos con sidecar; no-op si hay pocos; **nunca** borra final/`_raw`/`_best`; sidecar ausente no falla; `keep_last<1` levanta. Fix de una colisión de nombres (`_touch` local renombrado a `_touch_path`). **Suite completa en verde: 573 tests.** Smoke real del CLI: con `checkpoint_every=10`, `keep_last=2` y 50 pasos, en disco quedan solo `run_step00030/00040` (+ sidecars) y el final.
+
+**Follow-ups:**
+- Para `cats_vp.yaml` (10 snapshots), agregar `keep_last_checkpoints: N` si se quiere acotar el disco (p. ej. 2–3 para poder reanudar + comparar los últimos).

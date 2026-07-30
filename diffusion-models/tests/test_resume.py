@@ -30,6 +30,7 @@ from diffusion.training import (
     load_checkpoint,
     load_resume,
     load_resume_state,
+    prune_snapshots,
     resolve_resume,
     resume_sidecar_path,
     save_checkpoint,
@@ -1531,3 +1532,93 @@ def test_resume_con_amp_equivalente_a_corrida_ininterrumpida():
 
     assert result_b.history == result_a.history
     assert _weights_allclose(net_a, net_b)
+
+
+# --------------------------------------------- retención rolling (prune_snapshots)
+
+
+def _touch_path(p: pathlib.Path) -> None:
+    """Crea un archivo vacío (los tests de prune son puro filesystem, no necesitan pesos reales).
+
+    Nombre propio (`_touch_path`) para NO pisar el `_touch(dir, name)` que ya usa el resto del
+    archivo: éste recibe una ruta completa ya armada.
+    """
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"")
+
+
+def _stub_snapshots(base, steps, *, sidecars=True, final=True, raw=False, best=False):
+    """Arma el layout de checkpoints en disco (final + snapshots …_stepNNNNN.pt + sidecars)."""
+    if final:
+        _touch_path(base)  # X.pt
+    if raw:
+        _touch_path(base.with_stem(base.stem + "_raw"))  # X_raw.pt (contraparte cruda del final)
+    if best:
+        _touch_path(base.with_stem(base.stem + "_best"))  # X_best.pt legado
+    for s in steps:
+        snap = base.with_stem(f"{base.stem}_step{s:05d}")
+        _touch_path(snap)
+        if sidecars:
+            _touch_path(resume_sidecar_path(snap))
+
+
+def _steps_en_disco(base):
+    return {step for step, _ in discover_snapshots(base)}
+
+
+def test_prune_snapshots_conserva_los_n_mas_nuevos(tmp_path):
+    """Conserva los `keep_last` snapshots de mayor paso y borra los viejos + sus sidecars."""
+    base = tmp_path / "run.pt"
+    _stub_snapshots(base, [100, 200, 300, 400, 500])
+
+    borrados = prune_snapshots(base, keep_last=2)
+
+    # 3 snapshots viejos (100/200/300) × (.pt + .resume.pt) = 6 archivos borrados.
+    assert len(borrados) == 6
+    assert _steps_en_disco(base) == {400, 500}
+    for s in (100, 200, 300):
+        snap = base.with_stem(f"{base.stem}_step{s:05d}")
+        assert not snap.exists()
+        assert not resume_sidecar_path(snap).exists()
+    for s in (400, 500):
+        assert resume_sidecar_path(base.with_stem(f"{base.stem}_step{s:05d}")).exists()
+
+
+def test_prune_snapshots_noop_si_hay_pocos(tmp_path):
+    """Con `<= keep_last` snapshots no borra nada."""
+    base = tmp_path / "run.pt"
+    _stub_snapshots(base, [100, 200])
+    assert prune_snapshots(base, keep_last=5) == []
+    assert _steps_en_disco(base) == {100, 200}
+
+
+def test_prune_snapshots_nunca_toca_final_ni_raw_ni_best(tmp_path):
+    """El checkpoint final, su `_raw` y los `_best` legados nunca se borran."""
+    base = tmp_path / "run.pt"
+    _stub_snapshots(base, [100, 200, 300], raw=True, best=True)
+
+    prune_snapshots(base, keep_last=1)
+
+    assert base.exists()  # final intacto
+    assert base.with_stem(base.stem + "_raw").exists()
+    assert base.with_stem(base.stem + "_best").exists()
+    assert _steps_en_disco(base) == {300}  # solo se conserva el más nuevo
+
+
+def test_prune_snapshots_sidecar_ausente_no_falla(tmp_path):
+    """Un snapshot sin sidecar (corrida sin resume) se borra igual, sin error."""
+    base = tmp_path / "run.pt"
+    _stub_snapshots(base, [100, 200, 300], sidecars=False)
+
+    borrados = prune_snapshots(base, keep_last=1)
+
+    assert len(borrados) == 2  # solo los .pt viejos (100, 200), sin sidecars
+    assert _steps_en_disco(base) == {300}
+
+
+def test_prune_snapshots_keep_last_invalido(tmp_path):
+    """`keep_last < 1` es error: conservar cero snapshots dejaría la corrida sin resume."""
+    base = tmp_path / "run.pt"
+    _stub_snapshots(base, [100])
+    with pytest.raises(ValueError):
+        prune_snapshots(base, keep_last=0)

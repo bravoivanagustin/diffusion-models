@@ -111,6 +111,53 @@ def discover_snapshots(
     return snaps
 
 
+def prune_snapshots(
+    final_checkpoint: pathlib.Path, keep_last: int
+) -> list[pathlib.Path]:
+    """Borra los snapshots intermedios más viejos, conservando los ``keep_last`` más nuevos.
+
+    Política de **retención rolling** del checkpointing intermedio: descubre los snapshots
+    ``X_stepNNNNN.pt`` hermanos del checkpoint final (vía :func:`discover_snapshots`, que ya excluye
+    el final, su hermano ``_raw`` y los ``_best`` legados), conserva los ``keep_last`` de **mayor
+    paso** y borra el resto **junto con su sidecar** de resume (``X_stepNNNNN.resume.pt``: los dos
+    van siempre juntos). Nunca toca el checkpoint final ni su ``_raw``, y —con ``keep_last >= 1``—
+    siempre conserva al menos el snapshot más nuevo, así que el auto-resume sigue teniendo desde
+    dónde reanudar.
+
+    Es **puro filesystem** (no importa torch): solo lista y borra. El borrado es idempotente —un
+    sidecar ausente (corrida sin resume) no es un error, simplemente no se borra.
+
+    Args:
+        final_checkpoint: Ruta del checkpoint final ``X.pt`` (se usa solo para derivar ``stem`` y el
+            directorio, igual que :func:`discover_snapshots`; puede no existir todavía).
+        keep_last: Cantidad de snapshots intermedios más nuevos a conservar. Debe ser ``>= 1``.
+
+    Returns:
+        Lista de rutas efectivamente borradas (los ``.pt`` y sus ``.resume.pt`` que existían), de
+        más viejo a más nuevo. Vacía si no había nada que borrar (había ``<= keep_last`` snapshots).
+
+    Raises:
+        ValueError: Si ``keep_last < 1`` (conservar cero snapshots dejaría la corrida sin punto de
+            reanudación).
+    """
+    if keep_last < 1:
+        raise ValueError(
+            f"keep_last debe ser >= 1 (recibido {keep_last}): conservar cero snapshots dejaría "
+            "la corrida sin punto de reanudación."
+        )
+    snaps = discover_snapshots(final_checkpoint)  # (step, path) ascendente por paso
+    if len(snaps) <= keep_last:
+        return []  # nada que borrar: hay a lo sumo keep_last snapshots
+    # La cola (``snaps[-keep_last:]``) son los más nuevos que se conservan; el resto se borra.
+    borrados: list[pathlib.Path] = []
+    for _step, weights_path in snaps[:-keep_last]:
+        for archivo in (weights_path, resume_sidecar_path(weights_path)):
+            if archivo.exists():
+                archivo.unlink()
+                borrados.append(archivo)
+    return borrados
+
+
 def resolve_resume(
     final_checkpoint: pathlib.Path | None,
     *,

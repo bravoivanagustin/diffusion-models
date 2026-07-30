@@ -40,6 +40,7 @@ from diffusion.training import (
     build_run,
     load_config,
     load_resume,
+    prune_snapshots,
     resolve_resume,
     resume_sidecar_path,
     save_checkpoint,
@@ -60,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint-every", type=int, default=None,
                    help="Override de cada cuántos pasos guardar un snapshot intermedio "
                         "(0 = solo el checkpoint final; requiere 'out.checkpoint').")
+    p.add_argument("--keep-last", type=int, default=None, metavar="N",
+                   help="Override de la retención: conservar solo los N snapshots intermedios más "
+                        "nuevos (con su sidecar), borrando los más viejos a medida que se generan. "
+                        "El checkpoint final nunca se borra. Sin este flag ni 'train.keep_last_"
+                        "checkpoints', se conservan todos.")
     p.add_argument("--force", action="store_true",
                    help="Reentrenar aunque el checkpoint final ya exista (saltea el skip). "
                         "Si hay snapshots intermedios, reanuda desde el más nuevo.")
@@ -116,10 +122,22 @@ def main(argv=None) -> int:
         spec.config.device = args.device
     if args.checkpoint_every is not None:
         spec.config.checkpoint_every = args.checkpoint_every
+    if args.keep_last is not None:
+        spec.config.keep_last_checkpoints = args.keep_last
     if args.quiet:
         spec.config.log_every = 0
     elif spec.config.log_every == 0:
         spec.config.log_every = max(1, spec.config.num_steps // 10)
+
+    # Validación fail-fast del knob de retención (train() no lo usa; lo aplica el callback de abajo).
+    keep_last = spec.config.keep_last_checkpoints
+    if keep_last is not None and keep_last < 1:
+        print(
+            f"error: keep_last_checkpoints debe ser >= 1 (recibido {keep_last}): conservar cero "
+            "snapshots dejaría la corrida sin punto de reanudación (usá un N>=1 o quitá el knob).",
+            file=sys.stderr,
+        )
+        return 2
 
     # --- Resolución de resume (skip / resume / fresh) a partir del .yaml y los flags ---
     # resolve_resume solo mira el filesystem (no entrena ni escribe); --resume-from inexistente
@@ -157,6 +175,15 @@ def main(argv=None) -> int:
                 # tqdm.write en vez de print: escribe por encima de la barra de progreso sin
                 # romperla (y se comporta como print cuando la barra no está activa).
                 tqdm.write(f"Checkpoint ({tag}) -> {tagged}  (+ sidecar de resume)")
+                # Retención rolling: tras guardar el snapshot nuevo, borra los más viejos y deja los
+                # keep_last más nuevos (cada uno con su sidecar). El checkpoint final nunca se toca.
+                if keep_last is not None:
+                    borrados = prune_snapshots(base, keep_last)
+                    if borrados:
+                        tqdm.write(
+                            f"  retención: {keep_last} snapshots conservados; "
+                            f"{len(borrados)} archivos viejos borrados"
+                        )
         else:
             print(
                 "nota: 'train.checkpoint_every' > 0 pero falta 'out.checkpoint'; "

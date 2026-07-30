@@ -71,6 +71,13 @@ class TrainConfig:
     # decide el callback ``on_checkpoint`` de :func:`train` (el loop no toca el filesystem); sin
     # ese callback este campo no hace nada.
     checkpoint_every: int = 0
+    # Retención rolling de snapshots intermedios: ``None`` = conservarlos **todos** (default, sin
+    # regresión); ``N >= 1`` = conservar solo los ``N`` snapshots ``…_stepNNNNN`` más nuevos (con su
+    # sidecar), borrando los más viejos a medida que se generan. El **borrado** —como el guardado— lo
+    # hace el callback ``on_checkpoint`` del caller (``train`` no toca el filesystem): este campo es el
+    # valor que el CLI lee para aplicar :func:`~diffusion.training.prune_snapshots` tras cada snapshot.
+    # El checkpoint final nunca cuenta ni se borra. ``train`` no lo usa; un ``N < 1`` lo rechaza el CLI.
+    keep_last_checkpoints: int | None = None
     # Distribución de muestreo de t del loop (ver :mod:`diffusion.training.time_sampling`):
     # "uniform" = el default retrocompatible (misma secuencia por seed que antes del campo);
     # "log_uniform" = la recomendada para concentrar señal de entrenamiento en t chico (la
