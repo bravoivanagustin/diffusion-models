@@ -31,7 +31,7 @@ model:                    # arquitectura U-Net "Premium" (~50M parámetros)
 
 train:                    # hiperparámetros del loop
   num_steps: 30000       # aumentamos pasos para procesar el dataset muchas veces
-  checkpoint_every: 10000 # snapshot cada 10k pasos -> pasos 10k,20k,...,90k (9) + el final = 10 modelos; cada snapshot deja su sidecar …_stepNNNNN.resume.pt para reanudar
+  checkpoint_every: 1000 # snapshot cada 10k pasos, cada snapshot deja su sidecar …_stepNNNNN.resume.pt para reanudar
   keep_last_checkpoints: 3 # retención rolling: conserva solo los 3 snapshots más nuevos (borra los viejos); el final y su _raw nunca se tocan. Subilo/bajalo o quitalo (= conservar todos)
   lr: 1.0e-4              # LR más estándar para entrenamientos grandes y estables
   t_eps: 1.0e-4
