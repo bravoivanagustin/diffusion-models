@@ -15,12 +15,12 @@ dependencies = [
     "torchvision==0.27.0",
     "pillow>=12.2.0",
     "tqdm>=4.70.0",
+    "matplotlib>=3.5"
 ]
 
 [dependency-groups]
 analysis = [
     "ipykernel>=6.29",
-    "matplotlib>=3.5",
     "jupyter>=1.1",
     "pytest>=7"
 ]
