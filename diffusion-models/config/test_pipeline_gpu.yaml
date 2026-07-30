@@ -65,3 +65,4 @@ train:
 out:
   checkpoint: models/test_pipeline_gpu/test_pipeline_gpu.pt
   loss_curve: models/test_pipeline_gpu/test_pipeline_gpu_loss.png
+  train_log: models/test_pipeline_gpu/test_pipeline_gpu_log.jsonl  # estados del entrenamiento con timestamp

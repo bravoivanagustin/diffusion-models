@@ -1622,3 +1622,34 @@ def test_prune_snapshots_keep_last_invalido(tmp_path):
     _stub_snapshots(base, [100])
     with pytest.raises(ValueError):
         prune_snapshots(base, keep_last=0)
+
+
+# ---------------------------------------- log de entrenamiento (.jsonl) vía CLI
+
+
+def test_cli_escribe_train_log_jsonl(tmp_path):
+    """Con `out.train_log`, el CLI escribe un .jsonl con start + steps + end (con timestamp)."""
+    import json
+
+    run_dir = tmp_path / "run"
+    log_path = run_dir / "train_log.jsonl"
+    cfg = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 10, "lr": 0.002, "seed": 0, "log_every": 5},
+        "model": {"name": "mlp", "hidden_dim": 32, "num_blocks": 1},
+        "out": {"checkpoint": (run_dir / "m.pt").as_posix(), "train_log": log_path.as_posix()},
+    }
+    config_path = tmp_path / "config.yaml"
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+
+    assert _load_train_main()(["--config", str(config_path), "--quiet"]) == 0
+
+    lines = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["event"] == "start"
+    assert lines[0]["sde"] == "vp" and lines[0]["num_steps"] == 10
+    assert lines[-1]["event"] == "end"
+    assert lines[-1]["step"] == 10 and "loss_final" in lines[-1] and "elapsed_s" in lines[-1]
+    steps = [r for r in lines if r["event"] == "step"]
+    assert steps and all({"step", "loss", "elapsed_s", "t"} <= set(r) for r in steps)

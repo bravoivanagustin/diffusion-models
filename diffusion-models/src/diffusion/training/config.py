@@ -30,6 +30,7 @@ Estructura esperada del YAML::
     out:                  # rutas de salida (relativas al cwd)
       checkpoint: models/vp_mixture.pt
       loss_curve: models/vp_mixture_loss.png
+      train_log: models/vp_mixture_log.jsonl  # opcional: estados del entrenamiento con timestamp
 """
 
 from __future__ import annotations
@@ -71,6 +72,7 @@ class RunSpec:
     model_spec: dict | None = None  # receta {name, kwargs} para el checkpoint model-agnóstico
     checkpoint: pathlib.Path | None = None
     loss_curve: pathlib.Path | None = None
+    train_log: pathlib.Path | None = None  # .jsonl de estados del entrenamiento (opcional, con timestamps)
 
 
 def load_config(path: str | pathlib.Path) -> dict:
@@ -296,6 +298,7 @@ def build_run(raw: dict) -> RunSpec:
     out_raw = dict(raw.get("out") or {})
     checkpoint = out_raw.get("checkpoint")
     loss_curve = out_raw.get("loss_curve")
+    train_log = out_raw.get("train_log")
     return RunSpec(
         sde=sde,
         model=model,
@@ -304,4 +307,5 @@ def build_run(raw: dict) -> RunSpec:
         model_spec=model_spec,
         checkpoint=pathlib.Path(checkpoint) if checkpoint else None,
         loss_curve=pathlib.Path(loss_curve) if loss_curve else None,
+        train_log=pathlib.Path(train_log) if train_log else None,
     )

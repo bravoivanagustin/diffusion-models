@@ -2890,3 +2890,43 @@ def test_train_progress_no_altera_resultado():
         ).history
 
     assert run(progress=True) == pytest.approx(run(progress=False))
+
+
+# --------------------------------------------- logging estructurado (on_log)
+
+
+def test_train_on_log_emite_estados_por_cadencia():
+    """`on_log` recibe {step, loss} en la cadencia de `log_every`, sin cambiar el resultado."""
+    recs: list[dict] = []
+
+    def run(collect):
+        torch.manual_seed(0)
+        sde = make_sde("vp")
+        net = _small_net(sde)
+        dist = make_distribution("gaussian", 2, seed=1)
+        data = _data(dist, n=256, batch_size=64)
+        cb = recs.append if collect else None
+        return train(
+            sde, net, data, TrainConfig(num_steps=20, seed=7, log_every=5), on_log=cb
+        ).history
+
+    hist_with = run(collect=True)
+    assert [r["step"] for r in recs] == [5, 10, 15, 20]  # cadencia log_every=5
+    assert all(isinstance(r["loss"], float) for r in recs)
+
+    recs.clear()
+    hist_without = run(collect=False)
+    assert hist_with == pytest.approx(hist_without)  # display-only: no altera el history
+
+
+def test_train_on_log_funciona_con_log_every_cero():
+    """Con `log_every=0` (p. ej. --quiet), `on_log` igual emite en la cadencia num_steps//20."""
+    recs: list[dict] = []
+    torch.manual_seed(0)
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    dist = make_distribution("gaussian", 2, seed=1)
+    data = _data(dist, n=256, batch_size=64)
+    train(sde, net, data, TrainConfig(num_steps=40, seed=0, log_every=0), on_log=recs.append)
+    assert len(recs) == 20  # num_steps//20 = 2 -> pasos 2,4,...,40
+    assert recs[-1]["step"] == 40

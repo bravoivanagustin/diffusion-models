@@ -45,3 +45,4 @@ train:                    # hiperparámetros del loop
 out:                      # salidas
   checkpoint: /mnt/data/abravo/diffusion-models/phase_3/cats_vp.pt
   loss_curve: /mnt/data/abravo/diffusion-models/phase_3/cats_vp_loss.png
+  train_log: /mnt/data/abravo/diffusion-models/phase_3/cats_vp_train_log.jsonl 

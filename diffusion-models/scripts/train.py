@@ -26,8 +26,11 @@ dentro de la misma corrida.
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import pathlib
 import sys
+import time
 
 # Permitir ejecutar el script sin instalar el paquete (agrega ./src al path).
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
@@ -224,10 +227,39 @@ def main(argv=None) -> int:
         f"con {type(spec.model).__name__}: pasos={spec.config.num_steps} "
         f"device={spec.config.device}"
     )
+    # --- Log de entrenamiento (.jsonl) opcional: start + estados periódicos + end, con timestamp ---
+    # train() no toca el filesystem ni el reloj: emite estados por on_log y acá se les pone el
+    # timestamp y se escriben (modo append: un resume continúa el mismo log).
+    log_fh = None
+    on_log = None
+    if spec.train_log is not None:
+        spec.train_log.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(spec.train_log, "a", encoding="utf-8")
+        t0 = time.time()
+
+        def _log(rec):
+            rec = {"t": datetime.datetime.now().isoformat(timespec="seconds"), **rec}
+            log_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            log_fh.flush()  # cada línea persiste ya: un corte deja el log parcial usable
+
+        _log({
+            "event": "start",
+            "sde": spec.sde.name,
+            "device": spec.config.device,
+            "num_steps": spec.config.num_steps,
+            "amp": spec.config.amp,
+            "model": type(spec.model).__name__,
+            "data_dim": spec.sde.data_dim,
+            "resume_from_step": resume.start_step if resume is not None else 0,
+        })
+
+        def on_log(rec):
+            _log({"event": "step", "elapsed_s": round(time.time() - t0, 3), **rec})
+
     # Barra de progreso (%, ETA, it/s) salvo --quiet, que apaga tanto la barra como el print.
     result = train(
         spec.sde, spec.model, spec.data, spec.config,
-        on_checkpoint=on_checkpoint, resume=resume, progress=not args.quiet,
+        on_checkpoint=on_checkpoint, on_log=on_log, resume=resume, progress=not args.quiet,
     )
     hist = result.history
     k = max(1, len(hist) // 20)  # media de extremos: la pérdida per-step es ruidosa
@@ -236,6 +268,16 @@ def main(argv=None) -> int:
         f"Listo. pérdida inicial≈{ini:.6f} -> final≈{fin:.6f}  "
         f"(medias de {k} pasos; {len(hist)} pasos guardados)"
     )
+
+    if log_fh is not None:
+        _log({
+            "event": "end",
+            "step": len(hist),
+            "loss_final": round(fin, 6),
+            "elapsed_s": round(time.time() - t0, 3),
+        })
+        log_fh.close()
+        print(f"Log        -> {spec.train_log}")
 
     if spec.checkpoint:
         # raw_sibling=True: guardado FINAL, así que si la corrida tiene EMA activo se escribe

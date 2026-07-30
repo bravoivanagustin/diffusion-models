@@ -679,6 +679,7 @@ name = "diffusion-tp"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "matplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pillow" },
@@ -694,12 +695,12 @@ dependencies = [
 analysis = [
     { name = "ipykernel" },
     { name = "jupyter" },
-    { name = "matplotlib" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "matplotlib", specifier = ">=3.5" },
     { name = "numpy", specifier = ">=1.23" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pyyaml", specifier = ">=6" },
@@ -713,7 +714,6 @@ requires-dist = [
 analysis = [
     { name = "ipykernel", specifier = ">=6.29" },
     { name = "jupyter", specifier = ">=1.1" },
-    { name = "matplotlib", specifier = ">=3.5" },
     { name = "pytest", specifier = ">=7" },
 ]
 

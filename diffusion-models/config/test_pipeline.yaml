@@ -64,3 +64,4 @@ train:
 out:
   checkpoint: models/test_pipeline/test_pipeline.pt
   loss_curve: models/test_pipeline/test_pipeline_loss.png
+  train_log: models/test_pipeline/test_pipeline_log.jsonl  # estados del entrenamiento con timestamp

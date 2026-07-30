@@ -190,6 +190,7 @@ def train(
     *,
     generator: torch.Generator | None = None,
     on_checkpoint: Callable[[str, TrainSnapshot], None] | None = None,
+    on_log: Callable[[dict], None] | None = None,
     resume: ResumeState | None = None,
     progress: bool = False,
 ) -> TrainResult:
@@ -242,6 +243,12 @@ def train(
             ``range(start_step, num_steps)``. Si ``start_step >= num_steps`` no corre ningún paso
             y devuelve el resultado ya completo. Si trae ``ema_state`` (corrida con EMA) la sombra
             se restaura desde ahí; ver los guards de coherencia más abajo.
+        on_log: Callback **opcional** de logging estructurado. Se invoca con un ``dict``
+            ``{"step", "loss"}`` (paso 1-indexado completado y media móvil de la pérdida) en una
+            cadencia propia —``config.log_every`` si es ``>0``, si no ``num_steps//20``—
+            **independiente** del print/barra, así emite estados aun con ``log_every=0`` (p. ej.
+            corridas `--quiet` en background). El caller decide qué hacer con el registro (p. ej.
+            escribirlo a un ``.jsonl`` con timestamp); ``train`` no toca el filesystem ni el reloj.
         progress: Si es ``True``, muestra una barra de progreso (``tqdm``) con porcentaje, ETA e
             it/s mientras entrena; la pérdida (media móvil de ``log_every``) va como postfix. Es
             **display-only** (default ``False``): no cambia el resultado ni el ``history``, escribe a
@@ -479,6 +486,10 @@ def train(
         )
         step_iter = pbar
 
+    # Cadencia del logging estructurado (on_log): sigue log_every si está seteado, si no cae en
+    # num_steps//20 — INDEPENDIENTE del print/barra, para emitir estados también con log_every=0.
+    log_cadence = config.log_every if config.log_every > 0 else max(1, config.num_steps // 20)
+
     for step in step_iter:
         # Transferencia no bloqueante (R3.3): `non_blocking=True` es INCONDICIONAL — inofensivo sin
         # memoria fijada y en CPU (torch lo ignora si no aplica); su beneficio real aparece con
@@ -531,6 +542,13 @@ def train(
         # caller, así que se excluye acá.
         if do_checkpoints and not is_last and (step + 1) % config.checkpoint_every == 0:
             on_checkpoint(f"step{step + 1:05d}", _snapshot(step + 1))
+
+        # Logging estructurado (p. ej. a un .jsonl): cadencia propia, independiente del print/barra,
+        # así emite estados aun con log_every=0 (corridas --quiet en background). El caller le pone el
+        # timestamp y decide dónde escribirlo — train no toca el filesystem ni el reloj.
+        if on_log is not None and ((step + 1) % log_cadence == 0 or is_last):
+            recent_log = history[-log_cadence:]
+            on_log({"step": step + 1, "loss": sum(recent_log) / len(recent_log)})
 
         # Progreso en consola (solo display, desacoplado del history): media móvil de los últimos
         # log_every pasos. Con la barra activa va como postfix (para no romper la línea de la barra);
