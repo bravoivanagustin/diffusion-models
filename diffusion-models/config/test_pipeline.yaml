@@ -5,6 +5,11 @@
 # Correr desde diffusion-models/:
 #   uv run python scripts/train.py --config config/test_pipeline.yaml
 #
+# Tiempo esperado: ~45-60 s en CPU (la U-Net, aunque chica, hace convoluciones reales). OJO: con
+# `amp: true` en CPU el bf16 NO tiene aceleración —puede ir igual o MÁS lento—; está para ejercitar
+# el camino de AMP sin GPU. En GPU (device: cuda) es donde AMP/cudnn.benchmark dan el speedup real.
+# Si lo querés más rápido para iterar, bajá `num_steps` (o poné `amp: false`).
+#
 # Qué mirar mientras corre / al terminar:
 #   - la BARRA DE PROGRESO (tqdm): %, ETA, it/s y `perdida` como postfix.
 #   - mensajes "Checkpoint (stepNNNNN) -> …" cada 30 pasos, y luego
