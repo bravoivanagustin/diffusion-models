@@ -43,6 +43,7 @@ def generate_from_checkpoint(
     save_trajectory: bool = False,
     map_location: str = "cpu",
     model: ScoreModel | None = None,
+    device: str | None = None,
     **sampler_kwargs,
 ) -> torch.Tensor:
     """Genera muestras ``x_0`` a partir de un checkpoint entrenado y opcionalmente las guarda.
@@ -76,6 +77,8 @@ def generate_from_checkpoint(
         save_trajectory: Si es ``True``, captura la trayectoria de integración y la incluye
             en la salida (y en el ``.npz`` si ``out`` se provee).
         map_location: Dispositivo donde cargar los pesos del checkpoint (default ``"cpu"``).
+        device: Device donde correr la generación (``"cuda"``/``"cpu"``); ``None`` (default) = CPU.
+            Mueve la red a ese device y samplea ahí (prior + grilla + score) para generar en GPU.
         model: Red de score ya construida a la que cargarle los pesos. Solo se usa cuando el
             checkpoint **no** trae la receta ``meta["model"]``; si la trae, la red se
             reconstruye con :func:`~diffusion.models.make_model` y este argumento se ignora.
@@ -151,15 +154,18 @@ def generate_from_checkpoint(
     # eval() sobre el objeto final (wrapper o red pelada): el wrapper delega train/eval a su
     # submódulo, así el driver de sampleo consume una red interna en modo eval en ambos casos.
     net.eval()
+    if device is not None:
+        net = net.to(device)  # generación en GPU: la red va al device y el sampler samplea ahí
 
     generator: torch.Generator | None = None
     if seed is not None:
-        generator = torch.Generator()
+        # El generator debe vivir en el device del sampleo (randn con generator exige match).
+        generator = torch.Generator(device=device) if device is not None else torch.Generator()
         generator.manual_seed(int(seed))
 
     sampler = make_sampler(sampler_name, sde, net, n_steps=n_steps, **sampler_kwargs)
     result = sampler.sample(
-        n_samples, generator=generator, return_trajectory=save_trajectory
+        n_samples, generator=generator, device=device, return_trajectory=save_trajectory
     )
     if save_trajectory:
         x0, trajectory = result

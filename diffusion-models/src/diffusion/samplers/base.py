@@ -117,6 +117,7 @@ class ReverseSampler(abc.ABC):
         *,
         init: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
+        device: torch.device | str | None = None,
         return_trajectory: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Integra el proceso reverso de ``T`` a ``t_eps`` y devuelve las muestras ``x_0``.
@@ -139,7 +140,12 @@ class ReverseSampler(abc.ABC):
                 del integrador del muestreo del prior.
             generator: Generador de torch para reproducibilidad; alimenta tanto el muestreo
                 del prior como los pasos estocásticos (EM/PC). Los samplers determinísticos
-                (PF-ODE/Heun) lo ignoran en :meth:`step`.
+                (PF-ODE/Heun) lo ignoran en :meth:`step`. Si se corre en GPU con ``generator``
+                provisto, debe estar en el mismo device (p. ej. ``torch.Generator(device="cuda")``).
+            device: Device donde generar (``"cuda"``, ``"cpu"``, …). Solo fija dónde se sortea el
+                prior cuando ``init`` es ``None``; con ``init`` provisto manda ``init.device``. La
+                grilla temporal y el score se computan en el device de ``x``, así que con la red en
+                GPU el sampleo corre en GPU. ``None`` (default) = CPU, camino idéntico al previo.
             return_trajectory: Si es ``True``, devuelve además la trayectoria completa.
 
         Returns:
@@ -150,12 +156,18 @@ class ReverseSampler(abc.ABC):
         """
         if init is None:
             x = self.sde.prior_sampling(
-                (n_samples, *self.sde.data_shape), generator=generator, dtype=torch.float32
+                (n_samples, *self.sde.data_shape),
+                generator=generator,
+                device=device,
+                dtype=torch.float32,
             )
         else:
             x = init.to(dtype=torch.float32)
 
-        grid = self._time_grid()
+        # La grilla temporal se mueve al device de x, así t, los coeficientes de la SDE y el score
+        # se computan en el mismo device (GPU si x/red están en GPU): sin esto, t quedaría en CPU y
+        # chocaría contra un x en GPU. Con x en CPU es un no-op (camino previo idéntico).
+        grid = self._time_grid().to(x.device)
         trajectory: list[torch.Tensor] = [x.clone()] if return_trajectory else []
 
         for i in range(self.n_steps):

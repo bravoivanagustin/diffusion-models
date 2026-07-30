@@ -1604,3 +1604,40 @@ def test_generate_from_checkpoint_image_meta_missing_data_dim_raises_clear_error
     msg = str(excinfo.value)
     assert "sde_name" in msg
     assert "data_dim" in msg
+
+
+# --------------------------------------------------------------- device del sampleo
+
+
+def test_sample_device_param_cpu_equivale_a_default():
+    """El `device` nuevo es inerte en CPU: `device=None` y `device="cpu"` dan lo mismo (mismo seed)."""
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=2)
+
+    def run(dev):
+        g = torch.Generator().manual_seed(0)
+        s = make_sampler("euler", sde, _zero_score, n_steps=10)
+        return s.sample(B, generator=g, device=dev)
+
+    assert torch.equal(run(None), run("cpu"))
+
+
+def test_sample_pasa_t_en_el_device_de_x():
+    """La grilla temporal se mueve al device de x: el score recibe `t` y `x` en el MISMO device.
+
+    En CPU la invariante es trivial, pero guarda contra una regresión que cree `t` en un device
+    fijo (el bug que hacía imposible samplear en GPU: `x` en cuda, `t` en cpu).
+    """
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=2)
+    vistos: list[tuple] = []
+
+    def spy(x, t):
+        vistos.append((x.device, t.device))
+        return torch.zeros_like(x)
+
+    make_sampler("euler", sde, spy, n_steps=5).sample(B, generator=torch.Generator().manual_seed(0))
+
+    assert vistos and all(xd == td for xd, td in vistos)
