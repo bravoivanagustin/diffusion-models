@@ -52,10 +52,12 @@ ehthumbs.db
 desktop.ini
 .DS_Store
 
-# === Claude ===
+# === Claude y Antigravity ===
 .claude/
+.antigravity/
 .kiro/
 CLAUDE.md
+antigravity.md
 
 # === Docs ===
 docs/ 
