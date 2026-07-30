@@ -6,7 +6,7 @@ sde:                      # forward VP-SDE
 
 data:                     # fuente de imágenes
   kind: images
-  root: data/cats-full    # ¡Asegurate de cambiar esto a la carpeta de tus 9000 gatos!
+  root: data/cats-v1
   image_size: 64          # subimos la resolución a 64x64
   batch_size: 128         # aprovechando los 24GB de la 3090
   augment: true           # volteo horizontal aleatorio (duplica el dataset virtualmente)
