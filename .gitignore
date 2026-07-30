@@ -38,6 +38,8 @@ data/
 *.pt
 *.pth
 *.ckpt
+# Imagenes
+*.png
 
 # === Editores / IDE ===
 .vscode/
