@@ -1,5 +1,9 @@
 """Tests del examen fijo de validación (`diffusion.training.validation`).
 
+Cubre las dos piezas del submódulo: :class:`FixedValExam` (la métrica congelada) y
+:func:`evaluate_with_weights` (la evaluación con un juego de pesos ajeno, que deja la red
+exactamente como estaba).
+
 Torch es dependencia dura del módulo, así que se hace `importorskip` al tope. Todos los tests
 usan **listas de tensores en memoria** como fuente (sin tocar el disco ni el loader de imágenes):
 el evaluador solo pide una fuente re-iterable de batches, así que una lista alcanza para fijar
@@ -16,19 +20,22 @@ que el **promedio** sea por imagen y no por batch.
 from __future__ import annotations
 
 import math
+from types import MappingProxyType
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from diffusion.models import ScoreMLP
+from diffusion.models import EpsilonScoreWrapper, ScoreMLP
 from diffusion.sde import make_sde
 from diffusion.training import (
     VAL_EXAM_SEED,
+    EmaShadow,
     FixedValExam,
     UniformTimeSampler,
     ValPoint,
     dsm_loss,
+    evaluate_with_weights,
     make_time_sampler,
 )
 
@@ -53,6 +60,21 @@ def _batches(sizes, *, dim: int = 2, seed: int = 3) -> list[torch.Tensor]:
 def _ceros(sizes, *, dim: int = 2) -> list[torch.Tensor]:
     """Fuente de ``x_0 = 0``: la que hace exacta la pérdida de :class:`_LossConstante`."""
     return [torch.zeros(b, dim) for b in sizes]
+
+
+def _foto(net: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Copia **desacoplada** del ``state_dict`` de la red (clones, no los tensores vivos)."""
+    return {k: v.detach().clone() for k, v in net.state_dict().items()}
+
+
+def _pesos_desplazados(net: torch.nn.Module, delta: float = 0.5) -> dict[str, torch.Tensor]:
+    """Un juego de pesos **ajeno**: los de ``net`` corridos por ``delta`` (mismas claves)."""
+    return {k: v + delta for k, v in _foto(net).items()}
+
+
+def _mismos_tensores(uno: dict[str, torch.Tensor], otro: dict[str, torch.Tensor]) -> bool:
+    """``True`` si los dos ``state_dict`` tienen las mismas claves y son iguales tensor a tensor."""
+    return set(uno) == set(otro) and all(torch.equal(uno[k], otro[k]) for k in uno)
 
 
 class _LossConstante(torch.nn.Module):
@@ -432,6 +454,175 @@ def test_fuente_de_batches_vacios_levanta_valueerror():
     exam = FixedValExam(sde, [torch.zeros(0, 2)], time_sampler=_sampler(sde))
     with pytest.raises(ValueError, match="ninguna imagen"):
         exam.evaluate(_net(sde))
+
+
+# ------------------------------------------ evaluación con pesos ajenos (4.1, 4.4)
+
+
+def test_devuelve_la_perdida_bajo_los_pesos_ajenos():
+    # El valor tiene que ser el del examen medido **con los pesos recibidos**: se compara contra
+    # una red aparte cargada con esos mismos pesos (idéntico, no aproximado: el examen es
+    # determinístico) y contra el valor de los pesos vivos (distinto, si no la función no swapeó).
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4, 2]), time_sampler=_sampler(sde))
+    con_vivos = exam.evaluate(net)
+    otros = _pesos_desplazados(net)
+
+    referencia = _net(sde)
+    referencia.load_state_dict(otros)
+    esperado = exam.evaluate(referencia)
+
+    valor = evaluate_with_weights(exam, net, otros)
+    assert valor == esperado
+    assert valor != con_vivos
+
+
+def test_deja_el_state_dict_identico_tensor_por_tensor():
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4]), time_sampler=_sampler(sde))
+    antes = _foto(net)
+    evaluate_with_weights(exam, net, _pesos_desplazados(net))
+    assert _mismos_tensores(_foto(net), antes)
+
+
+def test_una_segunda_llamada_vuelve_a_medir_los_pesos_vivos():
+    # Corolario de la restauración: después del swap, evaluar la red da lo mismo que antes. Es el
+    # test que un "respaldo" sin clonar rompe (la copia quedaría sobreescrita al cargar los otros
+    # pesos y la red se quedaría con los ajenos para siempre).
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4, 2]), time_sampler=_sampler(sde))
+    antes = exam.evaluate(net)
+    evaluate_with_weights(exam, net, _pesos_desplazados(net))
+    assert exam.evaluate(net) == antes
+
+
+def test_dos_swaps_con_los_mismos_pesos_dan_el_mismo_valor():
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([3, 2]), time_sampler=_sampler(sde))
+    otros = _pesos_desplazados(net)
+    assert evaluate_with_weights(exam, net, otros) == evaluate_with_weights(exam, net, otros)
+
+
+@pytest.mark.parametrize("modo_entrenamiento", [True, False])
+def test_restaura_los_pesos_aunque_la_evaluacion_reviente(modo_entrenamiento):
+    # La restauración va en un ``finally``: una excepción del forward no puede dejar la red con
+    # los pesos ajenos, o el loop seguiría entrenando desde la sombra EMA.
+    sde = make_sde("ve")
+    net = _RedQueRevienta()
+    net.train(modo_entrenamiento)
+    exam = FixedValExam(sde, _batches([4]), time_sampler=_sampler(sde))
+    antes = _foto(net)
+    with pytest.raises(RuntimeError, match="forward roto"):
+        evaluate_with_weights(exam, net, _pesos_desplazados(net))
+    assert _mismos_tensores(_foto(net), antes)
+    assert net.training is modo_entrenamiento
+
+
+def test_recibe_los_pesos_como_mapping_generico():
+    # La firma pide un ``Mapping``, no un ``dict``: la función no conoce la clase del EMA ni
+    # depende de que los pesos vengan en un contenedor mutable.
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4]), time_sampler=_sampler(sde))
+    otros = MappingProxyType(_pesos_desplazados(net))
+    assert not isinstance(otros, dict)
+    assert math.isfinite(evaluate_with_weights(exam, net, otros))
+
+
+def test_no_muta_los_pesos_recibidos():
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4]), time_sampler=_sampler(sde))
+    otros = _pesos_desplazados(net)
+    copia = {k: v.detach().clone() for k, v in otros.items()}
+    evaluate_with_weights(exam, net, otros)
+    assert _mismos_tensores(otros, copia)
+
+
+def test_no_mueve_el_rng_global_ni_deja_gradientes():
+    # No consume azar propio: delega enteramente en ``evaluate`` (que se re-siembra local).
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4, 2]), time_sampler=_sampler(sde))
+    otros = _pesos_desplazados(net)
+    estado = torch.get_rng_state()
+    evaluate_with_weights(exam, net, otros)
+    assert torch.equal(torch.get_rng_state(), estado)
+    assert all(p.grad is None for p in net.parameters())
+
+
+def test_anda_con_una_red_envuelta_en_la_parametrizacion_epsilon():
+    # La red de producción de la celda de gatos va envuelta en ``EpsilonScoreWrapper``, cuyo
+    # ``state_dict``/``load_state_dict`` delegan al interno: las claves son las de la red pelada
+    # (que son justo las que publica la sombra EMA), así que el swap funciona igual.
+    sde = make_sde("ve")
+    interna = _net(sde)
+    net = EpsilonScoreWrapper(interna, lambda x, t: sde.marginal_prob(x, t)[1])
+    exam = FixedValExam(sde, _batches([4, 2]), time_sampler=_sampler(sde))
+    otros = _pesos_desplazados(net)
+    assert set(otros) == set(interna.state_dict())  # claves de red pelada, sin prefijo ``_net.``
+
+    con_vivos = exam.evaluate(net)
+    antes = _foto(net)
+    valor = evaluate_with_weights(exam, net, otros)
+    assert math.isfinite(valor)
+    assert valor != con_vivos
+    assert _mismos_tensores(_foto(net), antes)
+    assert _mismos_tensores(_foto(interna), antes)  # el interno también quedó como estaba
+
+
+def test_anda_con_la_foto_de_la_sombra_ema():
+    # El caller de producción (4.1): los pesos ajenos son ``EmaShadow.state_dict()``, cuya
+    # precondición de claves está garantizada por el propio EMA.
+    sde = make_sde("ve")
+    net = _net(sde)
+    sombra = EmaShadow(net, decay=0.9)
+    with torch.no_grad():
+        for p in net.parameters():
+            p.add_(0.5)
+    sombra.update(1)  # la sombra queda entre los pesos iniciales y los actuales
+
+    exam = FixedValExam(sde, _batches([4, 2]), time_sampler=_sampler(sde))
+    con_vivos = exam.evaluate(net)
+    antes = _foto(net)
+    con_ema = evaluate_with_weights(exam, net, sombra.state_dict())
+    assert con_ema != con_vivos
+    assert _mismos_tensores(_foto(net), antes)
+
+
+# ---------------------------------------------------------------------- errores del swap
+
+
+def test_claves_faltantes_levantan_runtimeerror_y_restauran_los_pesos():
+    # ``load_state_dict`` copia las claves que sí matchean **antes** de reportar las que faltan,
+    # así que la carga tiene que estar dentro del bloque protegido: si no, el fail-fast dejaría
+    # la red con una mezcla de pesos vivos y ajenos.
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4]), time_sampler=_sampler(sde))
+    incompletos = _pesos_desplazados(net)
+    faltante = sorted(incompletos)[0]
+    del incompletos[faltante]
+    antes = _foto(net)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        evaluate_with_weights(exam, net, incompletos)
+    assert _mismos_tensores(_foto(net), antes)
+
+
+def test_claves_desconocidas_levantan_runtimeerror():
+    sde = make_sde("ve")
+    net = _net(sde)
+    exam = FixedValExam(sde, _batches([4]), time_sampler=_sampler(sde))
+    intrusos = _pesos_desplazados(net)
+    intrusos["no_existe"] = torch.zeros(())
+    antes = _foto(net)
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        evaluate_with_weights(exam, net, intrusos)
+    assert _mismos_tensores(_foto(net), antes)
 
 
 # ------------------------------------------------------------- forma del punto (5.2)

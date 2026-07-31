@@ -48,7 +48,7 @@ from .resume import (
     resume_sidecar_path,
     validate_compatible,
 )
-from .validation import VAL_EXAM_SEED, FixedValExam, ValPoint
+from .validation import VAL_EXAM_SEED, FixedValExam, ValPoint, evaluate_with_weights
 from .trainer import (
     ResumeState,
     TrainConfig,
@@ -71,6 +71,7 @@ __all__ = [
     "available_time_samplers",
     "EmaShadow",
     "FixedValExam",
+    "evaluate_with_weights",
     "ValPoint",
     "VAL_EXAM_SEED",
     "TrainConfig",

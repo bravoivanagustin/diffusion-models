@@ -35,15 +35,21 @@ sembrado con la misma semilla que uno de CPU produce otra secuencia, y el ruido 
 device del dato. La serie es comparable **dentro de un mismo device**; por eso el registro del log
 lleva el device, para poder detectar el cambio en lugar de leerlo como un salto del modelo.
 
+La segunda pieza, :func:`evaluate_with_weights`, mide el **mismo** examen con un juego de pesos
+ajeno (típicamente la sombra EMA) y devuelve la red exactamente como estaba. Recibe un ``Mapping``
+genérico a propósito: no conoce :class:`~diffusion.training.ema.EmaShadow`, así que sirve para
+comparar cualquier par de pesos.
+
 Uso típico (lo orquesta el loop de :mod:`diffusion.training.trainer`)::
 
     exam = FixedValExam(sde, val_batches, time_sampler=time_sampler, device=device)
-    val_raw = exam.evaluate(net)          # mismo examen en cada llamada
+    val_raw = exam.evaluate(net)                                  # mismo examen en cada llamada
+    val_ema = evaluate_with_weights(exam, net, ema.state_dict())  # ídem, con la sombra
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Final, TypedDict
 
 import torch
@@ -189,3 +195,53 @@ class FixedValExam:
                 "evaluación)."
             )
         return acumulado / imagenes
+
+
+def evaluate_with_weights(
+    exam: FixedValExam, net: ScoreModel, weights: Mapping[str, torch.Tensor]
+) -> float:
+    """Corre el examen con un juego de pesos ajeno y deja la red **exactamente** como estaba.
+
+    Es la mecánica del intercambio que necesita la corrida para medir la validación con la sombra
+    EMA sobre el **mismo** examen que los pesos vivos (criterio 4.1), sin mantener una segunda
+    instancia de red: se clonan los pesos vivos, se cargan los recibidos, se evalúa y se restauran
+    los crudos (criterio 4.4).
+
+    La función recibe un ``Mapping`` genérico y **no** conoce la clase del EMA: sirve para
+    comparar cualquier par de juegos de pesos. Tampoco consume azar — todo el sorteo pasa por el
+    generator local de :meth:`FixedValExam.evaluate`.
+
+    Args:
+        exam: Examen fijo ya construido (define la métrica, las imágenes y el device).
+        net: Red de score a evaluar. Al retornar —o al propagar una excepción— su ``state_dict``
+            es **idéntico** al de la entrada, tensor por tensor; también su modo (lo restaura
+            :meth:`FixedValExam.evaluate`).
+        weights: Pesos con los que medir; tienen que ser exactamente las claves de
+            ``net.state_dict()`` (lo garantiza :meth:`~diffusion.training.ema.EmaShadow.state_dict`,
+            incluso con la red envuelta en ``EpsilonScoreWrapper``, cuyo ``state_dict`` delega al
+            interno). No se mutan.
+
+    Returns:
+        La pérdida del examen medida **bajo** ``weights``, como ``float``.
+
+    Raises:
+        RuntimeError: Si las claves de ``weights`` no coinciden con las de la red (fail-fast de
+            ``load_state_dict``, que se deja propagar tal cual).
+        ValueError: Lo que levante :meth:`FixedValExam.evaluate` (fuente sin imágenes).
+    """
+    # CLONAR, no referenciar: ``state_dict()`` devuelve los tensores VIVOS de la red, así que
+    # guardarlo tal cual como respaldo lo dejaría sobreescrito in-place por el ``load_state_dict``
+    # de abajo — la restauración sería un no-op y la red se quedaría con los pesos ajenos para
+    # siempre. Mismo cuidado que el sidecar de resume en ``trainer.py``.
+    crudos = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    try:
+        # La carga va DENTRO del bloque protegido: con claves que no coinciden,
+        # ``load_state_dict`` copia igual las que sí matchean y solo después levanta el
+        # ``RuntimeError``, así que sin esto el fail-fast dejaría una mezcla de pesos.
+        net.load_state_dict(weights)
+        return exam.evaluate(net)
+    finally:
+        # En el ``finally`` para que ninguna excepción —de la carga o del forward— deje la red con
+        # pesos que no son los del entrenamiento. La restauración es in-place (``copy_`` dentro de
+        # ``load_state_dict``), así que las referencias del optimizador siguen siendo válidas.
+        net.load_state_dict(crudos)
