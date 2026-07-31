@@ -28,8 +28,12 @@ data:                     # fuente de imágenes
   seed: 0
   num_workers: 8          # carga en paralelo usando la CPU (decodificación de imágenes)
   pin_memory: true        # acelera la transferencia de RAM a la VRAM de la GPU
+  # num_workers > 0 NO funciona en Windows (el spawn no puede picklear la clase de dataset, que es
+  # local a una fábrica con import diferido). En Linux —el laboratorio— anda. Para probar este
+  # config en Windows hay que bajarlo a 0. Las dos fuentes de medición usan 0 siempre.
+  #
   # De val_root se derivan DOS fuentes de medición, sin más claves: el examen de validación
-  # (las 450 de val/) y un examen fijo de ENTRENAMIENTO del mismo tamaño (450 de train/,
+  # (las 465 de val/) y un examen fijo de ENTRENAMIENTO del mismo tamaño (465 de train/,
   # las primeras del orden ordenado). Las dos se leen en orientación canónica —sin el augment
   # de arriba— y con el mismo t y el mismo ruido en cada evaluación. Ese examen de train es lo
   # que hace interpretable el gap: el par comparable es 'train (examen fijo)' vs 'val (pesos
@@ -71,12 +75,12 @@ train:                     # hiperparámetros del loop
   seed: 0
   time_sampling: log_uniform  # la validación usa el MISMO muestreo de t (y sus pesos de importance
                               # sampling), así que las dos curvas están en la misma escala
-  # Con ema_decay=0.9999 la rampa de warmup min(d, (1+s)/(10+s)) NO llega al valor nominal en esta
-  # corrida: toca 0.9999 en el paso ~89990, y a 60000 pasos el decay efectivo es 0.99985. En
-  # práctica el EMA promedia casi toda la corrida, así que su curva va a ser muy suave y a quedar
-  # por encima de la cruda hasta bien entrada la corrida. Si querés que el EMA se comporte como una
-  # ventana de ~10k pasos, 0.999 es el valor que satura temprano (paso ~8990).
-  ema_decay: 0.999       # subimos un '9' más para mayor estabilidad a largo plazo
+  # 0.999 satura la rampa de warmup min(d, (1+s)/(10+s)) en el paso ~8990, así que en una corrida
+  # de 60000 pasos el EMA trabaja a su decay nominal la mayor parte del tiempo (ventana efectiva
+  # de ~1000 pasos). Con 0.9999 la rampa NO llegaría al nominal acá —toca 0.9999 en el paso ~89990,
+  # y a 60000 el decay efectivo sería 0.99985—, así que el EMA promediaría casi toda la corrida y su
+  # curva saldría muy suave y por encima de la cruda: menos informativo para leer raw↔EMA.
+  ema_decay: 0.999        # satura temprano: el EMA es una ventana real, no el promedio de la corrida
   amp: true               # Automatic Mixed Precision -> Ahorra ~50% VRAM. La validación se computa
                           # SIEMPRE en fp32 (autocast deshabilitado a propósito), así que su número
                           # es comparable contra celdas entrenadas sin AMP.
