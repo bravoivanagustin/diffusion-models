@@ -3543,3 +3543,70 @@ def test_una_evaluacion_con_ema_no_perturba_la_optimizacion():
     for clave in res_sin.ema_state:
         assert torch.equal(res_val.ema_state[clave], res_sin.ema_state[clave])
     assert torch.equal(g_val.get_state(), g_sin.get_state())  # mismo stream del generator
+
+
+# ------------------------- validation-loss: regresión de no intervención (task 4.3)
+
+
+def _fingerprint(res, net, generator) -> dict:
+    """Todo lo que una corrida produce y que la validación **no** debe alterar (6.1, 6.2).
+
+    Incluye el estado del RNG **global** de torch además del ``generator`` del loop: son dos
+    streams distintos y la validación podría mover cualquiera de los dos (una fuente de datos que
+    se itere sin generator propio mueve el global; reusar el generator del loop mueve el otro).
+    """
+    return {
+        "history": list(res.history),  # floats exactos, no aproximados
+        "pesos": {k: v.detach().clone() for k, v in net.state_dict().items()},
+        "ema": None if res.ema_state is None else {k: v.clone() for k, v in res.ema_state.items()},
+        "generator": generator.get_state(),
+        "rng_global": torch.random.get_rng_state(),
+    }
+
+
+def _assert_mismo_fingerprint(con, sin) -> None:
+    """Compara dos fingerprints exigiendo igualdad exacta, nombrando qué se movió."""
+    assert con["history"] == sin["history"], "la serie de pérdida de entrenamiento cambió"
+    for clave in sin["pesos"]:
+        assert torch.equal(con["pesos"][clave], sin["pesos"][clave]), f"peso distinto en {clave}"
+    if sin["ema"] is not None:
+        for clave in sin["ema"]:
+            assert torch.equal(con["ema"][clave], sin["ema"][clave]), f"sombra distinta en {clave}"
+    assert torch.equal(con["generator"], sin["generator"]), "se movió el generator del loop"
+    assert torch.equal(con["rng_global"], sin["rng_global"]), "se movió el RNG global de torch"
+
+
+@pytest.mark.parametrize("ema_decay", [None, 0.6], ids=["sin_ema", "con_ema"])
+def test_activar_la_validacion_no_cambia_nada_de_la_corrida(ema_decay):
+    """Medir no cambia lo medido: con y sin validación, misma seed ⇒ corrida idéntica (6.1, 6.2).
+
+    Es el invariante que protege **todas** las celdas del estudio ya corridas: si activar la
+    validación moviera la trayectoria, las corridas con y sin validación dejarían de ser
+    comparables y el eje del ablation study se rompería sin que nada falle a la vista.
+
+    El mecanismo por el que se rompería es el azar: ``dsm_loss`` y el muestreo de ``t`` **consumen**
+    el ``generator`` que reciben, así que evaluar con el generator del loop correría su stream y
+    cambiaría todos los pasos siguientes; y cualquier sorteo sin ``generator=`` explícito movería el
+    RNG global, que además se persiste en el sidecar de resume. Por eso el fingerprint compara los
+    dos streams y no solo los pesos.
+
+    Se corre con y sin sombra EMA: con EMA hay además un swap de pesos por evaluación, que es la
+    otra vía por la que la trayectoria podría contaminarse.
+    """
+    def corrida(con_validacion: bool):
+        torch.manual_seed(777)  # mismo punto de partida del RNG global en ambas corridas
+        sde, net, data, cfg = _fresh_ema(num_steps=6, checkpoint_every=2, ema_decay=ema_decay)
+        g = _generador(cfg)
+        extra = (
+            dict(val_batches=_fuente_examen(), train_exam_batches=_fuente_examen(seed=7))
+            if con_validacion
+            else {}
+        )
+        res = train(sde, net, data, cfg, generator=g, **extra)
+        return res, _fingerprint(res, res.net, g)
+
+    res_con, fp_con = corrida(True)
+    _res_sin, fp_sin = corrida(False)
+
+    assert _pasos_de_val(res_con) == [2, 4, 6]  # la validación efectivamente corrió
+    _assert_mismo_fingerprint(fp_con, fp_sin)
