@@ -1653,3 +1653,221 @@ def test_cli_escribe_train_log_jsonl(tmp_path):
     assert lines[-1]["step"] == 10 and "loss_final" in lines[-1] and "elapsed_s" in lines[-1]
     steps = [r for r in lines if r["event"] == "step"]
     assert steps and all({"step", "loss", "elapsed_s", "t"} <= set(r) for r in steps)
+
+
+# =============================================================================
+# validation-loss task 5 — persistencia de la serie de validación y reanudación
+# =============================================================================
+#
+# La serie dispersa de validación viaja en el ``meta`` del checkpoint de PESOS, igual que el
+# ``history`` y por el mismo motivo: no se duplica en el sidecar (que sigue con sus cuatro claves
+# requeridas). ``load_resume`` la lee de forma **tolerante** (``meta.get``), así que un checkpoint
+# anterior a esta feature se reanuda exactamente como siempre (5.5). No hay guard cruzado
+# config↔sidecar: la serie es una *observación*, no estado necesario para continuar la optimización.
+#
+# El criterio 6.4 (mismo examen después del corte) se cubre acá con un test y **sin código**: el
+# examen fijo se re-siembra con una constante del módulo en cada evaluación, así que no hay ningún
+# estado que persistir — reconstruirlo tras el corte da el mismo número por construcción.
+
+from diffusion.training import (  # noqa: E402  (sección append-only, task 5)
+    FixedValExam,
+    make_time_sampler,
+)
+
+#: Receta de red consistente con ``_equiv_net`` (el ``ScoreMLP`` de las corridas de esta suite).
+_RECETA_EQUIV = {"name": "mlp", "kwargs": {"data_dim": 2, "hidden_dim": 32, "num_blocks": 1}}
+
+#: Serie sintética de un punto, con las cuatro claves de ``ValPoint``.
+_PUNTOS_VAL: list[dict] = [{"step": 5, "raw": 1.5, "ema": None, "train": 1.2}]
+
+
+def _fuente_examen_resume(n=6, batch=4, dim=2, seed=99):
+    """Fuente RE-ITERABLE de batches en memoria, con una cola parcial (como el examen real).
+
+    Recorrerla dos veces entrega la misma secuencia de tensores, que es lo que el examen fijo
+    necesita, sin tocar el disco ni depender de torchvision.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    x = torch.randn(n, dim, generator=gen)
+    return [x[i:i + batch] for i in range(0, n, batch)]
+
+
+def _pasos(serie) -> list[int]:
+    """Los pasos de una serie dispersa de validación (el índice de la serie)."""
+    return [punto["step"] for punto in serie]
+
+
+# ------------------------------------ el sidecar sigue sin llevar la serie (5.5)
+
+
+def test_el_sidecar_no_persiste_la_serie_de_validacion(tmp_path):
+    """La serie viaja en el ``meta`` del checkpoint, NO en el sidecar (5.2, 5.5).
+
+    Calca la decisión del ``history`` (1.3): el sidecar guarda solo lo que el checkpoint de pesos no
+    tiene, y la serie ya está en su ``meta``. La tupla de campos requeridos del sidecar la excluye, así
+    que un ``ResumeState`` con serie produce un sidecar con **exactamente** las claves de siempre.
+    """
+    _, opt = _net_with_optimizer_state()
+    resume = _resume_state(opt, start_step=5)
+    resume.val_history = [dict(punto) for punto in _PUNTOS_VAL]
+
+    path = tmp_path / "con_serie.resume.pt"
+    save_resume_state(path, resume)
+    loaded = load_resume_state(path)
+
+    assert set(loaded) == SIDECAR_KEYS
+    assert "val_history" not in loaded
+    assert "history" not in loaded  # el contrato del sidecar no cambia (1.3)
+
+
+# ------------------------ load_resume lee la serie del meta de los pesos (6.3)
+
+
+def test_load_resume_devuelve_la_serie_del_meta_del_checkpoint(tmp_path):
+    """El ``meta`` trae la serie ⇒ ``load_resume`` la pone en el ``ResumeState`` (6.3).
+
+    Misma procedencia que el ``history``: el checkpoint de **pesos**, no el sidecar. Se asevera
+    también que el sidecar del mismo punto no la trae, para que el test no pueda pasar por la ruta
+    equivocada.
+    """
+    net, opt = _net_with_optimizer_state()
+    history = [1.0, 0.5, 0.25, 0.2, 0.1]
+    result = TrainResult(net=net, history=list(history), sde_name="vp", data_dim=2)
+    result.val_history = [dict(punto) for punto in _PUNTOS_VAL]
+    weights = tmp_path / "vp_gaussian_step00005.pt"
+    save_checkpoint(result, weights, model_spec=_MODEL_SPEC)
+    sidecar = resume_sidecar_path(weights)
+    save_resume_state(sidecar, _resume_state(opt, start_step=5, history=history))
+
+    assert "val_history" not in load_resume_state(sidecar)  # no llega por el sidecar
+
+    _sd, meta, resume = load_resume(
+        weights, expected={"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+    )
+
+    assert meta["val_history"] == _PUNTOS_VAL
+    assert resume.val_history == meta["val_history"]
+    assert resume.history == history  # el resto del contrato de load_resume, intacto
+
+
+def test_load_resume_checkpoint_sin_la_clave_deja_la_serie_en_none(tmp_path):
+    """Checkpoint anterior a la feature (sin la clave) ⇒ ``val_history is None``, sin error (5.5).
+
+    La lectura es **tolerante** (``meta.get``): reanudar un checkpoint viejo no puede fallar por una
+    clave que en su momento no existía, y ``None`` es exactamente "este punto de reanudación no trae
+    serie" — el loop arranca la serie vacía y sigue.
+    """
+    weights, sidecar, _saved = _build_checkpoint_and_sidecar(
+        tmp_path, model_spec=_MODEL_SPEC, start_step=5
+    )
+    _sd0, meta0 = load_checkpoint(weights)
+    assert "val_history" not in meta0  # checkpoint "viejo": la clave no está
+
+    _sd, _meta, resume = load_resume(
+        weights, expected={"sde_name": "vp", "model_spec": _MODEL_SPEC, "data_dim": 2}
+    )
+    assert resume.val_history is None
+    assert resume.start_step == 5  # se reanuda igual que siempre
+    assert "val_history" not in load_resume_state(sidecar)
+
+
+# --------------- el snapshot del paso N y la continuación de la serie (6.3)
+
+
+def test_reanudar_desde_el_snapshot_del_paso_n_continua_la_serie_sin_duplicar(tmp_path):
+    """End-to-end (6.3): el snapshot de N trae los puntos hasta N y reanudar continúa la serie.
+
+    Corrida A de 4 pasos con cadencia 2 mide en 2 y 4, y persiste el snapshot del paso 2 (el 4 es el
+    último paso, que el disparador de snapshots excluye). Tres cosas se verifican sobre ese artefacto:
+
+    - su ``meta`` trae **exactamente** el punto medido hasta 2 (la evaluación va antes del snapshot);
+    - reanudar desde ahí hasta 6 pasos deja la serie en ``[2, 4, 6]``: el punto previo se conserva
+      **idéntico** y no se vuelve a medir (el paso 2 ya está completado, así que la próxima evaluación
+      cae en 4);
+    - el sidecar del punto no lleva la serie: llegó por el ``meta``.
+    """
+    sde = make_sde("vp")
+    batch = _fixed_batch()
+    base = tmp_path / "vp_val.pt"
+
+    def persistir(tag, snap):
+        weights = base.with_stem(f"{base.stem}_{tag}")
+        save_checkpoint(snap.result, weights, model_spec=_RECETA_EQUIV)
+        save_resume_state(resume_sidecar_path(weights), snap.resume)
+
+    net_a = _equiv_net()
+    res_a = train(
+        sde,
+        net_a,
+        _const_source(batch),
+        TrainConfig(num_steps=4, checkpoint_every=2, seed=0),
+        on_checkpoint=persistir,
+        val_batches=_fuente_examen_resume(),
+        train_exam_batches=_fuente_examen_resume(seed=7),
+    )
+    assert _pasos(res_a.val_history) == [2, 4]
+
+    weights = base.with_stem(f"{base.stem}_step00002")
+    state_dict, meta, resume = load_resume(
+        weights, expected={"sde_name": "vp", "model_spec": _RECETA_EQUIV, "data_dim": 2}
+    )
+
+    # (a) el meta del snapshot del paso 2 trae exactamente los puntos medidos hasta 2.
+    assert meta["val_history"] == res_a.val_history[:1]
+    assert _pasos(meta["val_history"]) == [2]
+    assert resume.val_history == meta["val_history"]
+    assert "val_history" not in load_resume_state(resume_sidecar_path(weights))
+
+    # (b) reanudar continúa la serie: ni pierde el punto previo ni duplica el del paso 2.
+    net_b = _equiv_net()
+    net_b.load_state_dict(state_dict)
+    res_b = train(
+        sde,
+        net_b,
+        _const_source(batch),
+        TrainConfig(num_steps=6, checkpoint_every=2, seed=0),
+        resume=resume,
+        val_batches=_fuente_examen_resume(),
+        train_exam_batches=_fuente_examen_resume(seed=7),
+    )
+
+    assert _pasos(res_b.val_history) == [2, 4, 6]
+    assert res_b.val_history[0] == res_a.val_history[0]  # el punto previo, intacto
+    assert len(res_b.history) == 6
+
+
+# ------------------------------- el examen se rearma igual tras el corte (6.4)
+
+
+def test_el_examen_se_reconstruye_igual_despues_del_corte():
+    """El examen fijo se rearma **idéntico** tras un corte: no hay estado que persistir (6.4).
+
+    Es la contracara de la persistencia de la serie: los puntos medidos antes y después del corte son
+    comparables porque el examen se reconstruye igual, y eso sale gratis de la re-siembra —cada
+    evaluación crea un generator nuevo sembrado con ``VAL_EXAM_SEED``—. El test simula el corte
+    tirando examen, fuente y muestreador y rearmándolos de cero, como haría un proceso nuevo al
+    reanudar, y **mueve el RNG global en el medio** para que la igualdad no pueda venir de que el
+    estado del proceso se mantuvo intacto.
+    """
+    sde = make_sde("vp")
+    net = _equiv_net()
+
+    def armar_examen() -> FixedValExam:
+        # Todo nuevo: la fuente, el muestreador de tiempos y el examen. Nada viaja del corte.
+        return FixedValExam(
+            sde,
+            _fuente_examen_resume(),
+            time_sampler=make_time_sampler("uniform", sde.T, 1e-3),
+            device="cpu",
+        )
+
+    antes = armar_examen().evaluate(net)
+    torch.manual_seed(31337)  # el corte cambia el estado del proceso; el examen no depende de él
+    torch.randn(5)
+    despues = armar_examen().evaluate(net)
+
+    assert despues == antes  # igualdad EXACTA de floats, no aproximada
+    # El examen tampoco depende de la RED por accidente: con otros pesos el número cambia (si no,
+    # la igualdad de arriba sería trivial y no probaría nada).
+    otra = _equiv_net()
+    assert armar_examen().evaluate(otra) != antes

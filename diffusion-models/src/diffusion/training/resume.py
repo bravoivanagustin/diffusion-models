@@ -342,7 +342,7 @@ def load_resume(
        (3.6). Sin él no hay optimizador/paso/azar para reanudar.
     4. Carga el sidecar y arma el :class:`ResumeState` (optimizador + paso + azar del sidecar;
        ``history`` del ``meta``, 1.3; la sombra EMA del sidecar si está, R3.1; el estado del
-       escalador AMP del sidecar si está, R2.1).
+       escalador AMP del sidecar si está, R2.1; la **serie de validación** del ``meta`` si está, 6.3).
 
     **Corridas con EMA**: el checkpoint de pesos publica la **sombra** (ver
     :func:`~diffusion.training.save_checkpoint`), así que los pesos con los que hay que *continuar
@@ -363,7 +363,10 @@ def load_resume(
     Returns:
         ``(state_dict, meta, resume)``: el ``state_dict`` de la red (a cargar en el modelo: los
         **crudos** del sidecar si están, si no los del checkpoint), el ``meta`` del checkpoint de
-        pesos y el :class:`ResumeState` listo para ``train(resume=...)``.
+        pesos y el :class:`ResumeState` listo para ``train(resume=...)``. Procedencia de cada campo
+        del :class:`ResumeState`: del **sidecar** el optimizador, el paso, los dos estados de azar y
+        —si las trae— la sombra EMA y el estado del escalador AMP; del ``meta`` del checkpoint de
+        **pesos** el ``history`` (1.3) y la ``val_history`` (6.3), las dos series de la corrida.
 
     Raises:
         ValueError: Si el checkpoint es incompatible con la corrida (SDE / ``data_dim`` / receta;
@@ -415,5 +418,13 @@ def load_resume(
         # El escalador AMP lo restaura ``train`` con ``GradScaler.load_state_dict``. Se pide con
         # ``get``: un sidecar sin AMP (o anterior a la feature) no tiene la clave → ``None`` (R2.4).
         scaler_state=sc.get("scaler_state"),
+        # Serie de validación del ``meta`` de los PESOS, no del sidecar (misma ruta que el
+        # ``history``, 6.3): ``save_checkpoint`` la escribe ahí y solo si no está vacía. La lectura es
+        # **tolerante** a propósito (``get``, no ``[...]``): un checkpoint de una corrida sin
+        # validación —o anterior a esta feature— no tiene la clave y se reanuda exactamente como
+        # siempre, con la serie en ``None`` y el loop arrancándola vacía (5.5). No hay guard cruzado
+        # contra la config, a diferencia de ``ema_state``/``scaler_state``: la serie es una
+        # observación, no estado necesario para continuar la optimización.
+        val_history=meta.get("val_history"),
     )
     return state_dict, meta, resume

@@ -3610,3 +3610,113 @@ def test_activar_la_validacion_no_cambia_nada_de_la_corrida(ema_decay):
 
     assert _pasos_de_val(res_con) == [2, 4, 6]  # la validación efectivamente corrió
     _assert_mismo_fingerprint(fp_con, fp_sin)
+
+
+# ------------------- validation-loss: la serie en el meta del checkpoint (task 5)
+#
+# Feature `validation-loss`, tarea 5, lado de la **escritura**: la serie dispersa viaja en el ``meta``
+# del checkpoint de PESOS —la misma ruta que el ``history``, no el sidecar de resume— y **solo si no
+# está vacía**, con el mismo patrón de clave opcional que ya usa ``ema`` acá (y ``ema_state`` /
+# ``scaler_state`` en el sidecar). Sin validación el ``meta`` conserva exactamente las claves de
+# antes de esta feature (5.5): es lo que hace que los checkpoints ya escritos sigan siendo del mismo
+# formato y que las celdas del estudio ya corridas no cambien de artefacto.
+#
+# El lado de la **lectura** (``load_resume``), la reanudación end-to-end y la estabilidad del examen
+# tras el corte viven en ``test_resume.py``, la suite dueña del resolver.
+
+#: Serie sintética de dos puntos con las cuatro claves de ``ValPoint``, incluida la ausencia de EMA.
+_SERIE_VAL: list[dict] = [
+    {"step": 2, "raw": 1.5, "ema": None, "train": 1.2},
+    {"step": 4, "raw": 1.1, "ema": 1.0, "train": 0.9},
+]
+
+#: Claves del ``meta`` de una corrida sin validación (con receta): la expectativa PREVIA a la feature.
+_META_SIN_VAL = {"sde_name", "data_dim", "history", "model"}
+
+
+def test_save_checkpoint_con_serie_persiste_val_history_en_el_meta(tmp_path):
+    """Con serie no vacía el ``meta`` gana ``val_history`` y la serie vuelve intacta del disco (5.2).
+
+    La serie viaja por la **misma ruta que el ``history``** (el ``meta`` del checkpoint de pesos), así
+    que un snapshot es autosuficiente para reconstruir las dos curvas. Se verifica además que cada
+    punto vuelva del disco como un ``dict`` **pelado**: ``ValPoint`` es un ``TypedDict`` justamente
+    para que leer el checkpoint no dependa de que la clase exista o sea importable, y convertirlo a un
+    dataclass o a una tupla en el camino al disco rompería esa propiedad sin que nada más falle.
+    """
+    result, model_spec, _crudos = _corrida_publicable(num_steps=4)
+    result.val_history = [dict(punto) for punto in _SERIE_VAL]
+
+    path = tmp_path / "vp_con_val.pt"
+    save_checkpoint(result, path, model_spec=model_spec)
+
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    assert set(blob) == {"model_state", "meta"}  # el formato del blob no cambia
+
+    _state_dict, meta = load_checkpoint(path)
+    assert set(meta) == _META_SIN_VAL | {"val_history"}  # la única clave nueva
+    assert meta["val_history"] == _SERIE_VAL
+    for punto in meta["val_history"]:
+        # ``type(...) is dict``, no ``isinstance``: un dataclass o un ``UserDict`` pasarían el
+        # isinstance de un Mapping y sí atarían la lectura del archivo a la clase.
+        assert type(punto) is dict
+        assert set(punto) == {"step", "raw", "ema", "train"}
+
+
+def test_save_checkpoint_sin_validacion_deja_el_meta_como_antes_de_la_feature(tmp_path):
+    """Serie vacía ⇒ el ``meta`` NO gana ninguna clave: idéntico al de antes de la feature (5.5).
+
+    La "palanca" de esta tarea es que la serie no esté vacía, así que una corrida sin validación
+    —todas las anteriores a la feature, y todas las que no declaren ``data.val_root``— tiene que
+    producir el ``meta`` de siempre. Se compara el **conjunto de claves** contra la expectativa previa
+    (la misma que asevera ``test_checkpoint_roundtrip``), no solo la ausencia de la clave nueva: así
+    el test también falla si alguien escribiera la clave con un valor "vacío" en lugar de omitirla.
+    """
+    result, model_spec, _crudos = _corrida_publicable(num_steps=4)
+    assert result.val_history == []  # corrida sin fuente de validación
+
+    path = tmp_path / "vp_sin_val.pt"
+    save_checkpoint(result, path, model_spec=model_spec)
+
+    _state_dict, meta = load_checkpoint(path)
+    assert set(meta) == _META_SIN_VAL
+    assert "val_history" not in meta
+
+
+def test_el_hermano_de_crudos_lleva_la_serie_de_la_misma_corrida(tmp_path):
+    """El hermano ``_raw`` también lleva la serie: es la **misma** corrida (5.2).
+
+    ``raw_sibling`` copia el ``meta`` del principal salvo la marca ``ema`` (que reemplaza por
+    ``raw_of``), así que la serie viaja con él por construcción. Es lo que corresponde —los dos
+    checkpoints son dos publicaciones de pesos del mismo entrenamiento, y la serie describe el
+    entrenamiento, no el juego de pesos—, pero conviene que sea **deliberado** y no un accidente del
+    filtrado: si mañana el hermano se armara desde cero en lugar de copiar el ``meta``, este test lo
+    delata.
+    """
+    result, model_spec, _crudos = _corrida_publicable(num_steps=6, ema_decay=0.6)
+    result.val_history = [dict(punto) for punto in _SERIE_VAL]
+
+    path = tmp_path / "vp_final_con_val.pt"
+    save_checkpoint(result, path, model_spec=model_spec, raw_sibling=True)
+
+    _ema_state, ema_meta = load_checkpoint(path)
+    raw_path = tmp_path / "vp_final_con_val_raw.pt"
+    _raw_state, raw_meta = load_checkpoint(raw_path)
+
+    assert ema_meta["val_history"] == _SERIE_VAL
+    assert raw_meta["val_history"] == _SERIE_VAL  # misma corrida ⇒ misma serie
+    # El resto del contrato del hermano no cambia: sin la marca ``ema``, con el puntero al principal.
+    assert set(raw_meta) == _META_SIN_VAL | {"raw_of", "val_history"}
+    assert "ema" not in raw_meta and raw_meta["raw_of"] == path.name
+
+
+def test_el_hermano_de_crudos_sin_validacion_no_gana_la_clave(tmp_path):
+    """Sin serie, el ``meta`` del hermano ``_raw`` también queda como antes de la feature (5.5)."""
+    result, model_spec, _crudos = _corrida_publicable(num_steps=6, ema_decay=0.6)
+    assert result.val_history == []
+
+    path = tmp_path / "vp_final_sin_val.pt"
+    save_checkpoint(result, path, model_spec=model_spec, raw_sibling=True)
+
+    _raw_state, raw_meta = load_checkpoint(tmp_path / "vp_final_sin_val_raw.pt")
+    assert set(raw_meta) == _META_SIN_VAL | {"raw_of"}
+    assert "val_history" not in raw_meta

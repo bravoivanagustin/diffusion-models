@@ -794,6 +794,15 @@ def save_checkpoint(
     - meta **con** ``ema = {"decay": d}`` ⇒ los pesos publicados son la sombra EMA con ese decay.
     - meta con ``raw_of = "<archivo>.pt"`` (y **sin** ``ema``) ⇒ es el *hermano de crudos* de
       ``raw_sibling`` (ver abajo): pesos crudos, contraparte del checkpoint EMA que nombra.
+    - meta con ``val_history = [ValPoint, …]`` ⇒ la corrida midió **validación** y ahí viaja su serie
+      dispersa (un punto por evaluación, ver :class:`~diffusion.training.validation.ValPoint`). La
+      clave se escribe **solo si la serie no está vacía**, con el mismo patrón que ``ema``: sin
+      validación el contenido queda bit a bit igual al de antes de esa feature, así que meta **sin**
+      ``val_history`` ⇒ corrida sin validación (es lo que son todos los checkpoints previos). Viaja
+      por la misma ruta que ``history`` —el ``meta`` de los pesos, no el sidecar de resume— y de ahí
+      la recupera :func:`~diffusion.training.load_resume` para continuar la serie al reanudar. Cada
+      punto es un ``dict`` pelado a propósito: leer el checkpoint no depende de que la clase
+      ``ValPoint`` exista ni sea importable.
 
     Args:
         result: Resultado de :func:`train`.
@@ -829,6 +838,15 @@ def save_checkpoint(
     if model_spec is not None:
         meta["model"] = model_spec  # receta genérica {name, kwargs}, independiente de la clase
 
+    # Serie dispersa de validación: clave OPCIONAL, presente solo si la corrida midió algo (5.2).
+    # El ``if`` es lo que sostiene la retrocompatibilidad por construcción —igual que con ``ema`` más
+    # abajo y que con las claves opcionales del sidecar—: con la serie vacía (toda corrida sin
+    # ``val_batches``, es decir todas las anteriores a esta feature) el ``meta`` no gana NINGUNA clave
+    # y queda bit a bit igual al de antes (5.5). Se copia la lista, con el mismo criterio que el
+    # ``history``: la meta que se serializa no debe aliasar la serie viva del loop.
+    if result.val_history:
+        meta["val_history"] = list(result.val_history)
+
     # Publicación: la sombra EMA cuando está (la foto ya viene clonada de EmaShadow.state_dict) o
     # los pesos vivos como siempre. Con ema_state=None no se agrega NINGUNA clave a la meta: el
     # contenido queda bit a bit igual al de antes de esta feature.
@@ -844,6 +862,9 @@ def save_checkpoint(
     if raw_sibling and publica_ema:
         # Hermano de crudos: checkpoint estándar con los pesos vivos y la MISMA meta, salvo que la
         # marca de EMA se reemplaza por el puntero al principal (sin ``ema`` = pesos crudos).
+        # El filtro excluye SOLO ``ema``, así que ``val_history`` viaja al hermano — y es lo que
+        # corresponde, deliberadamente: los dos checkpoints son dos publicaciones de pesos del MISMO
+        # entrenamiento, y la serie describe el entrenamiento, no el juego de pesos publicado.
         raw_meta = {clave: valor for clave, valor in meta.items() if clave != "ema"}
         raw_meta["raw_of"] = out.name
         torch.save(
