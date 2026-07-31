@@ -1871,3 +1871,329 @@ def test_el_examen_se_reconstruye_igual_despues_del_corte():
     # la igualdad de arriba sería trivial y no probaría nada).
     otra = _equiv_net()
     assert armar_examen().evaluate(otra) != antes
+
+
+# =============================================================================
+# validation-loss task 7.1 — wiring del CLI y el evento de validación en el log
+# =============================================================================
+#
+# Tests de nivel CLI (mismo patrón que la sección de la task 4: ``scripts/train.py`` se carga por
+# ruta con ``importlib``). Acá el config es de IMÁGENES —la validación solo aplica a esa fuente—
+# con dos carpetas HERMANAS sintetizadas con PIL en ``tmp_path`` y una U-Net mínima, así la corrida
+# entera son unos pocos pasos de CPU.
+#
+# Lo que se asevera es el contrato del ``.jsonl`` y de la consola:
+#
+# - el registro de validación llega por el ``on_log`` YA EXISTENTE y se distingue por su campo
+#   ``event``, que sobreescribe el ``"step"`` genérico del envoltorio del CLI porque el registro se
+#   expande **al final** (``**rec``). Ese orden es un invariante de la feature: invertirlo escribiría
+#   todos los puntos de validación como si fueran pasos de entrenamiento;
+# - las ausencias viajan como clave presente con ``null`` (nunca omitidas): un consumidor del
+#   ``.jsonl`` distingue "esta corrida no tenía EMA" de "este formato no tiene el campo";
+# - sin ``data.val_root`` el archivo y la consola salen exactamente como antes de la feature.
+
+#: Claves de un registro de validación en el ``.jsonl`` (las del loop + las que agrega el CLI).
+_CLAVES_VAL_JSONL = {
+    "t", "event", "elapsed_s", "step", "val_raw", "val_ema", "train_fijo", "device",
+}
+
+#: Claves de un registro de paso de entrenamiento (contrato previo a esta feature, sin tocar).
+_CLAVES_STEP_JSONL = {"t", "event", "elapsed_s", "step", "loss"}
+
+
+def _load_train_module():
+    """Carga ``scripts/train.py`` como módulo (no solo su ``main``).
+
+    Igual que :func:`_load_train_main`, pero devuelve el módulo: los tests que espían la escritura
+    compatible con la barra de progreso necesitan el ``tqdm`` que el script importó.
+    """
+    spec = importlib.util.spec_from_file_location("train_cli_under_test", _TRAIN_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _carpetas_imagenes_cli(tmp_path, *, n_train=8, n_val=6, size=8):
+    """Sintetiza dos carpetas **hermanas** de PNGs: ``imgs_train/`` y ``imgs_val/``.
+
+    Hermanas y no anidadas a propósito: el descubrimiento de imágenes es **recursivo**, así que un
+    ``val/`` dentro del ``root`` de entrenamiento contaminaría el set de train (advertencia
+    operativa de la feature).
+
+    ``n_val=6`` con ``batch_size=4`` deja una **cola parcial** en los dos exámenes (el de train se
+    dimensiona con la cantidad de imágenes del de validación), que es la forma real del examen.
+    """
+    Image = pytest.importorskip("PIL.Image")
+    pytest.importorskip("torchvision")  # la fuente de imágenes (transforms + loader)
+    train_dir, val_dir = tmp_path / "imgs_train", tmp_path / "imgs_val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    for i in range(n_train):
+        Image.new("RGB", (size, size), color=(i * 20, 40, 200 - i * 10)).save(
+            train_dir / f"t{i}.png"
+        )
+    for i in range(n_val):
+        Image.new("RGB", (size, size), color=(10, i * 30, 60)).save(val_dir / f"v{i}.png")
+    return train_dir, val_dir
+
+
+def _write_cli_config_val(
+    tmp_path,
+    *,
+    val_dir=None,
+    num_steps=3,
+    checkpoint_every=2,
+    ema_decay=None,
+    size=8,
+    with_train_log=True,
+):
+    """Escribe el ``.yaml`` de una corrida de imágenes mínima; devuelve ``(cfg, ckpt, log)``.
+
+    ``val_dir=None`` reproduce el camino sin validación (la clave ``data.val_root`` simplemente no
+    se declara: es opt-in). La U-Net es la mínima de los smokes de ``test_config_image``: 2 niveles
+    (reduction 2, divide a ``size=8``), 1 res-block, sin atención, ``groups=4``.
+
+    ``with_train_log=False`` omite ``out.train_log``: el ``.jsonl`` también es opt-in y la
+    validación tiene que informar igual por consola sin él.
+    """
+    train_dir = tmp_path / "imgs_train"
+    run_dir = tmp_path / "run"
+    ckpt = run_dir / "vp_imgs.pt"
+    log_path = run_dir / "train_log.jsonl"
+    data: dict = {
+        "kind": "images",
+        "root": str(train_dir),
+        "image_size": size,
+        "batch_size": 4,
+        "augment": False,   # determinístico y más rápido
+        "crop": True,
+        "shuffle": False,
+        "seed": 0,
+    }
+    if val_dir is not None:
+        data["val_root"] = str(val_dir)
+    train_raw: dict = {
+        "num_steps": num_steps,
+        "lr": 1e-3,
+        "seed": 0,
+        "device": "cpu",
+        "checkpoint_every": checkpoint_every,
+        "log_every": 1,
+    }
+    if ema_decay is not None:
+        train_raw["ema_decay"] = ema_decay
+    out: dict = {"checkpoint": ckpt.as_posix()}
+    if with_train_log:
+        out["train_log"] = log_path.as_posix()
+    cfg = {
+        "sde": {"name": "vp"},
+        "data": data,
+        "train": train_raw,
+        "model": {
+            "name": "unet",
+            "image_size": size,
+            "base_channels": 8,
+            "channel_mults": [1, 2],
+            "num_res_blocks": 1,
+            "attn_resolutions": [],
+            "embed_dim": 16,
+            "time_embed_dim": 32,
+            "groups": 4,
+        },
+        "out": out,
+    }
+    config_path = tmp_path / "config_val.yaml"
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+    return str(config_path), ckpt, log_path
+
+
+def _leer_jsonl(path) -> list[dict]:
+    import json
+
+    return [json.loads(linea) for linea in path.read_text(encoding="utf-8").splitlines()]
+
+
+# ------------------------ el registro de validación en el .jsonl (5.1, 5.7)
+
+
+def test_cli_con_validacion_escribe_el_evento_val_en_el_jsonl(tmp_path):
+    """Con ``data.val_root`` el ``.jsonl`` trae una línea por evaluación, distinguible (5.1, 5.7).
+
+    Cubre el wiring completo de la task: que el CLI reenvíe **las dos** fuentes de la corrida
+    ensamblada al loop (la validación mide ⇒ ``val_batches`` llegó; ``train_fijo`` no es nulo ⇒
+    ``train_exam_batches`` también), y que el registro se distinga de los de paso por su ``event``
+    propio, con el paso, los tres valores, el timestamp, el tiempo transcurrido y el **device**
+    (el examen fijo es específico del device).
+
+    Los pasos medidos son 2 y 3 con ``num_steps=3`` / ``checkpoint_every=2``: la cadencia y el
+    **último paso**, que es el disparador propio de la validación.
+    """
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, ckpt, log_path = _write_cli_config_val(
+        tmp_path, val_dir=val_dir, num_steps=3, checkpoint_every=2, ema_decay=0.6
+    )
+
+    assert _load_train_main()(["--config", cfg, "--quiet"]) == 0
+
+    lineas = _leer_jsonl(log_path)
+    vals = [r for r in lineas if r.get("event") == "val"]
+    assert [r["step"] for r in vals] == [2, 3]
+    for r in vals:
+        assert set(r) == _CLAVES_VAL_JSONL
+        assert isinstance(r["val_raw"], float) and r["val_raw"] > 0
+        assert isinstance(r["val_ema"], float)      # EMA activo ⇒ segundo valor real (4.1)
+        assert isinstance(r["train_fijo"], float)   # el examen fijo de train llegó al loop (3.8)
+        assert r["device"] == "cpu"
+        assert isinstance(r["elapsed_s"], float) and r["t"]
+
+    # Los registros de PASO no cambian: mismo event genérico y mismas claves que antes de la
+    # feature, sin ninguna de las de validación (el envoltorio no las filtra ni las agrega).
+    steps = [r for r in lineas if r.get("event") == "step"]
+    assert steps and all(set(r) == _CLAVES_STEP_JSONL for r in steps)
+
+    # El log y la serie del checkpoint son la MISMA medición (no dos caminos distintos).
+    _, meta = load_checkpoint(ckpt)
+    assert [p["step"] for p in meta["val_history"]] == [2, 3]
+    assert [p["raw"] for p in meta["val_history"]] == [r["val_raw"] for r in vals]
+
+
+def test_cli_evento_start_marca_que_la_corrida_tiene_validacion(tmp_path):
+    """El evento ``start`` dice si la corrida mide validación, para poder interpretar el archivo."""
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, _, log_path = _write_cli_config_val(tmp_path, val_dir=val_dir, num_steps=2)
+
+    assert _load_train_main()(["--config", cfg, "--quiet"]) == 0
+
+    start = _leer_jsonl(log_path)[0]
+    assert start["event"] == "start"
+    assert start["val"] is True
+
+
+def test_cli_sin_ema_registra_la_ausencia_como_null(tmp_path):
+    """Sin EMA el valor **falta explícitamente**: clave presente con ``null``, no omitida (4.2).
+
+    La distinción es del consumidor del ``.jsonl``: una clave ausente significaría "este formato no
+    tiene el campo" y una presente en ``null``, "esta corrida no mantenía sombra EMA". Se asevera
+    sobre el texto serializado, no solo sobre el dict parseado, para que un filtro de ``None`` en el
+    camino de escritura no pueda pasar desapercibido.
+    """
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, _, log_path = _write_cli_config_val(
+        tmp_path, val_dir=val_dir, num_steps=2, checkpoint_every=2  # sin ema_decay
+    )
+
+    assert _load_train_main()(["--config", cfg, "--quiet"]) == 0
+
+    texto = log_path.read_text(encoding="utf-8")
+    vals = [r for r in _leer_jsonl(log_path) if r.get("event") == "val"]
+    assert vals
+    for r in vals:
+        assert "val_ema" in r and r["val_ema"] is None
+        assert isinstance(r["train_fijo"], float)
+    assert '"val_ema": null' in texto
+
+
+# ------------------------------- resumen de consola y barra de progreso (5.4, 5.6)
+
+
+def test_cli_informa_por_consola_el_ultimo_punto_medido(tmp_path, capsys):
+    """Al terminar, la consola informa el **último** valor medido: crudo, EMA y examen de train (5.4).
+
+    Sin ``--quiet``, así que la corrida lleva barra de progreso y los avisos por evaluación pasan
+    por el escritor compatible con ella. Los valores del resumen se comparan contra el último punto
+    de la serie del checkpoint, no contra una constante: el resumen tiene que informar **ese** punto
+    y no el primero.
+    """
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, ckpt, _ = _write_cli_config_val(
+        tmp_path, val_dir=val_dir, num_steps=3, checkpoint_every=2, ema_decay=0.6
+    )
+
+    assert _load_train_main()(["--config", cfg]) == 0
+
+    out = capsys.readouterr().out
+    _, meta = load_checkpoint(ckpt)
+    ultimo = meta["val_history"][-1]
+    assert ultimo["step"] == 3
+    # El resumen final (línea con la flecha, como el resto de los artefactos) trae el último punto.
+    resumen = [l for l in out.splitlines() if "Validación" in l and "->" in l]
+    assert len(resumen) == 1
+    assert f"{ultimo['raw']:.6f}" in resumen[0]
+    assert f"{ultimo['ema']:.6f}" in resumen[0]
+    assert f"{ultimo['train']:.6f}" in resumen[0]
+    assert f"{ultimo['step']}" in resumen[0]
+    # …y hubo además un aviso por evaluación (dos evaluaciones: la cadencia y el último paso).
+    avisos = [l for l in out.splitlines() if "Validación" in l and "->" not in l]
+    assert len(avisos) == 2
+    assert f"{meta['val_history'][0]['raw']:.6f}" in avisos[0]
+
+
+def test_cli_los_avisos_de_validacion_van_por_el_escritor_de_la_barra(tmp_path, monkeypatch):
+    """Los mensajes emitidos **durante** una evaluación usan ``tqdm.write``, no ``print`` (5.6).
+
+    La evaluación cae dentro del paso, con la barra de progreso activa: un ``print`` la partiría en
+    dos. El test espía el ``tqdm.write`` que importó el script —si el aviso saliera por ``print``, el
+    espía no vería nada— y verifica que los dos avisos pasaron por ahí.
+    """
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, _, _ = _write_cli_config_val(
+        tmp_path, val_dir=val_dir, num_steps=3, checkpoint_every=2, ema_decay=0.6
+    )
+    module = _load_train_module()
+    escritos: list[str] = []
+    monkeypatch.setattr(module.tqdm, "write", lambda msg, *a, **k: escritos.append(str(msg)))
+
+    assert module.main(["--config", cfg]) == 0
+
+    avisos = [msg for msg in escritos if "Validación" in msg]
+    assert len(avisos) == 2  # una por evaluación (cadencia 2 + último paso 3)
+    assert all("paso" in msg and "val=" in msg for msg in avisos)
+
+
+def test_cli_con_validacion_sin_train_log_informa_igual(tmp_path, capsys):
+    """El ``.jsonl`` también es opt-in: sin ``out.train_log`` la validación informa por consola igual.
+
+    Es el camino en que el sumidero de estados existe **solo** por la validación (no hay archivo
+    donde escribir): si el envoltorio intentara serializar sin archivo abierto, la corrida
+    reventaría en la primera evaluación en lugar de terminar en 0.
+    """
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, ckpt, log_path = _write_cli_config_val(
+        tmp_path, val_dir=val_dir, num_steps=2, checkpoint_every=2, with_train_log=False
+    )
+
+    assert _load_train_main()(["--config", cfg]) == 0
+
+    assert not log_path.exists()  # no se declaró: no se crea nada
+    out = capsys.readouterr().out
+    assert "Validación ->" in out
+    _, meta = load_checkpoint(ckpt)
+    assert [p["step"] for p in meta["val_history"]] == [2]
+
+
+# --------------------------------- sin data.val_root: todo igual que antes (5.5)
+
+
+def test_cli_sin_val_root_no_escribe_ninguna_linea_de_validacion(tmp_path, capsys):
+    """Sin la clave, el ``.jsonl``, la consola y el checkpoint salen como antes de la feature (5.5).
+
+    Misma config de imágenes, misma cantidad de pasos: la única diferencia es que no se declara
+    ``data.val_root``. No hay registro de validación, el evento ``start`` lo dice, la consola no
+    menciona nada y el ``meta`` del checkpoint no gana la clave de la serie.
+    """
+    _carpetas_imagenes_cli(tmp_path)
+    cfg, ckpt, log_path = _write_cli_config_val(
+        tmp_path, val_dir=None, num_steps=3, checkpoint_every=2
+    )
+
+    assert _load_train_main()(["--config", cfg]) == 0
+
+    lineas = _leer_jsonl(log_path)
+    assert not [r for r in lineas if r.get("event") == "val"]
+    assert lineas[0]["event"] == "start" and lineas[0]["val"] is False
+    steps = [r for r in lineas if r.get("event") == "step"]
+    assert steps and all(set(r) == _CLAVES_STEP_JSONL for r in steps)
+    assert "Validación" not in capsys.readouterr().out
+    _, meta = load_checkpoint(ckpt)
+    assert "val_history" not in meta

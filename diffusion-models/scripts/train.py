@@ -21,6 +21,13 @@ Con ``train.ema_decay`` configurado los checkpoints publican la **sombra EMA** d
 :func:`diffusion.training.save_checkpoint`) y el guardado final escribe además el **hermano de
 crudos** ``…_raw.pt`` con los pesos del último paso de Adam, para poder comparar crudo vs EMA
 dentro de la misma corrida.
+
+Con ``data.val_root`` (solo ``kind: images``) la corrida mide además la **pérdida de validación**
+por examen fijo cada ``train.checkpoint_every`` pasos y en el paso final: el CLI reenvía al loop las
+dos fuentes que armó el config layer (el examen de validación y el examen fijo de entrenamiento que
+lo hace legible), escribe un registro propio por evaluación en el ``.jsonl`` —``event: "val"``, con
+los tres valores y el ``device``— e informa el último punto medido al cerrar. Sin la clave no se mide
+nada y la salida es exactamente la de antes de la feature.
 """
 
 from __future__ import annotations
@@ -78,6 +85,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true",
                    help="No imprimir el progreso por paso.")
     return p
+
+
+def format_val_values(raw: float, ema: float | None, train: float | None) -> str:
+    """Formatea los valores de **una** evaluación de validación para consola.
+
+    Un solo formateador para los dos mensajes que los muestran (el aviso por evaluación y el
+    resumen final), así los dos leen igual y no se desincronizan. Los valores ausentes se
+    **omiten** en lugar de imprimirse como ``None``: en la consola la ausencia se lee sola (sin
+    EMA no hay curva de EMA), a diferencia del ``.jsonl``, donde la clave viaja igual con ``null``
+    porque su consumidor necesita distinguir "no había EMA" de "el campo no existe".
+
+    Args:
+        raw: Pérdida de validación con los pesos vivos.
+        ema: Ídem con la sombra EMA, o ``None`` si la corrida no mantiene sombra.
+        train: Examen fijo de entrenamiento (la referencia del gap), o ``None``.
+
+    Returns:
+        Una línea del tipo ``"val=0.123456  val(EMA)=0.120000  train fijo=0.100000"``.
+    """
+    partes = [f"val={raw:.6f}"]
+    if ema is not None:
+        partes.append(f"val(EMA)={ema:.6f}")
+    if train is not None:
+        partes.append(f"train fijo={train:.6f}")
+    return "  ".join(partes)
 
 
 def save_loss_curve(path: str | pathlib.Path, history: list[float], title: str) -> None:
@@ -230,18 +262,23 @@ def main(argv=None) -> int:
     # --- Log de entrenamiento (.jsonl) opcional: start + estados periódicos + end, con timestamp ---
     # train() no toca el filesystem ni el reloj: emite estados por on_log y acá se les pone el
     # timestamp y se escriben (modo append: un resume continúa el mismo log).
+    #
+    # El mismo callback atiende las DOS variantes de registro que emite el loop (ver el contrato de
+    # eventos de train): los estados de paso y —con validación configurada— el punto medido en cada
+    # evaluación. La validación es opt-in por 'data.val_root': el config layer entrega las dos
+    # fuentes de examen juntas o ninguna, así que una sola bandera describe la corrida.
+    tiene_val = spec.val_data is not None
     log_fh = None
-    on_log = None
+    t0 = time.time()
+
+    def _log(rec):
+        rec = {"t": datetime.datetime.now().isoformat(timespec="seconds"), **rec}
+        log_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        log_fh.flush()  # cada línea persiste ya: un corte deja el log parcial usable
+
     if spec.train_log is not None:
         spec.train_log.parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(spec.train_log, "a", encoding="utf-8")
-        t0 = time.time()
-
-        def _log(rec):
-            rec = {"t": datetime.datetime.now().isoformat(timespec="seconds"), **rec}
-            log_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            log_fh.flush()  # cada línea persiste ya: un corte deja el log parcial usable
-
         _log({
             "event": "start",
             "sde": spec.sde.name,
@@ -251,15 +288,39 @@ def main(argv=None) -> int:
             "model": type(spec.model).__name__,
             "data_dim": spec.sde.data_dim,
             "resume_from_step": resume.start_step if resume is not None else 0,
+            # Si la corrida mide validación: lo que le permite a un lector posterior del archivo
+            # saber si la ausencia de registros 'val' significa "no se midió" o "se cortó antes".
+            "val": tiene_val,
         })
 
-        def on_log(rec):
+    def _on_log(rec):
+        """Sumidero de los estados del loop: consola (validación) + ``.jsonl`` (todo)."""
+        if rec.get("event") == "val":
+            # La evaluación cae DENTRO del paso, con la barra de progreso activa: el aviso va por
+            # tqdm.write (misma convención que los avisos de checkpoint), que escribe por encima de
+            # la barra sin partirla — un print la duplicaría.
+            tqdm.write(
+                f"Validación (paso {rec['step']}): "
+                + format_val_values(rec["val_raw"], rec["val_ema"], rec["train_fijo"])
+            )
+        if log_fh is not None:
+            # INVARIANTE: ``**rec`` va ÚLTIMO. De eso depende que el registro de validación —que
+            # trae su propio 'event'— sobreescriba el "step" genérico y quede distinguible en el
+            # archivo; invertir el orden escribiría todos los puntos de validación como si fueran
+            # pasos de entrenamiento. No reordenar sin revisar el contrato de eventos del loop.
             _log({"event": "step", "elapsed_s": round(time.time() - t0, 3), **rec})
+
+    # Sin log ni validación no hay nada que hacer con los estados: el callback queda en None y el
+    # loop no paga ni la llamada (comportamiento previo a la feature, sin ramas nuevas).
+    on_log = _on_log if (log_fh is not None or tiene_val) else None
 
     # Barra de progreso (%, ETA, it/s) salvo --quiet, que apaga tanto la barra como el print.
     result = train(
         spec.sde, spec.model, spec.data, spec.config,
         on_checkpoint=on_checkpoint, on_log=on_log, resume=resume, progress=not args.quiet,
+        # Las dos fuentes de examen que armó el config layer (None sin 'data.val_root'): la de
+        # validación y la del examen fijo de entrenamiento que hace legible su curva.
+        val_batches=spec.val_data, train_exam_batches=spec.train_exam_data,
     )
     hist = result.history
     k = max(1, len(hist) // 20)  # media de extremos: la pérdida per-step es ruidosa
@@ -268,6 +329,15 @@ def main(argv=None) -> int:
         f"Listo. pérdida inicial≈{ini:.6f} -> final≈{fin:.6f}  "
         f"(medias de {k} pasos; {len(hist)} pasos guardados)"
     )
+    if result.val_history:
+        # Último punto de la serie dispersa: la foto de validación más reciente de la corrida (el
+        # disparador incluye el paso final, así que es el del último paso). La serie completa vive en
+        # el .jsonl y en el meta del checkpoint; acá se informa solo el cierre.
+        ultimo = result.val_history[-1]
+        print(
+            f"Validación -> paso {ultimo['step']}: "
+            + format_val_values(ultimo["raw"], ultimo["ema"], ultimo["train"])
+        )
 
     if log_fh is not None:
         _log({
