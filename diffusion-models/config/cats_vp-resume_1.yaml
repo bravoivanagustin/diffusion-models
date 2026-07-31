@@ -1,0 +1,48 @@
+# Entrenamiento escalado a dataset completo (9000 gatos, 64x64)
+# Hardware objetivo: RTX 3090 (24GB VRAM)
+
+sde:                      # forward VP-SDE
+  name: vp
+
+data:                     # fuente de imágenes
+  kind: images
+  root: data/cats-v1
+  image_size: 64          # subimos la resolución a 64x64
+  batch_size: 128         # aprovechando los 24GB de la 3090
+  augment: true           # volteo horizontal aleatorio (duplica el dataset virtualmente)
+  shuffle: true           # obligatorio para generalizar
+  seed: 0
+  num_workers: 8          # carga en paralelo usando la CPU (decodificación de imágenes)
+  pin_memory: true        # acelera la transferencia de RAM a la VRAM de la GPU
+
+model:                    # arquitectura U-Net "Premium" (~50M parámetros)
+  name: unet
+  score_parametrization: epsilon
+  in_channels: 3
+  image_size: 64          # DEBE coincidir con data.image_size
+  base_channels: 128      # mayor capacidad expresiva inicial
+  channel_mults: [1, 2, 2, 2] # 4 niveles
+  num_res_blocks: 2       # red más profunda
+  embed_dim: 256
+  time_embed_dim: 512     # respeta la regla de 4x base_channels (aprox)
+  attn_resolutions: [16, 8] # Atención en resoluciones bajas para coherencia global
+  groups: 32              # divide perfecto a 128 (GroupNorm)
+  time_scale: 1000.0
+
+train:                    # hiperparámetros del loop
+  num_steps: 60000       # aumentamos pasos para procesar el dataset muchas veces
+  checkpoint_every: 1000 # snapshot cada 10k pasos, cada snapshot deja su sidecar …_stepNNNNN.resume.pt para reanudar
+  keep_last_checkpoints: 3 # retención rolling: conserva solo los 3 snapshots más nuevos (borra los viejos); el final y su _raw nunca se tocan. Subilo/bajalo o quitalo (= conservar todos)
+  lr: 1.0e-4              # LR más estándar para entrenamientos grandes y estables
+  t_eps: 1.0e-4
+  device: cuda            # usar la GPU (RTX 3090)
+  log_every: 1000         # loguear menos seguido para no spammar la consola
+  seed: 0
+  time_sampling: log_uniform
+  ema_decay: 0.9999       # subimos un '9' más para mayor estabilidad a largo plazo
+  amp: true               # Automatic Mixed Precision (float16) -> Ahorra ~50% VRAM
+
+out:                      # salidas
+  checkpoint: /mnt/data/abravo/diffusion-models/phase_3/cats_vp.pt
+  loss_curve: /mnt/data/abravo/diffusion-models/phase_3/cats_vp_loss.png
+  train_log: /mnt/data/abravo/diffusion-models/phase_3/cats_vp_train_log_1.jsonl 
