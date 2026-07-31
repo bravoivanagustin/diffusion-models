@@ -2773,6 +2773,7 @@ def test_train_amp_on_con_ema_publica_pesos_float32(tmp_path):
 # `torch.backends.cudnn.benchmark` se salva/restaura alrededor de cada test para no filtrarlo.
 
 from diffusion.training import trainer as _trainer_mod  # noqa: E402
+from diffusion.training import VAL_EXAM_SEED  # noqa: E402  (semilla compartida por los exámenes)
 
 
 @pytest.fixture
@@ -2930,3 +2931,329 @@ def test_train_on_log_funciona_con_log_every_cero():
     train(sde, net, data, TrainConfig(num_steps=40, seed=0, log_every=0), on_log=recs.append)
     assert len(recs) == 20  # num_steps//20 = 2 -> pasos 2,4,...,40
     assert recs[-1]["step"] == 40
+
+
+# ------------- validation-loss: entrada opt-in, exámenes y fail-fast (task 4.1)
+#
+# Feature `validation-loss`, tarea 4.1: el SEAM de la validación en el loop —los dos parámetros
+# keyword-only, la construcción de los dos :class:`FixedValExam` en el bloque de fail-fast y el
+# rechazo de la cadencia deshabilitada (3.7)—, más los campos de la serie en ``TrainResult`` y
+# ``ResumeState`` y su continuación al reanudar. La CADENCIA y las tres mediciones son de la tarea
+# 4.2: acá los exámenes se construyen y todavía nadie los llama, así que ningún test de esta sección
+# asevera que la serie se llene durante la corrida.
+#
+# Se reusan los helpers de la sección de EMA (``_fresh_ema`` / ``_generador``: corrida chica con
+# pesos iniciales y fuente de datos idénticos en cada invocación) y de la de reanudación
+# (``_fuente_constante`` / ``_batch_constante``).
+
+
+class _DataProhibidaVal:
+    """Fuente centinela: cualquier consumo de datos delata un fail-fast tardío de la validación."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise AssertionError("el loop consumió data antes de validar la cadencia de validación")
+
+
+class _FuenteValVigilada:
+    """Fuente re-iterable de batches que **cuenta** sus recorridos.
+
+    Sirve para aseverar el otro lado del fail-fast: cuando la cadencia es inválida, el loop no solo
+    no consume el primer batch de entrenamiento — tampoco toca la fuente del examen.
+    """
+
+    def __init__(self, batches: list) -> None:
+        self._batches = batches
+        self.recorridos = 0
+
+    def __iter__(self):
+        self.recorridos += 1
+        return iter(self._batches)
+
+
+def _fuente_examen(n=6, batch=4, dim=2, seed=99):
+    """Fuente RE-ITERABLE de batches en memoria (una lista), con una cola parcial.
+
+    Es lo que el examen fijo necesita (recorrerla dos veces entrega la misma secuencia) sin tocar el
+    disco ni depender de torchvision, igual que en la suite del evaluador.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    x = torch.randn(n, dim, generator=gen)
+    return [x[i:i + batch] for i in range(0, n, batch)]
+
+
+def _espiar_examenes(monkeypatch) -> list[dict]:
+    """Reemplaza ``FixedValExam`` en el loop por un doble que solo registra cómo lo construyeron.
+
+    Permite verificar la construcción —cuántos exámenes, con qué fuente, con qué muestreador de
+    tiempos y en qué device— sin evaluar nada (en esta tarea el loop todavía no los llama).
+    """
+    llamadas: list[dict] = []
+
+    def _doble(sde, batches, **kwargs):
+        llamadas.append({"sde": sde, "batches": batches, **kwargs})
+        return object()  # centinela: nadie lo usa todavía
+
+    monkeypatch.setattr(_trainer_mod, "FixedValExam", _doble)
+    return llamadas
+
+
+def _espiar_time_sampler(monkeypatch) -> list:
+    """Registra el muestreador de tiempos que construye el loop, sin cambiar su comportamiento."""
+    construidos: list = []
+    real = _trainer_mod.make_time_sampler
+
+    def _spy(*args, **kwargs):
+        muestreador = real(*args, **kwargs)
+        construidos.append(muestreador)
+        return muestreador
+
+    monkeypatch.setattr(_trainer_mod, "make_time_sampler", _spy)
+    return construidos
+
+
+def _resume_val(net, **overrides) -> ResumeState:
+    """:class:`ResumeState` **cargable** (optimizador real) para ejercitar la reanudación.
+
+    A diferencia de ``_resume_dummy`` —pensado para guards que fallan antes de tocarlo— este pasa
+    el ``optimizer.load_state_dict`` del loop, así que la corrida reanudada llega a correr pasos.
+    """
+    base = dict(
+        optimizer_state=torch.optim.Adam(net.parameters(), lr=1e-3).state_dict(),
+        start_step=2,
+        torch_rng_state=torch.get_rng_state(),
+        generator_state=torch.Generator().manual_seed(0).get_state(),
+        history=[1.0, 2.0],
+    )
+    base.update(overrides)
+    return ResumeState(**base)
+
+
+def test_trainresult_y_resumestate_declaran_la_serie_como_campo_opcional():
+    """La serie de validación es un campo con default inerte en los dos dataclasses (5.2).
+
+    ``TrainResult.val_history`` arranca en lista **vacía** (y por ``default_factory``, así que dos
+    resultados no comparten la misma lista) y ``ResumeState.val_history`` en ``None`` — el
+    equivalente de "este punto de reanudación no trae serie", que es el caso de todos los
+    checkpoints anteriores a esta feature.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+
+    res = TrainResult(net=net)
+    assert res.val_history == []
+    assert TrainResult(net=net).val_history is not res.val_history  # default_factory, no compartida
+
+    assert _resume_val(net).val_history is None
+
+
+def test_train_sin_val_batches_no_construye_nada_ni_cambia_la_corrida(monkeypatch):
+    """Sin fuente de validación: cero exámenes construidos y corrida idéntica (6.1).
+
+    El parámetro con default ``None`` **es** la palanca: una llamada que ni lo menciona y una que lo
+    pasa explícitamente en ``None`` tienen que producir la misma historia (igualdad EXACTA de
+    floats), los mismos pesos finales (``torch.equal``) y el mismo estado del ``generator``. El
+    espía sobre ``FixedValExam`` prueba lo estructural —no se construye **nada**, así que no hay
+    ninguna rama nueva activa— y la segunda corrida trae además ``train_exam_batches``: sin fuente
+    de validación esa fuente se **ignora** en silencio (no hay serie donde publicar su valor), no se
+    rechaza.
+    """
+    llamadas = _espiar_examenes(monkeypatch)
+
+    sde, net_a, data, cfg = _fresh_ema()
+    g_a = _generador(cfg)
+    res_a = train(sde, net_a, data, cfg, generator=g_a)  # parámetros AUSENTES de la llamada
+
+    sde, net_b, data, cfg = _fresh_ema()
+    g_b = _generador(cfg)
+    res_b = train(
+        sde,
+        net_b,
+        data,
+        cfg,
+        generator=g_b,
+        val_batches=None,
+        train_exam_batches=_fuente_examen(),
+    )
+
+    assert llamadas == []  # ni un examen construido: cero ramas activas
+    assert res_a.history == res_b.history  # igualdad exacta de floats por paso
+    sd_a, sd_b = net_a.state_dict(), net_b.state_dict()
+    assert sd_a.keys() == sd_b.keys()
+    for key in sd_a:
+        assert torch.equal(sd_a[key], sd_b[key]), f"peso final distinto en {key}"
+    assert torch.equal(g_a.get_state(), g_b.get_state())  # mismo stream del generator
+    assert res_a.val_history == [] and res_b.val_history == []
+
+
+@pytest.mark.parametrize("cadencia", [0, -1])
+def test_train_rechaza_validacion_con_cadencia_deshabilitada(cadencia):
+    """Validación pedida + ``checkpoint_every <= 0`` ⇒ ``ValueError`` antes del primer batch (3.7).
+
+    La cadencia de checkpoints es la que gobierna cada cuántos pasos se evalúa, así que pedir
+    validación con esa cadencia apagada es una corrida que nunca mediría nada: se falla temprano en
+    lugar de entrenar en silencio sin validación. El chequeo vive en el loop —no en el config
+    layer— porque es el único punto que ve el valor **efectivo** (el CLI lo sobreescribe después de
+    armar la corrida). La fuente centinela convierte cualquier consumo prematuro de datos en un
+    ``AssertionError`` distinto del error esperado, y la fuente del examen tampoco se recorre.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    cfg = TrainConfig(num_steps=2, seed=0, checkpoint_every=cadencia)
+    fuente_val = _FuenteValVigilada(_fuente_examen())
+
+    with pytest.raises(ValueError) as exc:
+        train(sde, net, _DataProhibidaVal(), cfg, val_batches=fuente_val)
+
+    mensaje = str(exc.value)
+    assert "checkpoint_every" in mensaje
+    assert str(cadencia) in mensaje  # nombra el valor recibido
+    assert fuente_val.recorridos == 0
+
+
+def test_train_construye_los_examenes_antes_del_primer_batch_con_su_time_sampler(monkeypatch):
+    """Los dos exámenes se construyen en el fail-fast, con el muestreador del loop (3.4, 3.8).
+
+    Dos cosas estructurales. Primero, la construcción ocurre **antes** de pedir el primer batch: la
+    fuente centinela revienta en el primer ``next``, y los exámenes ya están construidos cuando eso
+    pasa. Segundo, los dos reciben **el mismo objeto** ``TimeSampler`` que usa el loop (no uno
+    propio): así "val y train usan el mismo criterio de muestreo de ``t``" no depende de que alguien
+    lo recuerde. Se verifica además el orden (validación primero, examen de train después) y que
+    cada uno reciba su propia fuente y el device de la corrida.
+    """
+    llamadas = _espiar_examenes(monkeypatch)
+    muestreadores = _espiar_time_sampler(monkeypatch)
+
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    fuente_val, fuente_train = _fuente_examen(), _fuente_examen(seed=7)
+    cfg = TrainConfig(num_steps=2, seed=0, checkpoint_every=1)
+
+    with pytest.raises(AssertionError, match="consumió data"):
+        train(
+            sde,
+            net,
+            _DataProhibidaVal(),
+            cfg,
+            val_batches=fuente_val,
+            train_exam_batches=fuente_train,
+        )
+
+    assert len(llamadas) == 2
+    assert len(muestreadores) == 1  # un único muestreador en la corrida
+    assert llamadas[0]["batches"] is fuente_val
+    assert llamadas[1]["batches"] is fuente_train
+    for llamada in llamadas:
+        assert llamada["sde"] is sde
+        assert llamada["time_sampler"] is muestreadores[0]  # el del loop, no uno propio
+        assert torch.device(llamada["device"]) == torch.device(cfg.device)
+        # Los dos exámenes comparten la MISMA semilla (3.8): es el mecanismo por el que ambos
+        # sortean la misma secuencia de t y de ruido, y por lo tanto lo único que hace
+        # interpretable el gap train↔val. Que uno de los dos la override —aunque sea con un
+        # valor "razonable"— convierte la distancia entre las curvas en un artefacto de dos
+        # sorteos distintos, con la forma de un gap de generalización pero sin significado.
+        assert llamada.get("seed", VAL_EXAM_SEED) == VAL_EXAM_SEED
+
+
+def test_train_sin_fuente_de_examen_de_train_construye_solo_el_de_validacion(monkeypatch):
+    """``train_exam_batches`` es opcional: sin él se construye un solo examen (el de validación)."""
+    llamadas = _espiar_examenes(monkeypatch)
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    fuente_val = _fuente_examen()
+    cfg = TrainConfig(num_steps=2, seed=0, checkpoint_every=1)
+
+    with pytest.raises(AssertionError, match="consumió data"):
+        train(sde, net, _DataProhibidaVal(), cfg, val_batches=fuente_val)
+
+    assert len(llamadas) == 1
+    assert llamadas[0]["batches"] is fuente_val
+
+
+def test_train_con_validacion_completa_la_corrida():
+    """Con validación pedida y cadencia válida la corrida entrena de punta a punta.
+
+    Smoke del seam con los exámenes **reales** (sin dobles): construirlos no rompe el loop y el
+    ``history`` sigue siendo la serie per-step completa. La serie de validación se llena en la
+    tarea 4.2, así que acá solo se pide que exista como lista.
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=2)
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+    assert len(res.history) == 4
+    assert isinstance(res.val_history, list)
+
+
+def test_train_reanuda_continuando_la_serie_de_validacion():
+    """Al reanudar, la serie del punto de reanudación se **continúa**, no se pierde (6.3).
+
+    Los puntos ya medidos entran en la serie del resultado tal cual, y la lista del
+    :class:`ResumeState` no se muta (se copia, igual que el ``history``): un caller que reusara el
+    mismo ``ResumeState`` para otra corrida no encontraría puntos ajenos.
+    """
+    puntos = [{"step": 2, "raw": 1.5, "ema": None, "train": 1.2}]
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    cfg = TrainConfig(num_steps=3, seed=0, checkpoint_every=2)
+
+    res = train(
+        sde,
+        net,
+        _fuente_constante(_batch_constante()),
+        cfg,
+        resume=_resume_val(net, val_history=puntos),
+        val_batches=_fuente_examen(),
+    )
+
+    assert res.val_history[:1] == puntos  # los previos, intactos y al frente de la serie
+    assert res.val_history is not puntos  # copia, no la lista del resume
+    assert len(puntos) == 1  # la lista del resume no ganó puntos
+
+
+def test_train_reanuda_sin_guard_cruzado_entre_config_y_sidecar():
+    """La serie no tiene guard cruzado config↔sidecar, a diferencia del EMA y del escalador.
+
+    Esos dos son estado **necesario** para continuar la optimización y perderlos corrompería la
+    corrida, así que las combinaciones cruzadas se rechazan. La serie de validación es una
+    **observación**: que falte solo hace que arranque vacía, y que sobre no hace daño. Las dos
+    combinaciones cruzadas corren sin levantar nada.
+    """
+    puntos = [{"step": 2, "raw": 1.5, "ema": None, "train": None}]
+    cfg = TrainConfig(num_steps=3, seed=0, checkpoint_every=2)
+
+    # (a) Serie en el punto de reanudación, corrida SIN fuente de validación: se conserva tal cual
+    # (sin fuente no hay nada que medir, así que la serie queda con los puntos previos y nada más).
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    res_sin_fuente = train(
+        sde,
+        net,
+        _fuente_constante(_batch_constante()),
+        cfg,
+        resume=_resume_val(net, val_history=puntos),
+    )
+    assert res_sin_fuente.val_history == puntos
+
+    # (b) Fuente de validación, punto de reanudación SIN serie (sidecar/checkpoint viejo): arranca
+    # vacía y la corrida sigue normalmente.
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    res_sin_serie = train(
+        sde,
+        net,
+        _fuente_constante(_batch_constante()),
+        cfg,
+        resume=_resume_val(net),
+        val_batches=_fuente_examen(),
+    )
+    assert isinstance(res_sin_serie.val_history, list)
+    assert len(res_sin_serie.history) == 3  # continuó la corrida hasta el total

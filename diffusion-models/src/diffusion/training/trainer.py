@@ -23,7 +23,7 @@ explícita) y carga el ``state_dict`` — así el mismo checkpoint sirve al ``Sc
 from __future__ import annotations
 
 import pathlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 import torch
@@ -33,6 +33,7 @@ from ..sde import ForwardSDE
 from .ema import EmaShadow
 from .losses import dsm_loss
 from .time_sampling import make_time_sampler
+from .validation import FixedValExam, ValPoint
 
 
 def _enable_cudnn_autotune(device: torch.device) -> None:
@@ -114,6 +115,12 @@ class TrainResult:
     # la red, con los parámetros promediados) cuando ``config.ema_decay`` está configurado; ``None``
     # sin EMA. Es lo que publican los checkpoints en lugar de los pesos crudos.
     ema_state: dict | None = None
+    # Serie DISPERSA de validación (:class:`~diffusion.training.validation.ValPoint` por evaluación,
+    # indexada por el paso en que se midió), al lado de la serie DENSA per-step de ``history``. Queda
+    # **vacía** —el default— cuando la corrida no recibe fuente de validación, que es el caso de
+    # todas las corridas anteriores a esta feature: el campo existe pero no agrega contenido (6.1).
+    # Al reanudar continúa la serie del punto de reanudación en lugar de arrancar de cero (6.3).
+    val_history: list[ValPoint] = field(default_factory=list)
 
 
 @dataclass
@@ -152,6 +159,15 @@ class ResumeState:
             sidecar no gana ninguna clave (R2.4). En CPU el escalador va deshabilitado, así que su
             ``state_dict()`` es ``{}`` (un dict **vacío**, no ``None``): "presencia" se decide por
             ``is None``, no por dict vacío.
+        val_history: Serie de validación medida hasta ``start_step``
+            (:class:`~diffusion.training.validation.ValPoint` por evaluación) o ``None`` si el punto
+            de reanudación no la trae. Viaja acá en memoria como el ``history`` —y por el mismo
+            motivo: **no** se persiste en el sidecar, vive en el ``meta`` del checkpoint de pesos y
+            se rellena desde ahí al cargar—. Campo **opcional**, así que un checkpoint anterior a
+            esta feature se reanuda igual que siempre. A diferencia de ``ema_state`` /
+            ``scaler_state`` **no** tiene guard cruzado contra la config: la serie es una
+            *observación*, no estado necesario para continuar la optimización, así que que falte
+            solo hace que arranque vacía en lugar de corromper la corrida.
     """
 
     optimizer_state: dict
@@ -162,6 +178,7 @@ class ResumeState:
     ema_state: dict | None = None
     raw_model_state: dict | None = None
     scaler_state: dict | None = None
+    val_history: list[ValPoint] | None = None
 
 
 @dataclass
@@ -193,6 +210,8 @@ def train(
     on_log: Callable[[dict], None] | None = None,
     resume: ResumeState | None = None,
     progress: bool = False,
+    val_batches: Iterable[torch.Tensor] | None = None,
+    train_exam_batches: Iterable[torch.Tensor] | None = None,
 ) -> TrainResult:
     """Entrena la red ``model`` para aproximar el score de ``sde`` por DSM.
 
@@ -254,6 +273,23 @@ def train(
             **display-only** (default ``False``): no cambia el resultado ni el ``history``, escribe a
             stderr, y al reanudar la barra va de ``start_step`` a ``num_steps`` (así el % y el ETA
             son correctos). El import de ``tqdm`` es diferido: solo se carga si ``progress=True``.
+        val_batches: Fuente **re-iterable** y **opcional** de batches de **validación** (imágenes
+            held-out; típicamente lo que devuelve ``finite_batches``). Es la palanca **opt-in** de
+            la pérdida de validación: con el default (``None``) no se construye nada —cero ramas
+            nuevas activas— y la corrida es idéntica a la de antes de esta feature para la misma
+            semilla (6.1). Con una fuente, el loop arma un
+            :class:`~diffusion.training.validation.FixedValExam` en el bloque de fail-fast —antes de
+            consumir el primer batch— y **exige** ``config.checkpoint_every > 0``: esa es la cadencia
+            de la evaluación, así que con ella deshabilitada la corrida nunca mediría nada y se falla
+            temprano (3.7). La validación **observa y no interviene**: corre sin gradientes, saca su
+            azar de un generator propio y no altera los pesos, el optimizador ni la sombra EMA.
+        train_exam_batches: Fuente **re-iterable** y **opcional** del **examen fijo de
+            entrenamiento** (imágenes del set de train, la misma cantidad que las de validación),
+            medido con el mismo procedimiento para que la distancia vertical entre las dos curvas
+            sea generalización y no una diferencia de estimador (3.8). Se usa **solo** si hay
+            ``val_batches``: sin fuente de validación no hay serie donde publicar su valor, así que
+            se **ignora** en silencio (no se rechaza). Su examen comparte la semilla y el
+            muestreador de ``t`` con el de validación, de modo que ambos sortean la misma secuencia.
 
     Mantiene además, si ``config.ema_decay`` está configurado, una **sombra EMA** de los pesos
     (:class:`~diffusion.training.ema.EmaShadow`): se construye antes de consumir datos (fail-fast
@@ -269,12 +305,19 @@ def train(
     ``ValueError`` antes de entrenar: nunca se continúa con una sombra inventada ni descartada en
     silencio (R3.4).
 
+    Con una fuente en ``val_batches`` mide además la **pérdida de validación** por examen fijo
+    (:mod:`diffusion.training.validation`): los exámenes se construyen en el fail-fast, con el mismo
+    ``TimeSampler`` que usa el loop —así el criterio de muestreo de ``t`` es el mismo por
+    construcción (3.4)— y la serie medida viaja en ``TrainResult.val_history``. Sin la fuente no se
+    construye nada y la corrida es la de siempre (6.1).
+
     Returns:
         :class:`TrainResult` con la red entrenada, la historia de pérdida (**serie per-step
         completa**: una entrada por paso, ``len(history) == num_steps`` cuando
         ``start_step < num_steps``; el ``history`` previo intacto en el caso no-op), el ``config``
-        usado, el nombre de la SDE, su ``data_dim`` y la foto de la sombra EMA en ``ema_state``
-        (``None`` si el EMA no está activo).
+        usado, el nombre de la SDE, su ``data_dim``, la foto de la sombra EMA en ``ema_state``
+        (``None`` si el EMA no está activo) y la serie **dispersa** de validación en ``val_history``
+        (lista **vacía** sin fuente de validación; continúa la del ``resume`` si la trae).
 
     Con ``config.amp=True`` activa **precisión mixta** (opt-in, R1.1): el forward y la pérdida se
     computan bajo ``torch.autocast`` (bfloat16 en CPU) y —en GPU— el gradiente se escala con un
@@ -286,8 +329,9 @@ def train(
 
     Raises:
         ValueError: Si ``config.ema_decay`` es inválido (R1.6), si ``config.amp`` no es ``bool``
-            (R1.5), si ``config.time_sampling`` no existe, o si al reanudar la config y el sidecar no
-            coinciden en el uso del EMA (R3.4). Todos antes de consumir el primer batch.
+            (R1.5), si ``config.time_sampling`` no existe, si se pide validación
+            (``val_batches``) con ``config.checkpoint_every <= 0`` (3.7), o si al reanudar la config y
+            el sidecar no coinciden en el uso del EMA (R3.4). Todos antes de consumir el primer batch.
     """
     device = torch.device(config.device)
     # Autotune de kernels convolucionales: auto-on en GPU (aprovecha los shapes fijos de la corrida),
@@ -341,6 +385,40 @@ def train(
         if config.amp
         else None
     )
+
+    # Validación por examen fijo (opt-in, 6.1): con ``val_batches=None`` —el default— no se construye
+    # NADA, así que la corrida no gana ninguna rama activa y es idéntica a la de antes de esta
+    # feature para la misma semilla. Con fuente, los exámenes se arman acá, junto al resto del
+    # fail-fast: ANTES de consumir el primer batch, mismo criterio que el time sampler / el decay del
+    # EMA / el ``amp``.
+    #
+    # La cadencia se rechaza en ESTE punto y no en el config layer (3.7) porque el loop es el único
+    # que ve el valor **efectivo** de ``checkpoint_every``: el CLI lo sobreescribe *después* de armar
+    # la corrida, así que un chequeo en la config se saltearía (o dispararía sobre un valor que la
+    # corrida ya no usa).
+    val_exam: FixedValExam | None = None
+    train_exam: FixedValExam | None = None
+    if val_batches is not None:
+        if config.checkpoint_every <= 0:
+            raise ValueError(
+                "La corrida pide pérdida de validación pero tiene la cadencia de checkpoints "
+                f"deshabilitada (config.checkpoint_every={config.checkpoint_every}): esa cadencia es "
+                "la que gobierna cada cuántos pasos se evalúa, así que la corrida entrenaría "
+                "completa sin medir ni un punto de validación. Declará checkpoint_every > 0 o quitá "
+                "la fuente de validación."
+            )
+        # Los dos exámenes reciben el ``time_sampler`` recién construido —EL MISMO objeto que usa el
+        # loop— y la semilla por defecto del examen: así "val y train usan el mismo criterio de
+        # muestreo de t" (3.4) es estructural en lugar de depender de que alguien lo recuerde, y
+        # ambos exámenes sortean la misma secuencia de t y de ruido (3.8), de modo que la diferencia
+        # entre las dos curvas no pueda venir del examen.
+        val_exam = FixedValExam(sde, val_batches, time_sampler=time_sampler, device=device)
+        if train_exam_batches is not None:
+            train_exam = FixedValExam(
+                sde, train_exam_batches, time_sampler=time_sampler, device=device
+            )
+    # NB: ``train_exam_batches`` sin ``val_batches`` se IGNORA y no se rechaza — sin fuente de
+    # validación no hay serie donde publicar su valor, así que no hay nada que hacer con esa fuente.
 
     # Coherencia config ↔ sidecar al reanudar (R3.4). Con EMA el estado de la corrida vive PARTIDO
     # (el checkpoint publica la sombra; los crudos y la sombra van en el sidecar), así que las dos
@@ -403,6 +481,7 @@ def train(
     if resume is None:
         start_step = 0
         history: list[float] = []
+        val_history: list[ValPoint] = []
     else:
         # Restaurar optimizador y azar antes de continuar (2.1). El load_state_dict actúa además
         # de guard de compatibilidad: levanta si las shapes del optimizador no corresponden (2.5).
@@ -411,6 +490,13 @@ def train(
         generator.set_state(resume.generator_state)
         start_step = resume.start_step
         history = list(resume.history)  # continuar la curva previa (2.3)
+        # Serie de validación: se **continúa** la del punto de reanudación (6.3) y se COPIA, igual
+        # que el history, para no mutar la lista del ``ResumeState`` recibido. Un punto de
+        # reanudación sin serie (``None``: un checkpoint anterior a esta feature, o una corrida
+        # original sin validación) simplemente arranca vacío — no hay guard cruzado contra la
+        # config, a diferencia del EMA y del escalador: la serie es una observación, no estado
+        # necesario para continuar la optimización.
+        val_history = list(resume.val_history or [])
 
     # ``history`` guarda la pérdida de CADA paso (serie completa, la fuente de verdad).
     # ``log_every`` gobierna solo el print de consola, desacoplado.
@@ -432,6 +518,9 @@ def train(
             sde_name=sde.name,
             data_dim=sde.data_dim,
             ema_state=ema.state_dict() if ema is not None else None,
+            # Copia de la serie dispersa, con el mismo criterio que el ``history``: la foto de un
+            # checkpoint intermedio no puede seguir creciendo cuando la corrida agrega puntos.
+            val_history=list(val_history),
         )
 
     def _snapshot(completed_steps: int) -> TrainSnapshot:
@@ -463,6 +552,10 @@ def train(
                 # (AMP activo). En CPU es ``{}`` (deshabilitado) pero se persiste igual —presencia por
                 # ``is None``—; sin AMP queda ``None`` y el sidecar no gana ninguna clave (R2.4).
                 scaler_state=scaler.state_dict() if scaler is not None else None,
+                # Serie de validación del momento, copiada (mismo criterio que el ``history``). Viaja
+                # acá por simetría con el estado en memoria del punto de reanudación; el sidecar
+                # NO la persiste —vive en el ``meta`` del checkpoint de pesos, como el ``history``—.
+                val_history=list(val_history),
             ),
         )
 
@@ -575,6 +668,9 @@ def train(
         data_dim=sde.data_dim,
         # Foto final de la sombra (clonada), lo que el checkpoint publica cuando el EMA está activo.
         ema_state=ema.state_dict() if ema is not None else None,
+        # Serie dispersa completa de la corrida: vacía sin fuente de validación (6.1), y con los
+        # puntos previos al frente cuando se reanudó una corrida que ya había medido (6.3).
+        val_history=val_history,
     )
 
 
