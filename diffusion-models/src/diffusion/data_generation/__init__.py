@@ -13,7 +13,7 @@ from __future__ import annotations
 import inspect
 
 from .base import PointDistribution
-from .images import infinite_batches, report_small_images
+from .images import count_images, finite_batches, infinite_batches, report_small_images
 from .iterators import infinite_bare
 from .shapes import Gaussian, GaussianMixture, Spiral, SwissRoll, TwoMoons
 
@@ -53,6 +53,8 @@ __all__ = [
     "make_distribution",
     "infinite_bare",
     "infinite_batches",
+    "finite_batches",
+    "count_images",
     "report_small_images",
     "Gaussian",
     "GaussianMixture",

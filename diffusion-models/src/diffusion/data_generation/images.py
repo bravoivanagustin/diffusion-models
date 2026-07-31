@@ -17,7 +17,7 @@ torch diferido del core de puntos (ver :mod:`diffusion.data_generation.base`).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -306,6 +306,139 @@ def infinite_batches(
         generator=generator,
     )
     return _infinite(loader)
+
+
+def finite_batches(
+    root: str | Path,
+    batch_size: int,
+    *,
+    image_size: int = 64,
+    crop: bool = True,
+    max_images: int | None = None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+) -> Iterable[torch.Tensor]:
+    """Fuente **finita y re-iterable** de batches de imágenes, en orden canónico.
+
+    Contraparte de :func:`infinite_batches` para medir en lugar de entrenar: recorre
+    la carpeta **completa** una sola vez, en orden fijo, sin aumento de datos y **sin
+    descartar la cola** del set. Reusa exactamente las mismas piezas que la fuente
+    infinita —la cadena de :func:`_build_transform` (con ``augment=False``) y la clase
+    :class:`CatImages`—, así que la normalización a ``[-1, 1]`` y el encuadre son los
+    mismos; lo único que cambia es cómo se recorre.
+
+    Tres diferencias respecto de :func:`infinite_batches`, todas deliberadas:
+
+    - **``drop_last=False``:** la cola se entrega como **batch parcial** en lugar de
+      descartarse. Por eso acá **no** hay mínimo de ``batch_size``: un set más chico
+      que el batch es un único batch parcial válido, no un error (el guard de la
+      fuente infinita existe solo porque con ``drop_last=True`` su loader quedaría
+      vacío y el wrapper infinito giraría sin yield-ear nunca).
+    - **``shuffle=False`` y ``augment=False``:** orden y orientación **canónicos**. La
+      función no tiene ninguna fuente de aleatoriedad, así que **no consume RNG** de
+      ninguna clase (tampoco el global): activarla no puede mover el azar de una
+      corrida de entrenamiento. Sostener eso exige un detalle no obvio: el
+      ``DataLoader`` sortea su ``base_seed`` del **RNG global** cuando no se le pasa
+      ``generator``, incluso con ``shuffle=False`` y ``num_workers=0``. Por eso acá se
+      le inyecta un ``torch.Generator`` propio con semilla fija — no gobierna ningún
+      sorteo observable (no hay barajado ni transform aleatorio), solo evita que
+      iterar la fuente adelante el RNG global del proceso.
+    - **Re-iterable, no iterador:** se devuelve el ``DataLoader`` mismo (tipado como
+      ``Iterable``, que es todo lo que el consumidor necesita). Recorrerlo dos veces
+      entrega **la misma** secuencia de batches — la condición que hace reproducible
+      un examen fijo, donde la única variable entre dos evaluaciones debe ser la red.
+
+    **Fail-fast:** los errores cortan en la llamada (esta función no es un generador).
+    Si ``root`` no existe o no tiene imágenes, :class:`CatImages` levanta ``ValueError``
+    al construirse.
+
+    Los imports de ``torch`` y torchvision (vía :func:`_build_transform`) son
+    **diferidos**, en línea con el resto del módulo.
+
+    Args:
+        root: Carpeta raíz con las imágenes (se recorre recursivamente).
+        batch_size: Cantidad de imágenes por batch (``>= 1``). Todos los batches
+            salen con este tamaño salvo el último, que puede ser parcial.
+        image_size: Lado del cuadrado de salida en píxeles; cada batch tiene shape
+            ``(b, 3, image_size, image_size)``.
+        crop: Modo de encuadre, igual que en :func:`infinite_batches`. ``True`` (por
+            defecto) preserva aspect ratio (``Resize`` del lado corto +
+            ``CenterCrop``); ``False`` deforma con ``Resize((image_size, image_size))``
+            sin recortar.
+        max_images: Tope opcional de imágenes (``>= 1``). Se resuelve tomando las
+            **primeras N** del orden ordenado del descubrimiento (subconjunto fijo, vía
+            ``torch.utils.data.Subset`` sobre ``range(n)``): sin sorteo, así el examen
+            es el mismo en toda corrida. Un tope mayor que la cantidad de imágenes
+            **no recorta** (se acota a lo disponible). ``None`` recorre el set entero.
+        num_workers: Cantidad de procesos de carga del ``DataLoader``. Por defecto
+            ``0`` (proceso principal): con ``shuffle=False`` el orden es determinístico
+            igual con workers, pero una evaluación no amortiza su costo de arranque.
+        pin_memory: Se pasa tal cual al ``DataLoader`` (útil solo con GPU).
+
+    Returns:
+        Un iterable **re-iterable** de tensores ``(b, 3, image_size, image_size)``
+        float32 en ``[-1, 1]`` (tensores pelados, sin tupla). Con
+        ``n = min(count_images(root), max_images)``, cada recorrido entrega
+        ``ceil(n / batch_size)`` batches cuyos tamaños suman ``n``.
+
+    Raises:
+        ValueError: Si ``root`` no existe o no contiene imágenes (delegado a
+            :class:`CatImages`, antes de devolver la fuente).
+    """
+    import torch
+
+    transform = _build_transform(image_size, augment=False, crop=crop)
+    dataset = _build_cat_images_class()(root, transform)
+
+    if max_images is not None:
+        # Las primeras N del orden ordenado: subconjunto fijo, sin sortear nada. El
+        # min() hace que un tope mayor que el set simplemente no recorte.
+        n_taken = min(max_images, len(dataset))
+        dataset = torch.utils.data.Subset(dataset, range(n_taken))
+
+    # Generator propio con semilla fija: el DataLoader sortea su `base_seed` del RNG
+    # global si `generator` es None (aun con shuffle=False y num_workers=0), y esta
+    # fuente no debe tocar el azar del proceso. No gobierna nada observable.
+    generator = torch.Generator()
+    generator.manual_seed(0)
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        generator=generator,
+    )
+
+
+def count_images(root: str | Path) -> int:
+    """Cuenta las imágenes bajo ``root``, con la misma definición que la carga.
+
+    Delega en :func:`_discover_image_paths`, así que comparte **exactamente** el
+    criterio de las fuentes de datos: recorrido recursivo, filtrado por
+    :data:`IMAGE_EXTENSIONS` y el mismo fail-fast de carpeta inexistente o sin
+    imágenes.
+
+    Existe para que un caller pueda **dimensionar** un recorrido sin construirlo —
+    por ejemplo, para armar un examen de entrenamiento con la misma cantidad de
+    imágenes que el de validación (``finite_batches(..., max_images=count_images(...))``)
+    sin introspeccionar el ``.dataset`` del ``DataLoader``, que rompería el contrato
+    de :func:`finite_batches` (declarado como un simple iterable de tensores).
+
+    Args:
+        root: Carpeta raíz con las imágenes (se recorre recursivamente).
+
+    Returns:
+        La cantidad de archivos de imagen descubiertos bajo ``root`` (siempre ``>= 1``:
+        un conjunto vacío es un error, no un cero).
+
+    Raises:
+        ValueError: Si ``root`` no existe o no contiene ninguna imagen (delegado a
+            :func:`_discover_image_paths`).
+    """
+    return len(_discover_image_paths(root))
 
 
 def report_small_images(

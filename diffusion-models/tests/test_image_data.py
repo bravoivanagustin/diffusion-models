@@ -23,6 +23,8 @@ from PIL import Image
 from diffusion.data_generation.images import (
     CatImages,
     _build_transform,
+    count_images,
+    finite_batches,
     infinite_batches,
     report_small_images,
 )
@@ -48,6 +50,20 @@ def rgb_dir(tmp_path):
     sizes = [(80, 100), (128, 64), (90, 90), (200, 150)]
     for i, (w, h) in enumerate(sizes):
         _save_rgb(tmp_path / f"img_{i}.png", w, h, rng)
+    return tmp_path
+
+
+@pytest.fixture
+def rgb_dir_10(tmp_path):
+    """Carpeta con 10 imágenes RGB sintéticas (nombres `img_00`…`img_09`, orden estable).
+
+    Los nombres van con dos dígitos a propósito: así el orden lexicográfico del
+    descubrimiento coincide con el numérico y los asserts sobre "las primeras N"
+    se leen sin ambigüedad.
+    """
+    rng = np.random.default_rng(1)
+    for i in range(10):
+        _save_rgb(tmp_path / f"img_{i:02d}.png", 70 + i, 90 - i, rng)
     return tmp_path
 
 
@@ -224,3 +240,163 @@ def test_report_small_images_reports_short_side_and_keeps_files(tmp_path):
     # No borra ni modifica: todos los archivos siguen en disco.
     for name in ("tiny.png", "wide.png", "exact.png", "big.png"):
         assert (tmp_path / name).exists()
+
+
+# ------------------------------- fuente finita (Req 2.2, 2.5, 2.7, 2.8, 3.9)
+
+
+def test_finite_covers_whole_set_with_partial_tail(rgb_dir_10):
+    # (2.7) 10 imágenes con batch 4 → 3 batches de 4/4/2 que suman 10: `drop_last=False`,
+    # así que la cola del set NO se descarta (a diferencia de infinite_batches).
+    batches = list(finite_batches(rgb_dir_10, 4, image_size=32))
+    assert [b.shape[0] for b in batches] == [4, 4, 2]
+    assert sum(b.shape[0] for b in batches) == 10
+    for b in batches:
+        assert isinstance(b, torch.Tensor)
+        assert not isinstance(b, tuple)  # tensor pelado, no una tupla
+        assert tuple(b.shape[1:]) == (3, 32, 32)
+        assert b.dtype == torch.float32
+        assert torch.isfinite(b).all()
+        # Misma normalización a [-1, 1] que la fuente infinita.
+        assert b.min().item() >= -1.0 - 1e-4
+        assert b.max().item() <= 1.0 + 1e-4
+    assert torch.cat(batches).min().item() < 0.0
+
+
+def test_finite_is_reiterable(rgb_dir_10):
+    # (2.2 / 3.3) el resultado es RE-ITERABLE, no un iterador de un solo uso:
+    # dos recorridos completos entregan la misma secuencia de batches tensor por
+    # tensor. Es la condición que hace reproducible el examen fijo.
+    source = finite_batches(rgb_dir_10, 4, image_size=32)
+    first = list(source)
+    second = list(source)
+    assert len(first) == len(second) == 3
+    for a, b in zip(first, second, strict=True):
+        assert torch.equal(a, b)
+
+
+def test_finite_smaller_than_batch_yields_one_partial_batch(tmp_path):
+    # (2.7) 3 imágenes con batch 8 → un único batch parcial de 3, SIN error: acá no
+    # hay mínimo de batch_size (el de infinite_batches existe solo por drop_last=True).
+    rng = np.random.default_rng(0)
+    for i in range(3):
+        _save_rgb(tmp_path / f"img_{i}.png", 80, 80, rng)
+    batches = list(finite_batches(tmp_path, 8, image_size=32))
+    assert len(batches) == 1
+    assert tuple(batches[0].shape) == (3, 3, 32, 32)
+
+
+def test_finite_order_and_transform_are_canonical(rgb_dir_10):
+    # (2.2) el recorrido sigue el orden ordenado del descubrimiento y aplica la MISMA
+    # cadena de transforms que la infinita con augment=False: concatenar los batches
+    # reproduce exactamente los items de CatImages en orden. Falla si se barajara
+    # (shuffle) o si la cadena incluyera el volteo aleatorio (orientación canónica).
+    ds = CatImages(rgb_dir_10, _build_transform(32, augment=False, crop=True))
+    expected = torch.stack([ds[i] for i in range(len(ds))])
+    got = torch.cat(list(finite_batches(rgb_dir_10, 4, image_size=32, crop=True)))
+    assert torch.equal(got, expected)
+
+
+def test_finite_crop_false_frames_without_cropping(rgb_dir_10):
+    # (2.2) el modo de encuadre se reusa tal cual: crop=False deforma al cuadrado y
+    # coincide con la cadena equivalente aplicada a mano.
+    ds = CatImages(rgb_dir_10, _build_transform(32, augment=False, crop=False))
+    expected = torch.stack([ds[i] for i in range(len(ds))])
+    got = torch.cat(list(finite_batches(rgb_dir_10, 5, image_size=32, crop=False)))
+    assert torch.equal(got, expected)
+
+
+def test_finite_max_images_takes_the_first_n_always(rgb_dir_10):
+    # (2.8, 3.9) el tope entrega SIEMPRE las mismas N imágenes: las primeras N del
+    # orden ordenado (subconjunto fijo, sin sorteo). Se compara contra el prefijo del
+    # recorrido completo y contra un segundo recorrido de la fuente topeada.
+    full = torch.cat(list(finite_batches(rgb_dir_10, 4, image_size=32)))
+    capped = finite_batches(rgb_dir_10, 4, image_size=32, max_images=6)
+    batches = list(capped)
+    assert [b.shape[0] for b in batches] == [4, 2]  # 6 imágenes, cola parcial
+    taken = torch.cat(batches)
+    assert taken.shape[0] == 6
+    assert torch.equal(taken, full[:6])
+    # Re-iterar y reconstruir la fuente dan el mismo subconjunto.
+    assert torch.equal(torch.cat(list(capped)), full[:6])
+    otra = finite_batches(rgb_dir_10, 4, image_size=32, max_images=6)
+    assert torch.equal(torch.cat(list(otra)), full[:6])
+
+
+def test_finite_max_images_above_total_does_not_truncate(rgb_dir_10):
+    # (2.8) un tope mayor que el set no recorta ni rompe: se entregan las 10 imágenes.
+    # Es el caso de un set de entrenamiento más chico que el de validación.
+    batches = list(finite_batches(rgb_dir_10, 4, image_size=32, max_images=99))
+    assert sum(b.shape[0] for b in batches) == 10
+
+
+def test_finite_does_not_consume_global_rng(rgb_dir_10):
+    # (invariante) sin barajado ni augmentation la fuente no tiene aleatoriedad, así
+    # que no puede consumir el RNG global: activar la validación no debe mover el
+    # azar del entrenamiento.
+    before = torch.random.get_rng_state()
+    list(finite_batches(rgb_dir_10, 4, image_size=32))
+    assert torch.equal(torch.random.get_rng_state(), before)
+
+
+def test_finite_root_missing_raises(tmp_path):
+    # (2.5) carpeta raíz inexistente → ValueError en la llamada (fail-fast heredado
+    # de CatImages, antes de devolver la fuente).
+    with pytest.raises(ValueError):
+        finite_batches(tmp_path / "no_existe", 2)
+
+
+def test_finite_empty_dir_raises(tmp_path):
+    # (2.5) carpeta sin imágenes → ValueError (no una fuente vacía silenciosa).
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError):
+        finite_batches(empty, 2)
+
+
+# ----------------------------------------------- conteo de imágenes (Req 2.8)
+
+
+def test_count_images_matches_the_real_amount(rgb_dir_10):
+    # (2.8) el conteo coincide con la cantidad real de imágenes de la carpeta, que es
+    # lo que después dimensiona el examen de entrenamiento.
+    assert count_images(rgb_dir_10) == 10
+    assert count_images(rgb_dir_10) == sum(
+        b.shape[0] for b in finite_batches(rgb_dir_10, 4, image_size=32)
+    )
+
+
+def test_count_images_is_recursive_and_ignores_non_images(tmp_path):
+    # (2.8) misma definición de "imagen" que la fuente: recursivo por subcarpetas y
+    # filtrado por extensión (un .txt no cuenta).
+    rng = np.random.default_rng(0)
+    _save_rgb(tmp_path / "a.png", 80, 80, rng)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _save_rgb(sub / "b.png", 80, 80, rng)
+    (tmp_path / "notas.txt").write_text("no soy una imagen", encoding="utf-8")
+    assert count_images(tmp_path) == 2
+
+
+def test_count_images_missing_root_raises(tmp_path):
+    # (2.5) mismo fail-fast que la fuente: raíz inexistente → ValueError.
+    with pytest.raises(ValueError):
+        count_images(tmp_path / "no_existe")
+
+
+def test_count_images_empty_dir_raises(tmp_path):
+    # (2.5) mismo fail-fast que la fuente: carpeta sin imágenes → ValueError.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError):
+        count_images(empty)
+
+
+def test_finite_and_count_are_exported_by_the_package(rgb_dir_10):
+    # Los dos símbolos se importan del paquete igual que infinite_batches: es la
+    # superficie que consume el config layer.
+    from diffusion.data_generation import count_images as pkg_count
+    from diffusion.data_generation import finite_batches as pkg_finite
+
+    assert pkg_count(rgb_dir_10) == 10
+    assert sum(b.shape[0] for b in pkg_finite(rgb_dir_10, 4, image_size=32)) == 10
