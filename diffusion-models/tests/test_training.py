@@ -3257,3 +3257,289 @@ def test_train_reanuda_sin_guard_cruzado_entre_config_y_sidecar():
     )
     assert isinstance(res_sin_serie.val_history, list)
     assert len(res_sin_serie.history) == 3  # continuó la corrida hasta el total
+
+
+# ------------- validation-loss: cadencia y las tres mediciones (task 4.2)
+#
+# Feature `validation-loss`, tarea 4.2: el DISPARADOR de la evaluación y las hasta tres mediciones
+# que produce cada una. Lo que la tarea 4.1 dejó construido pero sin llamar, acá se consume: la
+# serie se llena y el punto se emite por ``on_log`` como variante discriminada por ``event``.
+#
+# El riesgo específico de esta tarea es conflacionar el disparador de la evaluación con el de los
+# snapshots: se **parecen** (los dos miran ``checkpoint_every``) pero el de snapshots excluye el
+# último paso y exige un ``on_checkpoint`` inyectado, mientras que el de la evaluación incluye el
+# último paso y no depende de ningún callback (3.1). Hay un test dedicado a los dos a la vez.
+#
+# Se reusan los helpers de las secciones previas (``_fresh_ema`` / ``_generador`` / ``_fuente_examen``).
+
+
+def _pasos_de_val(res) -> list[int]:
+    """Los pasos en que la corrida midió validación (el índice de la serie dispersa)."""
+    return [punto["step"] for punto in res.val_history]
+
+
+def test_train_evalua_en_la_cadencia_y_en_el_ultimo_paso_sin_callback_de_checkpoint():
+    """Disparador: múltiplos de ``checkpoint_every`` **más** el último paso, sin callback (3.1).
+
+    10 pasos con cadencia 4 dan puntos en 4, 8 y **10**: los dos primeros por la cadencia y el
+    tercero porque es el último paso de la corrida (que la cadencia no alcanza, 10 no es múltiplo de
+    4). La llamada **no** inyecta ``on_checkpoint``: la validación es una medición, no un artefacto
+    de checkpointing, así que no puede depender de que el caller quiera persistir snapshots.
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=10, checkpoint_every=4)
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    assert _pasos_de_val(res) == [4, 8, 10]
+    assert len(res.history) == 10  # la serie densa sigue siendo una entrada por paso
+
+
+def test_los_disparadores_de_evaluacion_y_de_snapshot_son_independientes():
+    """El disparador de la evaluación **no** es el de los snapshots, en las dos direcciones (3.1).
+
+    Con la misma corrida (10 pasos, cadencia 4) y un ``on_checkpoint`` inyectado:
+
+    - los snapshots caen en 4 y 8 y **excluyen** el 10 (el último paso lo cubre el checkpoint final
+      del caller);
+    - los puntos de validación caen en 4, 8 y **también** en 10.
+
+    Conflacionar los dos disparadores rompe exactamente uno de estos dos asserts, así que el test
+    falla si alguien reusa la condición del snapshot para evaluar (perdería el punto final) o la de
+    la evaluación para el snapshot (escribiría un snapshot de más).
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=10, checkpoint_every=4)
+    tags: list[str] = []
+
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        on_checkpoint=lambda tag, _snapshot: tags.append(tag),
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    assert tags == ["step00004", "step00008"]  # el snapshot excluye el último paso
+    assert _pasos_de_val(res) == [4, 8, 10]  # la evaluación lo incluye
+
+
+def test_train_con_ema_mide_los_tres_valores_por_evaluacion():
+    """Con EMA activo cada punto trae los tres valores, distintos entre sí (4.1, 4.3, 3.8).
+
+    ``raw`` ≠ ``ema`` porque los pesos difieren (la sombra es un promedio de la trayectoria, no la
+    foto del último paso) y ``train`` ≠ ``raw`` porque son **otras** imágenes — el mismo examen, otro
+    conjunto: esa distancia vertical es justamente el gap que la feature existe para mirar.
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=2, ema_decay=0.6)
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    assert _pasos_de_val(res) == [2, 4]
+    for punto in res.val_history:
+        assert set(punto) == {"step", "raw", "ema", "train"}
+        for clave in ("raw", "ema", "train"):
+            assert isinstance(punto[clave], float)
+            assert math.isfinite(punto[clave])
+        assert punto["raw"] != punto["ema"]  # pesos distintos, mismo examen
+        assert punto["raw"] != punto["train"]  # mismo procedimiento, otras imágenes
+
+
+def test_train_sin_ema_deja_el_valor_de_ema_ausente():
+    """Sin sombra EMA el valor de EMA está **ausente**, nunca inventado (4.2).
+
+    ``None`` es la representación de la ausencia (lo que anota ``ValPoint``): rellenarla con el valor
+    de los pesos crudos dibujaría una segunda curva idéntica a la primera y sugeriría que el
+    promediado no aporta nada, que es una conclusión y no un dato faltante.
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=2)  # ema_decay=None
+    registros: list[dict] = []
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        on_log=registros.append,
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    assert _pasos_de_val(res) == [2, 4]
+    assert all(punto["ema"] is None for punto in res.val_history)
+    assert all(isinstance(punto["raw"], float) for punto in res.val_history)
+    assert all(isinstance(punto["train"], float) for punto in res.val_history)
+
+    # La ausencia viaja como clave presente con ``None``, no como clave omitida: el consumidor del
+    # .jsonl (task 7.1) distingue "no había EMA en esta corrida" de "el campo no existe en este
+    # formato", y solo la primera lectura es la correcta. Un registro que filtrara los ``None``
+    # borraría esa diferencia sin que nada más se rompa.
+    de_val = [r for r in registros if r.get("event") == "val"]
+    assert len(de_val) == 2
+    for registro in de_val:
+        assert set(registro) == {"event", "step", "val_raw", "val_ema", "train_fijo", "device"}
+        assert registro["val_ema"] is None
+
+
+def test_train_sin_fuente_de_examen_de_train_deja_ese_valor_ausente():
+    """Sin ``train_exam_batches`` el examen de entrenamiento está ausente, no en cero (3.8)."""
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=2)
+    res = train(sde, net, data, cfg, generator=_generador(cfg), val_batches=_fuente_examen())
+
+    assert _pasos_de_val(res) == [2, 4]
+    assert all(punto["train"] is None for punto in res.val_history)
+    assert all(isinstance(punto["raw"], float) for punto in res.val_history)
+
+
+def test_el_examen_de_train_se_mide_solo_con_los_pesos_crudos():
+    """El examen de entrenamiento se mide **una** vez, con los pesos vivos (3.9).
+
+    La lectura raw↔EMA vive en la curva de validación; una cuarta medición (el examen de train bajo
+    la sombra) duplicaría el costo de la evaluación sin agregar información. El test cuenta los
+    recorridos de cada fuente: con EMA activo la de validación se recorre **dos** veces por
+    evaluación (crudos + sombra) y la del examen de train **una** sola.
+    """
+    fuente_val = _FuenteValVigilada(_fuente_examen())
+    fuente_train = _FuenteValVigilada(_fuente_examen(seed=7))
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=2, ema_decay=0.6)
+
+    train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        val_batches=fuente_val,
+        train_exam_batches=fuente_train,
+    )
+
+    assert fuente_val.recorridos == 4  # 2 evaluaciones × (crudos + sombra)
+    assert fuente_train.recorridos == 2  # 2 evaluaciones × solo crudos
+
+
+def test_train_emite_el_registro_de_validacion_por_on_log():
+    """El punto se emite por ``on_log`` como variante discriminada por ``event`` (5.1, 5.2).
+
+    Un solo callback y dos variantes de registro: el de paso de entrenamiento **no** trae la clave
+    ``event`` (asimetría deliberada: el escritor del CLI expande el registro al final, así que un
+    ``event`` propio sobreescribe su default) y el de validación la trae en ``"val"`` con los tres
+    valores y el ``device``. El ``device`` viaja porque el examen fijo es específico del device: sin
+    ese dato, una serie medida en dos máquinas es indistinguible de un salto real del modelo.
+    """
+    registros: list[dict] = []
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=2, ema_decay=0.6)
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        on_log=registros.append,
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    de_val = [r for r in registros if r.get("event") == "val"]
+    de_paso = [r for r in registros if "event" not in r]
+    assert de_paso  # los registros de paso siguen existiendo, y sin clave ``event``
+    assert all(set(r) == {"step", "loss"} for r in de_paso)  # variante existente, intacta
+
+    assert [r["step"] for r in de_val] == [2, 4]
+    for registro, punto in zip(de_val, res.val_history, strict=True):
+        assert set(registro) == {"event", "step", "val_raw", "val_ema", "train_fijo", "device"}
+        assert registro["step"] == punto["step"]
+        assert registro["val_raw"] == punto["raw"]
+        assert registro["val_ema"] == punto["ema"]
+        assert registro["train_fijo"] == punto["train"]
+        assert registro["device"] == str(torch.device(cfg.device))
+
+
+def test_train_sin_on_log_mide_igual_y_no_revienta():
+    """Sin ``on_log`` la serie se llena igual: la emisión es opcional, la medición no."""
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=2)
+    res = train(sde, net, data, cfg, generator=_generador(cfg), val_batches=_fuente_examen())
+    assert _pasos_de_val(res) == [2, 4]
+
+
+def test_el_snapshot_del_paso_n_ya_contiene_el_punto_medido_en_n():
+    """La evaluación va **antes** del snapshot, así el snapshot de N ya trae el punto de N (6.3).
+
+    Es lo que hace que reanudar desde el checkpoint del paso N restaure **todos** los puntos ya
+    medidos: si la evaluación corriera después de emitir el snapshot, el punto de N quedaría fuera de
+    su metadata y se perdería al reanudar. Se verifica en las dos fotos del snapshot (el
+    ``TrainResult`` y el ``ResumeState``), y que cada una sea una **copia** (la serie sigue creciendo
+    después).
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=6, checkpoint_every=2)
+    fotos: dict[str, TrainSnapshot] = {}
+
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        on_checkpoint=lambda tag, snapshot: fotos.__setitem__(tag, snapshot),
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    assert sorted(fotos) == ["step00002", "step00004"]
+    assert _pasos_de_val(fotos["step00002"].result) == [2]
+    assert [p["step"] for p in fotos["step00002"].resume.val_history] == [2]
+    assert _pasos_de_val(fotos["step00004"].result) == [2, 4]
+    assert _pasos_de_val(res) == [2, 4, 6]  # la corrida completa, con el punto del último paso
+    # Copias, no la lista viva del loop: la foto del paso 2 no ganó los puntos posteriores.
+    assert fotos["step00002"].result.val_history is not res.val_history
+
+
+def test_una_evaluacion_con_ema_no_perturba_la_optimizacion():
+    """Evaluar entre pasos —con swap de pesos incluido— no mueve la trayectoria de Adam (6.1, 6.2).
+
+    Es el chequeo más fuerte disponible de que la restauración del swap EMA fue **in-place**: el
+    optimizador guarda referencias a los tensores-parámetro desde ``Adam(net.parameters())``, así que
+    una restauración que los **rebindeara** dejaría a Adam actualizando tensores huérfanos y los
+    pasos posteriores a la primera evaluación divergirían. La cadencia 2 sobre 6 pasos garantiza que
+    haya pasos después de una evaluación (3, 4, 5, 6).
+
+    La regresión completa de no intervención —incluido el estado del ``generator`` y del RNG
+    global— es de la tarea 4.3; acá se compara lo que esta tarea puede romper: la serie de pérdida y
+    los pesos finales.
+    """
+    def corrida(con_validacion: bool):
+        sde, net, data, cfg = _fresh_ema(num_steps=6, checkpoint_every=2, ema_decay=0.6)
+        g = _generador(cfg)
+        extra = (
+            dict(val_batches=_fuente_examen(), train_exam_batches=_fuente_examen(seed=7))
+            if con_validacion
+            else {}
+        )
+        res = train(sde, net, data, cfg, generator=g, **extra)
+        return res, net, g
+
+    res_val, net_val, g_val = corrida(True)
+    res_sin, net_sin, g_sin = corrida(False)
+
+    assert _pasos_de_val(res_val) == [2, 4, 6]  # hubo evaluaciones, y con pasos después
+    assert res_val.history == res_sin.history  # igualdad EXACTA de floats, paso por paso
+    sd_val, sd_sin = net_val.state_dict(), net_sin.state_dict()
+    for clave in sd_sin:
+        assert torch.equal(sd_val[clave], sd_sin[clave]), f"peso final distinto en {clave}"
+    for clave in res_sin.ema_state:
+        assert torch.equal(res_val.ema_state[clave], res_sin.ema_state[clave])
+    assert torch.equal(g_val.get_state(), g_sin.get_state())  # mismo stream del generator

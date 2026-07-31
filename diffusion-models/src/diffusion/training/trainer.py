@@ -33,7 +33,7 @@ from ..sde import ForwardSDE
 from .ema import EmaShadow
 from .losses import dsm_loss
 from .time_sampling import make_time_sampler
-from .validation import FixedValExam, ValPoint
+from .validation import FixedValExam, ValPoint, evaluate_with_weights
 
 
 def _enable_cudnn_autotune(device: torch.device) -> None:
@@ -262,12 +262,27 @@ def train(
             ``range(start_step, num_steps)``. Si ``start_step >= num_steps`` no corre ningún paso
             y devuelve el resultado ya completo. Si trae ``ema_state`` (corrida con EMA) la sombra
             se restaura desde ahí; ver los guards de coherencia más abajo.
-        on_log: Callback **opcional** de logging estructurado. Se invoca con un ``dict``
-            ``{"step", "loss"}`` (paso 1-indexado completado y media móvil de la pérdida) en una
-            cadencia propia —``config.log_every`` si es ``>0``, si no ``num_steps//20``—
-            **independiente** del print/barra, así emite estados aun con ``log_every=0`` (p. ej.
-            corridas `--quiet` en background). El caller decide qué hacer con el registro (p. ej.
-            escribirlo a un ``.jsonl`` con timestamp); ``train`` no toca el filesystem ni el reloj.
+        on_log: Callback **opcional** de logging estructurado, con **dos variantes** de registro
+            discriminadas por la clave opcional ``event``:
+
+            - **Paso de entrenamiento** — ``{"step", "loss"}`` (paso 1-indexado completado y media
+              móvil de la pérdida), **sin** clave ``event``: su ausencia *significa* "paso de
+              entrenamiento". Cadencia propia —``config.log_every`` si es ``>0``, si no
+              ``num_steps//20``— **independiente** del print/barra, así emite estados aun con
+              ``log_every=0`` (p. ej. corridas `--quiet` en background).
+            - **Validación** (solo con ``val_batches``) — ``{"event": "val", "step", "val_raw",
+              "val_ema", "train_fijo", "device"}``, en la cadencia de la evaluación
+              (``config.checkpoint_every`` y el último paso). ``val_ema`` / ``train_fijo`` son
+              ``None`` cuando no hay sombra EMA / fuente de examen de train. El ``device`` va en el
+              registro porque el examen fijo es **específico del device**: sin ese dato, una serie
+              medida en dos máquinas es indistinguible de una serie con un salto real del modelo.
+              Se emite **después** de agregar el punto a ``val_history``.
+
+            La asimetría (una variante con ``event`` y otra sin) es deliberada y retrocompatible: un
+            consumidor que ya escribía los registros de paso sigue funcionando sin cambios, y —como
+            expande el registro al final— el ``event`` del de validación sobreescribe su default. El
+            caller decide qué hacer con cada registro (p. ej. escribirlo a un ``.jsonl`` con
+            timestamp); ``train`` no toca el filesystem ni el reloj.
         progress: Si es ``True``, muestra una barra de progreso (``tqdm``) con porcentaje, ETA e
             it/s mientras entrena; la pérdida (media móvil de ``log_every``) va como postfix. Es
             **display-only** (default ``False``): no cambia el resultado ni el ``history``, escribe a
@@ -311,13 +326,25 @@ def train(
     construcción (3.4)— y la serie medida viaja en ``TrainResult.val_history``. Sin la fuente no se
     construye nada y la corrida es la de siempre (6.1).
 
+    La evaluación corre cuando el paso completado es múltiplo de ``config.checkpoint_every`` **o** es
+    el último de la corrida (3.1) — un disparador **independiente** del de los snapshots, que excluye
+    el último paso y exige ``on_checkpoint``: la validación mide aunque la corrida no persista nada.
+    Cada evaluación produce hasta **tres** valores, en este orden: validación con los pesos vivos,
+    validación con la sombra EMA si está activa (4.1; ``None`` si no, nunca un valor inventado, 4.2)
+    y el examen fijo de entrenamiento con los pesos vivos (3.8, ``None`` sin su fuente). Va **después**
+    del ``ema.update`` y del registro de la pérdida del paso, y **antes** del snapshot periódico, así
+    que la foto del checkpoint del paso *N* ya contiene el punto medido en *N* (6.3). Cada punto se
+    agrega a la serie y se emite por ``on_log`` como la variante ``event="val"`` (ver ``on_log``).
+
     Returns:
         :class:`TrainResult` con la red entrenada, la historia de pérdida (**serie per-step
         completa**: una entrada por paso, ``len(history) == num_steps`` cuando
         ``start_step < num_steps``; el ``history`` previo intacto en el caso no-op), el ``config``
         usado, el nombre de la SDE, su ``data_dim``, la foto de la sombra EMA en ``ema_state``
         (``None`` si el EMA no está activo) y la serie **dispersa** de validación en ``val_history``
-        (lista **vacía** sin fuente de validación; continúa la del ``resume`` si la trae).
+        —un :class:`~diffusion.training.validation.ValPoint` por evaluación, indexado por el paso en
+        que se midió (lista **vacía** sin fuente de validación; continúa la del ``resume`` si la
+        trae)—.
 
     Con ``config.amp=True`` activa **precisión mixta** (opt-in, R1.1): el forward y la pérdida se
     computan bajo ``torch.autocast`` (bfloat16 en CPU) y —en GPU— el gradiente se escala con un
@@ -629,6 +656,65 @@ def train(
 
         history.append(loss.item())  # serie completa: la pérdida de cada paso
         is_last = step == config.num_steps - 1
+
+        # Evaluación de validación por examen fijo (3.1). Ubicada ACÁ a propósito: después del
+        # ``ema.update`` (así la sombra que se mide es la del paso ya completado) y del
+        # ``history.append``, y ANTES del snapshot periódico — de ese modo la foto del checkpoint del
+        # paso N ya contiene el punto medido en N, y reanudar desde ahí restaura todos los puntos ya
+        # medidos en lugar de perder el último (6.3).
+        #
+        # El DISPARADOR NO ES EL DE LOS SNAPSHOTS, aunque se le parezca: incluye el último paso
+        # (``is_last``, que el snapshot excluye porque el checkpoint final lo guarda el caller) y no
+        # exige ``on_checkpoint`` (``do_checkpoints``), porque la validación es una medición de la
+        # corrida y no un artefacto de checkpointing — una corrida sin persistencia igual mide. Los
+        # dos disparadores comparten solo la cadencia ``checkpoint_every``, garantizada > 0 acá por
+        # el fail-fast de más arriba (3.7). Conflacionarlos es el error más probable de esta feature:
+        # reusar la condición del snapshot perdería el punto final; reusar esta para el snapshot
+        # escribiría un snapshot de más.
+        if val_exam is not None and ((step + 1) % config.checkpoint_every == 0 or is_last):
+            # Hasta TRES mediciones, en este orden. La primera con los pesos vivos.
+            val_raw = val_exam.evaluate(net)
+            # La segunda con la sombra EMA, y solo si está activa (4.1): sin sombra el valor queda
+            # explícitamente AUSENTE (``None``, 4.2) en lugar de repetir el de los crudos —una
+            # segunda curva idéntica sugeriría que el promediado no aporta nada, que es una
+            # conclusión y no un dato faltante—. El swap clona los crudos, carga la sombra, mide el
+            # MISMO examen y restaura in-place en un ``finally``: el optimizador conserva sus
+            # referencias a los tensores-parámetro y los pasos siguientes no se desvían.
+            val_ema = (
+                evaluate_with_weights(val_exam, net, ema.state_dict())
+                if ema is not None
+                else None
+            )
+            # La tercera es el examen fijo de ENTRENAMIENTO, medido **solo con los pesos vivos**
+            # (3.9): la lectura raw↔EMA se hace sobre la curva de validación, así que una cuarta
+            # medición duplicaría el costo de la evaluación sin agregar información.
+            train_fijo = train_exam.evaluate(net) if train_exam is not None else None
+
+            punto: ValPoint = {
+                "step": step + 1,  # paso completado, 1-indexado (misma convención que el EMA)
+                "raw": val_raw,
+                "ema": val_ema,
+                "train": train_fijo,
+            }
+            val_history.append(punto)
+            # Emisión por el callback YA EXISTENTE, como segunda variante de registro discriminada
+            # por ``event`` (5.1): no se agrega un segundo callback porque no daría capacidad nueva
+            # —el CLI expande el registro al final, así que un ``event`` propio sobreescribe su
+            # default— y el loop sigue sin tocar el filesystem ni el reloj (el timestamp lo pone el
+            # caller). El ``device`` viaja en el registro porque el examen fijo es específico del
+            # device: sin ese dato, una serie medida en dos máquinas es indistinguible de una serie
+            # con un salto real del modelo.
+            if on_log is not None:
+                on_log(
+                    {
+                        "event": "val",
+                        "step": step + 1,
+                        "val_raw": val_raw,
+                        "val_ema": val_ema,
+                        "train_fijo": train_fijo,
+                        "device": str(device),
+                    }
+                )
 
         # Snapshot periódico: cadencia propia, chequeada cada paso para que ``checkpoint_every``
         # no tenga que ser múltiplo de nada. El último paso lo cubre el checkpoint final del
