@@ -1,21 +1,41 @@
-# Entrenamiento escalado a dataset completo (9000 gatos, 64x64)
+# Entrenamiento escalado a dataset completo (9304 gatos en data/cats-v1, 64x64)
 # Hardware objetivo: RTX 3090 (24GB VRAM)
+#
+# REQUISITO PREVIO (una sola vez, antes de entrenar): partir el dataset en train/val.
+#   uv run python scripts/split_dataset.py --src data/cats-v1 --out data/cats-v1-split \
+#       --val-frac 0.05 --seed 0
+# Deja data/cats-v1-split/train (8839 imgs) y data/cats-v1-split/val (465), HERMANAS. Copia, no
+# mueve: data/cats-v1 queda intacto. El split es determinístico —misma seed + mismo conjunto de
+# archivos ⇒ misma partición—, así que la seed documentada acá reproduce el reparto exacto.
+# NO agregues fotos a data/cats-v1 y vuelvas a splitear con la misma seed esperando el mismo
+# reparto: el resultado depende del conjunto de archivos, y algo que era val puede pasar a train.
 
 sde:                      # forward VP-SDE
   name: vp
 
 data:                     # fuente de imágenes
   kind: images
-  root: data/cats-v1
+  # OJO: root apunta al train/ del split, NO a data/cats-v1. El descubrimiento de imágenes es
+  # RECURSIVO, así que si root siguiera siendo la carpeta madre el loop leería también las
+  # imágenes held-out y contaminaría la validación en silencio (el gap daría ~0 y no querría
+  # decir nada). Por eso val/ tiene que ser HERMANA de train/, nunca estar adentro.
+  root: data/cats-v1-split/train
+  val_root: data/cats-v1-split/val   # pérdida de validación (opt-in): sin esta clave, corrida idéntica a antes
   image_size: 64          # subimos la resolución a 64x64
-  batch_size: 128         # aprovechando los 24GB de la 3090
+  batch_size: 128         # aprovechando los 24GB de la 3090; la validación reusa este mismo batch
   augment: true           # volteo horizontal aleatorio (duplica el dataset virtualmente)
   shuffle: true           # obligatorio para generalizar
   seed: 0
   num_workers: 8          # carga en paralelo usando la CPU (decodificación de imágenes)
   pin_memory: true        # acelera la transferencia de RAM a la VRAM de la GPU
+  # De val_root se derivan DOS fuentes de medición, sin más claves: el examen de validación
+  # (las 450 de val/) y un examen fijo de ENTRENAMIENTO del mismo tamaño (450 de train/,
+  # las primeras del orden ordenado). Las dos se leen en orientación canónica —sin el augment
+  # de arriba— y con el mismo t y el mismo ruido en cada evaluación. Ese examen de train es lo
+  # que hace interpretable el gap: el par comparable es 'train (examen fijo)' vs 'val (pesos
+  # vivos)', NO la curva densa per-step contra la de validación.
 
-model:                    # arquitectura U-Net "Premium" (~50M parámetros)
+model:                    # arquitectura U-Net "Premium" (37.1M parámetros, 142 MB en fp32)
   name: unet
   score_parametrization: epsilon
   in_channels: 3
@@ -29,20 +49,39 @@ model:                    # arquitectura U-Net "Premium" (~50M parámetros)
   groups: 32              # divide perfecto a 128 (GroupNorm)
   time_scale: 1000.0
 
-train:                    # hiperparámetros del loop
-  num_steps: 30000       # aumentamos pasos para procesar el dataset muchas veces
-  checkpoint_every: 1000 # snapshot cada 10k pasos, cada snapshot deja su sidecar …_stepNNNNN.resume.pt para reanudar
-  keep_last_checkpoints: 3 # retención rolling: conserva solo los 3 snapshots más nuevos (borra los viejos); el final y su _raw nunca se tocan. Subilo/bajalo o quitalo (= conservar todos)
-  lr: 1.0e-4              # LR más estándar para entrenamientos grandes y estables
+train:                     # hiperparámetros del loop
+  num_steps: 60000         # aumentamos pasos para procesar el dataset muchas veces
+  # checkpoint_every gobierna DOS cosas: los snapshots y —desde validation-loss— la cadencia de
+  # evaluación. Con 15000 sobre 60000 pasos la curva de validación queda con solo 4 puntos
+  # (15k/30k/45k/60k), que alcanza para ver el nivel pero es poco para leer una divergencia.
+  # Alternativas medidas (cada snapshot intermedio pesa ~708 MB: 142 de pesos + 567 de sidecar):
+  #   15000 ->  4 puntos,  3 snapshots  (~2.1 GB escritos)
+  #   10000 ->  6 puntos,  5 snapshots  (~3.5 GB escritos)
+  #    5000 -> 12 puntos, 11 snapshots  (~7.6 GB escritos)
+  # La retención de abajo acota el disco OCUPADO (4 snapshots vivos), no el total escrito.
+  checkpoint_every: 15000  # cada snapshot deja su sidecar …_stepNNNNN.resume.pt para reanudar
+  keep_last_checkpoints: 4 # retención rolling: conserva solo los 4 snapshots más nuevos (borra los viejos); el final y su _raw nunca se tocan. Subilo/bajalo o quitalo (= conservar todos)
+  lr: 1.0e-4               # LR más estándar para entrenamientos grandes y estables
   t_eps: 1.0e-4
-  device: cuda            # usar la GPU (RTX 3090)
-  log_every: 1000         # loguear menos seguido para no spammar la consola
+  device: cuda             # usar la GPU (RTX 3090). El examen fijo es específico del device: un
+                           # generator de CUDA y uno de CPU con la misma semilla dan secuencias
+                           # distintas, así que reanudar en CPU cortaría la comparabilidad de la
+                           # serie. Cada registro 'val' del .jsonl lleva el device para detectarlo.
+  log_every: 1000
   seed: 0
-  time_sampling: log_uniform
-  ema_decay: 0.9999       # subimos un '9' más para mayor estabilidad a largo plazo
-  amp: true               # Automatic Mixed Precision (float16) -> Ahorra ~50% VRAM
+  time_sampling: log_uniform  # la validación usa el MISMO muestreo de t (y sus pesos de importance
+                              # sampling), así que las dos curvas están en la misma escala
+  # Con ema_decay=0.9999 la rampa de warmup min(d, (1+s)/(10+s)) NO llega al valor nominal en esta
+  # corrida: toca 0.9999 en el paso ~89990, y a 60000 pasos el decay efectivo es 0.99985. En
+  # práctica el EMA promedia casi toda la corrida, así que su curva va a ser muy suave y a quedar
+  # por encima de la cruda hasta bien entrada la corrida. Si querés que el EMA se comporte como una
+  # ventana de ~10k pasos, 0.999 es el valor que satura temprano (paso ~8990).
+  ema_decay: 0.999       # subimos un '9' más para mayor estabilidad a largo plazo
+  amp: true               # Automatic Mixed Precision -> Ahorra ~50% VRAM. La validación se computa
+                          # SIEMPRE en fp32 (autocast deshabilitado a propósito), así que su número
+                          # es comparable contra celdas entrenadas sin AMP.
 
 out:                      # salidas
-  checkpoint: /mnt/data/abravo/diffusion-models/phase_3/cats_vp.pt
-  loss_curve: /mnt/data/abravo/diffusion-models/phase_3/cats_vp_loss.png
-  train_log: /mnt/data/abravo/diffusion-models/phase_3/cats_vp_train_log.jsonl 
+  checkpoint: /mnt/data/abravo/diffusion-models/phase_2/cats_vp.pt
+  loss_curve: /mnt/data/abravo/diffusion-models/phase_2/cats_vp_loss.png
+  train_log: /mnt/data/abravo/diffusion-models/phase_2/cats_vp_train_log.jsonl 
