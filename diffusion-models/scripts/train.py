@@ -26,8 +26,9 @@ Con ``data.val_root`` (solo ``kind: images``) la corrida mide además la **pérd
 por examen fijo cada ``train.checkpoint_every`` pasos y en el paso final: el CLI reenvía al loop las
 dos fuentes que armó el config layer (el examen de validación y el examen fijo de entrenamiento que
 lo hace legible), escribe un registro propio por evaluación en el ``.jsonl`` —``event: "val"``, con
-los tres valores y el ``device``— e informa el último punto medido al cerrar. Sin la clave no se mide
-nada y la salida es exactamente la de antes de la feature.
+los tres valores y el ``device``—, suma las tres curvas al gráfico de pérdida (con leyenda, ver
+:func:`save_loss_curve`) e informa el último punto medido al cerrar. Sin la clave no se mide nada y
+la salida —log, gráfico y consola— es exactamente la de antes de la feature.
 """
 
 from __future__ import annotations
@@ -112,7 +113,47 @@ def format_val_values(raw: float, ema: float | None, train: float | None) -> str
     return "  ".join(partes)
 
 
-def save_loss_curve(path: str | pathlib.Path, history: list[float], title: str) -> None:
+#: Etiqueta de la curva **densa** de entrenamiento (una pérdida por paso, con ``t`` re-sorteado en
+#: cada uno). Nombrarla "per-step" es load-bearing: la corrida puede dibujar además el examen fijo
+#: de entrenamiento, que mide el MISMO conjunto con ``t`` y ruido congelados. Son dos estimadores
+#: distintos y confundirlos invierte la lectura del gap — el par comparable es el examen fijo de
+#: train contra la validación con pesos vivos, nunca la curva densa contra la de validación.
+_ETIQUETA_TRAIN_DENSA = "train per-step"
+
+#: Las tres series **dispersas** de la validación: (clave del ``ValPoint``, etiqueta de la leyenda).
+#: El orden es el de dibujo y el de la leyenda: las dos de validación juntas (así la comparación
+#: raw↔EMA se lee de un vistazo) y el examen fijo de train al final, que es la referencia contra la
+#: cual se mide el gap de generalización.
+_SERIES_VAL: tuple[tuple[str, str], ...] = (
+    ("raw", "val (pesos vivos)"),
+    ("ema", "val (EMA)"),
+    ("train", "train (examen fijo)"),
+)
+
+
+def save_loss_curve(
+    path: str | pathlib.Path,
+    history: list[float],
+    title: str,
+    *,
+    val_history: list[dict] | None = None,
+) -> None:
+    """Dibuja la curva de pérdida de la corrida y la guarda como PNG.
+
+    Args:
+        path: Ruta del ``.png`` (se crean los directorios padre que falten).
+        history: Serie **densa** de la pérdida de entrenamiento, un valor por paso.
+        title: Título de la figura (típicamente ``"<sde> · <modelo>"``).
+        val_history: Serie **dispersa** de validación (los ``ValPoint`` de la corrida, indexados por
+            paso), o ``None``/vacía si la corrida no midió validación. Con la serie presente se
+            dibujan hasta tres curvas más —validación con pesos vivos, validación con la sombra EMA
+            y el examen fijo de entrenamiento— con línea **y** marcadores, porque la serie es
+            dispersa y con una cadencia grande puede tener dos o tres puntos: sin marcadores, una
+            línea de dos puntos se lee como una tendencia continua. Una curva cuyos valores son
+            todos ``None`` (sin EMA, o sin fuente de examen de train) simplemente no se dibuja.
+            Sin la serie el gráfico sale exactamente como antes de la feature ``validation-loss``:
+            una sola curva y sin leyenda.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -121,8 +162,31 @@ def save_loss_curve(path: str | pathlib.Path, history: list[float], title: str) 
     out = pathlib.Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(range(1, len(history) + 1), history, linewidth=0.7, alpha=0.8)
-    if min(history) > 0:
+    # La densa va indexada por POSICIÓN (paso 1..N); las dispersas, por el paso que trae cada punto.
+    # Mezclar las dos convenciones apilaría los puntos de validación contra el origen del eje.
+    ax.plot(
+        range(1, len(history) + 1), history,
+        linewidth=0.7, alpha=0.8, label=_ETIQUETA_TRAIN_DENSA,
+    )
+    graficadas = [history]
+    if val_history:
+        for clave, etiqueta in _SERIES_VAL:
+            presentes = [
+                (p["step"], p[clave]) for p in val_history if p.get(clave) is not None
+            ]
+            if not presentes:
+                continue  # serie ausente (p. ej. sin sombra EMA): no se dibuja
+            pasos, valores = zip(*presentes)
+            ax.plot(pasos, valores, marker="o", markersize=3.5, linewidth=1.2, label=etiqueta)
+            graficadas.append(list(valores))
+        # La leyenda aparece solo si se dibujó algo más que la curva densa: es lo que hace
+        # distinguible la densa del examen fijo de train (y lo que deja el gráfico sin validación
+        # igual que antes, sin leyenda).
+        if len(graficadas) > 1:
+            ax.legend(fontsize="small")
+    # La escala log tiene que mirar TODAS las series dibujadas: un valor <= 0 en cualquiera de ellas
+    # quedaría fuera de un eje logarítmico, sin ningún aviso.
+    if all(min(serie) > 0 for serie in graficadas):
         ax.set_yscale("log")
     ax.set_xlabel("paso")
     ax.set_ylabel("pérdida DSM")
@@ -361,8 +425,11 @@ def main(argv=None) -> int:
             raw_path = spec.checkpoint.with_stem(f"{spec.checkpoint.stem}_raw")
             print(f"Crudos     -> {raw_path}  (contraparte cruda del checkpoint EMA)")
     if spec.loss_curve:
+        # La serie de validación viaja como argumento opcional: vacía (corrida sin 'data.val_root')
+        # el gráfico sale exactamente como antes de la feature.
         save_loss_curve(
-            spec.loss_curve, result.history, f"{spec.sde.name} · {type(spec.model).__name__}"
+            spec.loss_curve, result.history, f"{spec.sde.name} · {type(spec.model).__name__}",
+            val_history=result.val_history,
         )
         print(f"Curva      -> {spec.loss_curve}")
     if not spec.checkpoint and not spec.loss_curve:

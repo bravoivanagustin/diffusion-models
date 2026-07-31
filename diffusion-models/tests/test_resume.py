@@ -1946,6 +1946,7 @@ def _write_cli_config_val(
     ema_decay=None,
     size=8,
     with_train_log=True,
+    with_loss_curve=False,
 ):
     """Escribe el ``.yaml`` de una corrida de imágenes mínima; devuelve ``(cfg, ckpt, log)``.
 
@@ -1955,6 +1956,9 @@ def _write_cli_config_val(
 
     ``with_train_log=False`` omite ``out.train_log``: el ``.jsonl`` también es opt-in y la
     validación tiene que informar igual por consola sin él.
+
+    ``with_loss_curve=True`` agrega ``out.loss_curve`` (el PNG queda en
+    ``<tmp_path>/run/vp_imgs_loss.png``, hermano del checkpoint), para los tests del gráfico.
     """
     train_dir = tmp_path / "imgs_train"
     run_dir = tmp_path / "run"
@@ -1985,6 +1989,8 @@ def _write_cli_config_val(
     out: dict = {"checkpoint": ckpt.as_posix()}
     if with_train_log:
         out["train_log"] = log_path.as_posix()
+    if with_loss_curve:
+        out["loss_curve"] = (run_dir / "vp_imgs_loss.png").as_posix()
     cfg = {
         "sde": {"name": "vp"},
         "data": data,
@@ -2197,3 +2203,349 @@ def test_cli_sin_val_root_no_escribe_ninguna_linea_de_validacion(tmp_path, capsy
     assert "Validación" not in capsys.readouterr().out
     _, meta = load_checkpoint(ckpt)
     assert "val_history" not in meta
+
+
+# =============================================================================
+# validation-loss task 7.2 — las curvas de validación en el gráfico de pérdida
+# =============================================================================
+#
+# El gráfico se asevera por el **contenido de la figura** (las series dibujadas, sus etiquetas, sus
+# coordenadas y la escala del eje Y), no por píxeles: un PNG no se puede interrogar y comparar bytes
+# ataría la suite a la versión de matplotlib. Para poder inspeccionar la figura que arma
+# ``save_loss_curve`` se neutraliza el ``plt.close`` del script (ver :func:`_capturar_figura`).
+#
+# Los dos invariantes que se protegen acá:
+#
+# - la serie dispersa se dibuja en los **pasos medidos**, no en índices consecutivos: la curva densa
+#   está indexada por posición y la dispersa por paso, así que mezclar las dos convenciones
+#   comprimiría los puntos de validación contra el origen del eje;
+# - la leyenda distingue la curva **densa per-step** del **examen fijo de entrenamiento**: son dos
+#   mediciones distintas del mismo conjunto (una con ``t`` re-sorteado por paso, la otra con el
+#   examen congelado) y confundirlas invierte la lectura del gap. El par comparable es el examen
+#   fijo de train contra la validación con pesos vivos.
+
+
+def _val_history(pasos, raws, emas=None, trains=None):
+    """Arma una serie dispersa de validación (lista de ``ValPoint``) para los tests del gráfico.
+
+    ``emas``/``trains`` en ``None`` producen la ausencia **por serie completa** (una corrida sin
+    sombra EMA, o sin fuente de examen de train), que es la forma en que la ausencia aparece de
+    verdad; una lista con ``None`` intercalados cubre la ausencia parcial.
+    """
+    n = len(pasos)
+    emas = [None] * n if emas is None else emas
+    trains = [None] * n if trains is None else trains
+    return [
+        {"step": s, "raw": r, "ema": e, "train": tr}
+        for s, r, e, tr in zip(pasos, raws, emas, trains)
+    ]
+
+
+def _capturar_figura(module, monkeypatch, path, history, title="titulo", **kwargs):
+    """Ejecuta ``save_loss_curve`` y devuelve la figura que armó, para inspeccionarla.
+
+    Se intercepta el ``plt.close(fig)`` del script para quedarse con la referencia a la figura y se
+    lo deja correr igual (el script tiene que seguir cerrándola: si no, una corrida larga acumularía
+    figuras). Cerrar una figura la saca del registro de pyplot pero **no** destruye el objeto ni sus
+    artistas, así que sigue siendo interrogable: series, etiquetas, leyenda y escala del eje.
+
+    El ``import matplotlib.pyplot`` del script es diferido, pero devuelve el mismo objeto módulo que
+    este, así que el parche llega.
+    """
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    capturadas = []
+    close_real = plt.close
+
+    def _close_espia(fig=None, *a, **k):
+        capturadas.append(fig)
+        return close_real(fig, *a, **k)
+
+    monkeypatch.setattr(plt, "close", _close_espia)
+    module.save_loss_curve(path, history, title, **kwargs)
+    assert len(capturadas) == 1, "save_loss_curve debe cerrar exactamente una figura"
+    assert capturadas[0] is not None, "debe cerrar la figura que creó, no todas"
+    return capturadas[0]
+
+
+def _etiquetas(ax):
+    """Etiquetas de las series dibujadas, en orden de dibujo."""
+    return [linea.get_label() for linea in ax.get_lines()]
+
+
+def _etiquetas_de_leyenda(ax):
+    leyenda = ax.get_legend()
+    return None if leyenda is None else [t.get_text() for t in leyenda.get_texts()]
+
+
+# ---------------------------------- sin serie de validación: el gráfico de hoy (5.5)
+
+
+def test_grafico_sin_validacion_dibuja_una_sola_serie_sin_leyenda(
+    tmp_path, monkeypatch
+):
+    """Sin la serie dispersa, la figura es la de hoy: una serie, sin leyenda, y el PNG se escribe (5.5).
+
+    El parámetro nuevo es opcional y el llamador viejo (``save_loss_curve(path, history, title)``)
+    tiene que seguir andando sin cambios.
+    """
+    module = _load_train_module()
+    png = tmp_path / "curva.png"
+
+    fig = _capturar_figura(module, monkeypatch, png, [1.0, 0.8, 0.6, 0.5])
+
+    ax = fig.axes[0]
+    assert len(ax.get_lines()) == 1
+    assert _etiquetas_de_leyenda(ax) is None  # hoy no hay leyenda y sin validación no aparece
+    assert ax.get_yscale() == "log"           # historia positiva ⇒ escala log, como hoy
+    assert png.exists()
+
+
+def test_grafico_con_serie_vacia_es_identico_a_sin_serie(tmp_path, monkeypatch):
+    """Una serie de validación **vacía** (corrida sin validación) no agrega curvas ni leyenda (5.5).
+
+    Es el valor real que llega desde el resultado de la corrida cuando no hay ``data.val_root``:
+    ``val_history`` es una lista vacía, no ``None``.
+    """
+    module = _load_train_module()
+
+    fig = _capturar_figura(
+        module, monkeypatch, tmp_path / "curva.png", [1.0, 0.8], val_history=[]
+    )
+
+    ax = fig.axes[0]
+    assert len(ax.get_lines()) == 1
+    assert _etiquetas_de_leyenda(ax) is None
+
+
+# ------------------------------- las cuatro series y la leyenda (5.3, 5.7)
+
+
+def test_grafico_con_validacion_dibuja_cuatro_series_con_leyenda(
+    tmp_path, monkeypatch
+):
+    """Con las tres mediciones, la figura tiene **cuatro** series y leyenda con las cuatro (5.3, 5.7)."""
+    module = _load_train_module()
+    val = _val_history([4, 8, 10], [0.9, 0.7, 0.6], [0.85, 0.65, 0.55], [0.5, 0.4, 0.35])
+
+    fig = _capturar_figura(
+        module, monkeypatch, tmp_path / "curva.png", [1.0] * 10, val_history=val
+    )
+
+    ax = fig.axes[0]
+    assert len(ax.get_lines()) == 4
+    etiquetas = _etiquetas(ax)
+    assert len(set(etiquetas)) == 4, f"etiquetas repetidas: {etiquetas}"
+    assert _etiquetas_de_leyenda(ax) == etiquetas  # la leyenda lista las cuatro, en orden de dibujo
+
+
+def test_grafico_la_leyenda_distingue_la_curva_densa_del_examen_fijo_de_train(
+    tmp_path, monkeypatch
+):
+    """La leyenda no puede confundir la curva densa per-step con el examen fijo de train (5.3).
+
+    Son dos mediciones distintas del **mismo** conjunto: la densa re-sortea ``t`` en cada paso, el
+    examen los tiene congelados. Si la leyenda las nombra igual (o solo una de las dos dice "train"),
+    el lector compara la curva equivocada contra la de validación y el gap se lee invertido.
+    """
+    module = _load_train_module()
+    val = _val_history([2, 4], [0.9, 0.7], [0.85, 0.65], [0.5, 0.4])
+
+    fig = _capturar_figura(
+        module, monkeypatch, tmp_path / "curva.png", [1.0, 0.9, 0.8, 0.7], val_history=val
+    )
+
+    ax = fig.axes[0]
+    etiquetas = _etiquetas(ax)
+    densa = etiquetas[0]  # la primera serie dibujada es siempre la historia per-step
+    de_train = [e for e in etiquetas if "train" in e.lower()]
+    assert len(de_train) == 2, f"esperaba dos series de train (densa + examen), hay {de_train}"
+    assert densa in de_train and densa != de_train[1]
+    # Cada una se nombra por lo que la distingue: la densa por ser per-step, la otra por ser el examen.
+    assert "per-step" in densa.lower()
+    examen = [e for e in de_train if e != densa][0]
+    assert "examen" in examen.lower()
+    # Y las dos de validación se distinguen entre sí por los pesos (vivos vs EMA).
+    de_val = [e for e in etiquetas if e not in de_train]
+    assert len(de_val) == 2 and any("ema" in e.lower() for e in de_val)
+
+
+# ------------------- la serie dispersa va en los pasos medidos, con marcadores (5.3)
+
+
+def test_grafico_dibuja_la_serie_dispersa_en_los_pasos_medidos(
+    tmp_path, monkeypatch
+):
+    """Las tres curvas dispersas se dibujan en los **pasos medidos**, no en índices consecutivos.
+
+    Es el error más fácil de cometer: la curva densa está indexada por posición (``1..len``) y la
+    dispersa por paso. Con cadencia 4 en una corrida de 10 pasos, usar índices pondría los puntos en
+    1, 2 y 3 — todos apilados contra el origen — en lugar de 4, 8 y 10.
+    """
+    module = _load_train_module()
+    pasos = [4, 8, 10]
+    val = _val_history(pasos, [0.9, 0.7, 0.6], [0.85, 0.65, 0.55], [0.5, 0.4, 0.35])
+
+    fig = _capturar_figura(
+        module, monkeypatch, tmp_path / "curva.png", [1.0] * 10, val_history=val
+    )
+
+    ax = fig.axes[0]
+    densa, *dispersas = ax.get_lines()
+    assert list(densa.get_xdata()) == list(range(1, 11))  # la densa no cambió de convención
+    assert len(dispersas) == 3
+    for linea in dispersas:
+        assert list(linea.get_xdata()) == pasos
+    # Los valores llegan a la serie que les corresponde (no cruzados entre sí).
+    por_etiqueta = {l.get_label(): list(l.get_ydata()) for l in dispersas}
+    assert sorted(por_etiqueta.values()) == sorted(
+        [[0.9, 0.7, 0.6], [0.85, 0.65, 0.55], [0.5, 0.4, 0.35]]
+    )
+
+
+def test_grafico_la_serie_dispersa_lleva_marcadores(tmp_path, monkeypatch):
+    """Las curvas dispersas llevan línea **y** marcadores (la densa sigue sin marcador).
+
+    Con una cadencia grande la serie puede tener dos o tres puntos: sin marcadores, una línea de dos
+    puntos se lee como una tendencia continua en lugar de como dos mediciones.
+    """
+    module = _load_train_module()
+    val = _val_history([5, 10], [0.9, 0.7], [0.85, 0.65], [0.5, 0.4])
+
+    fig = _capturar_figura(
+        module, monkeypatch, tmp_path / "curva.png", [1.0] * 10, val_history=val
+    )
+
+    densa, *dispersas = fig.axes[0].get_lines()
+    assert densa.get_marker() in ("", "None", None)  # la densa no cambia
+    for linea in dispersas:
+        assert linea.get_marker() not in ("", "None", None)
+        assert linea.get_linestyle() not in ("", "None", None)  # línea además del marcador
+
+
+# ----------------------------------- series ausentes: no se dibujan y no revientan
+
+
+def test_grafico_saltea_las_series_enteramente_ausentes(tmp_path, monkeypatch):
+    """Una curva cuyos valores son todos ``None`` **no se dibuja**: ni crashea ni aplana en cero.
+
+    Es el caso real de una corrida sin sombra EMA (``ema`` en ``None`` en todos los puntos) y sin
+    fuente de examen de train. Dibujar ``None`` como 0 pondría una línea plana falsa en el piso del
+    gráfico y, con escala log, tumbaría el eje entero.
+    """
+    module = _load_train_module()
+    hist = [1.0] * 6
+
+    # Sin EMA: quedan la densa, val con pesos vivos y el examen de train.
+    solo_sin_ema = _val_history([3, 6], [0.9, 0.7], None, [0.5, 0.4])
+    fig = _capturar_figura(module, monkeypatch, tmp_path / "a.png", hist, val_history=solo_sin_ema)
+    ax = fig.axes[0]
+    assert len(ax.get_lines()) == 3
+    assert not any("ema" in e.lower() for e in _etiquetas(ax))
+
+    # Sin EMA ni examen de train: solo la densa y la validación con pesos vivos.
+    solo_raw = _val_history([3, 6], [0.9, 0.7])
+    fig = _capturar_figura(module, monkeypatch, tmp_path / "b.png", hist, val_history=solo_raw)
+    ax = fig.axes[0]
+    assert len(ax.get_lines()) == 2
+    assert _etiquetas_de_leyenda(ax) == _etiquetas(ax)  # con validación siempre hay leyenda
+
+
+def test_grafico_omite_solo_los_puntos_ausentes_de_una_serie_parcial(
+    tmp_path, monkeypatch
+):
+    """Con ausencias **parciales** se dibujan los puntos presentes, en sus pasos, sin rellenar."""
+    module = _load_train_module()
+    val = _val_history([2, 4, 6], [0.9, 0.8, 0.7], [None, 0.75, 0.65])
+
+    fig = _capturar_figura(
+        module, monkeypatch, tmp_path / "curva.png", [1.0] * 6, val_history=val
+    )
+
+    lineas = {l.get_label(): l for l in fig.axes[0].get_lines()}
+    ema = [l for etiqueta, l in lineas.items() if "ema" in etiqueta.lower()]
+    assert len(ema) == 1
+    assert list(ema[0].get_xdata()) == [4, 6]
+    assert list(ema[0].get_ydata()) == [0.75, 0.65]
+
+
+# ------------------------------- la escala log mira TODAS las series graficadas
+
+
+def test_grafico_escala_log_solo_si_todas_las_series_son_positivas(
+    tmp_path, monkeypatch
+):
+    """La escala logarítmica se sujeta a **todas** las series, no solo a la de entrenamiento.
+
+    Con la condición vieja (que solo mira la historia), una serie de validación con un valor <= 0
+    entraría en un eje logarítmico y ese punto quedaría fuera del gráfico sin ningún aviso.
+    """
+    module = _load_train_module()
+    hist = [1.0, 0.9, 0.8, 0.7]
+
+    # Todas positivas ⇒ log.
+    todas_positivas = _val_history([2, 4], [0.9, 0.7], [0.85, 0.65], [0.5, 0.4])
+    fig = _capturar_figura(module, monkeypatch, tmp_path / "a.png", hist, val_history=todas_positivas)
+    assert fig.axes[0].get_yscale() == "log"
+
+    # Un cero en la validación con pesos vivos ⇒ escala lineal.
+    con_cero = _val_history([2, 4], [0.9, 0.0], [0.85, 0.65], [0.5, 0.4])
+    fig = _capturar_figura(module, monkeypatch, tmp_path / "b.png", hist, val_history=con_cero)
+    assert fig.axes[0].get_yscale() == "linear"
+
+    # Un negativo en el examen fijo de train (la serie que se agrega última) ⇒ lineal también.
+    con_negativo = _val_history([2, 4], [0.9, 0.7], [0.85, 0.65], [0.5, -0.1])
+    fig = _capturar_figura(module, monkeypatch, tmp_path / "c.png", hist, val_history=con_negativo)
+    assert fig.axes[0].get_yscale() == "linear"
+
+    # Y la condición vieja sigue valiendo: un cero en la historia ⇒ lineal aunque la val sea positiva.
+    fig = _capturar_figura(
+        module, monkeypatch, tmp_path / "d.png", [1.0, 0.0], val_history=todas_positivas
+    )
+    assert fig.axes[0].get_yscale() == "linear"
+
+
+# --------------------------------------- el PNG por el camino del CLI (5.3, 5.5)
+
+
+def test_cli_con_validacion_escribe_el_png_con_las_curvas(tmp_path):
+    """El CLI enchufa la serie de la corrida al gráfico: el PNG sale y trae las cuatro series (5.3).
+
+    Corrida real de punta a punta (imágenes sintéticas, 3 pasos, EMA activo) para que el gráfico se
+    arme con la serie que **midió el loop** y no con una construida a mano; la figura se vuelve a
+    generar con la serie del checkpoint para poder aseverar su contenido.
+    """
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, ckpt, _ = _write_cli_config_val(
+        tmp_path,
+        val_dir=val_dir,
+        num_steps=3,
+        checkpoint_every=2,
+        ema_decay=0.6,
+        with_loss_curve=True,
+    )
+
+    assert _load_train_main()(["--config", cfg, "--quiet"]) == 0
+
+    png = ckpt.parent / "vp_imgs_loss.png"
+    assert png.exists() and png.stat().st_size > 0
+    _, meta = load_checkpoint(ckpt)
+    assert [p["step"] for p in meta["val_history"]] == [2, 3]
+    assert all(p["ema"] is not None and p["train"] is not None for p in meta["val_history"])
+
+
+def test_cli_sin_validacion_escribe_el_png_igual(tmp_path):
+    """Sin ``data.val_root`` el gráfico se sigue generando, con una sola serie (5.5)."""
+    _carpetas_imagenes_cli(tmp_path)
+    cfg, ckpt, _ = _write_cli_config_val(
+        tmp_path, val_dir=None, num_steps=3, checkpoint_every=2, with_loss_curve=True
+    )
+
+    assert _load_train_main()(["--config", cfg, "--quiet"]) == 0
+
+    png = ckpt.parent / "vp_imgs_loss.png"
+    assert png.exists() and png.stat().st_size > 0
