@@ -5,6 +5,10 @@ archivo cubre el **resolver de fuente** :func:`build_data_source` y su cableado 
 :func:`build_run`. La Task 1.1 sólo ejercita el camino de **puntos** (retrocompatible) y el
 dispatch por ``kind`` (default ``points``, kind desconocido → error). El camino de imágenes se
 agrega en tareas posteriores.
+
+La feature ``validation-loss`` (task 6.1) cambió el contrato del resolver: devuelve un
+:class:`~diffusion.training.DataSources` en lugar de la 2-tupla ``(data, event_shape)``, y suma
+la clave ``data.val_root``. Los tests previos se migraron a la firma nueva en el mismo paso.
 """
 
 from __future__ import annotations
@@ -14,48 +18,55 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from diffusion.models import ScoreMLP, ScoreModel
-from diffusion.training import RunSpec, build_data_source, build_run, load_config  # noqa: F401
+from diffusion.training import (  # noqa: F401
+    DataSources,
+    RunSpec,
+    build_data_source,
+    build_run,
+    load_config,
+)
 
 
 # ------------------------------------------------------------ dispatch / puntos
 
 
 def test_build_data_source_puntos_sin_kind():
-    """Sin ``kind`` la fuente es de puntos: devuelve ``(iterador, None)`` y yield-ea ``(B, dim)``.
+    """Sin ``kind`` la fuente es de puntos: ``DataSources`` con ``event_shape`` nulo y ``(B, dim)``.
 
     ``event_shape`` es ``None`` para puntos (no hay forma de evento multidimensional). El batch
     respeta el ``batch_size`` del bloque ``data:`` y la dimensión ``dim`` de la distribución.
     """
-    data, event_shape = build_data_source(
+    sources = build_data_source(
         {"shape": "gaussian", "dim": 2, "n_samples": 64, "batch_size": 16}
     )
 
-    assert event_shape is None
-    batch = next(iter(data))
+    assert isinstance(sources, DataSources)
+    assert sources.event_shape is None
+    batch = next(iter(sources.train))
     assert isinstance(batch, torch.Tensor)
     assert batch.shape == (16, 2)
 
 
 def test_build_data_source_puntos_kind_explicito():
     """``kind: points`` explícito recorre el mismo camino que su ausencia (retrocompat)."""
-    data, event_shape = build_data_source(
+    sources = build_data_source(
         {"kind": "points", "shape": "mixture", "dim": 2, "n_samples": 64,
          "batch_size": 8, "n_components": 4, "seed": 0}
     )
 
-    assert event_shape is None
-    batch = next(iter(data))
+    assert sources.event_shape is None
+    batch = next(iter(sources.train))
     assert batch.shape == (8, 2)
 
 
 def test_build_data_source_acepta_name_ademas_de_shape():
     """El alias ``name`` para la forma sigue funcionando (como en el ``build_run`` previo)."""
-    data, event_shape = build_data_source(
+    sources = build_data_source(
         {"name": "gaussian", "dim": 2, "n_samples": 32, "batch_size": 4}
     )
 
-    assert event_shape is None
-    assert next(iter(data)).shape == (4, 2)
+    assert sources.event_shape is None
+    assert next(iter(sources.train)).shape == (4, 2)
 
 
 def test_build_data_source_falta_forma_es_value_error():
@@ -109,6 +120,8 @@ def test_build_run_puntos_sigue_armando_runspec_con_mlp():
     assert batch.shape == (128, 2)
     assert spec.checkpoint.name == "x.pt"
     assert spec.loss_curve.name == "x.png"
+    # validation-loss (2.4): sin 'data.val_root' la corrida no trae fuente de validación.
+    assert spec.val_data is None
 
 
 def test_build_data_source_no_muta_dict_del_caller():
@@ -144,15 +157,17 @@ def test_build_data_source_imagenes_happy_path(carpeta_imagenes):
     El iterador devuelto yield-ea un tensor ``(B, 3, image_size, image_size)`` float32; la forma
     de evento fija los canales en 3.
     """
-    data, event_shape = build_data_source(
+    sources = build_data_source(
         {"kind": "images", "root": str(carpeta_imagenes), "image_size": 16, "batch_size": 4}
     )
 
-    assert event_shape == (3, 16, 16)
-    batch = next(data)
+    assert sources.event_shape == (3, 16, 16)
+    batch = next(sources.train)
     assert isinstance(batch, torch.Tensor)
     assert batch.shape == (4, 3, 16, 16)
     assert batch.dtype == torch.float32
+    # validation-loss (2.4): sin 'val_root' las fuentes de examen quedan nulas.
+    assert sources.val is None
 
 
 def test_build_data_source_imagenes_falta_root_es_value_error():
@@ -231,7 +246,7 @@ def test_build_data_source_imagenes_propaga_knobs_de_carga(carpeta_imagenes, mon
         config_module, "infinite_batches", _spy_infinite_batches(captura, image_size=16)
     )
 
-    data, event_shape = build_data_source(
+    sources = build_data_source(
         {
             "kind": "images",
             "root": str(carpeta_imagenes),
@@ -242,7 +257,7 @@ def test_build_data_source_imagenes_propaga_knobs_de_carga(carpeta_imagenes, mon
         }
     )
 
-    assert event_shape == (3, 16, 16)
+    assert sources.event_shape == (3, 16, 16)
     assert captura["num_workers"] == 3
     assert captura["pin_memory"] is True
 
@@ -279,6 +294,222 @@ def test_build_data_source_imagenes_clave_de_carga_desconocida_es_value_error(ca
         )
 
     assert "desconocida" in str(exc.value).lower()
+
+
+# --------------------------------------------- data.val_root (validation-loss, 6.1)
+
+
+def _imagen_asimetrica(path, ancho=32, alto=32):
+    """Guarda una imagen con la mitad izquierda negra y la derecha blanca.
+
+    Sirve para detectar espejado horizontal: la fuente de validación se arma con
+    ``augment=False``, así que la orientación tiene que ser siempre la canónica (izquierda
+    oscura, derecha clara) en todos los recorridos.
+    """
+    img = Image.new("RGB", (ancho, alto), color=(0, 0, 0))
+    for x in range(ancho // 2, ancho):
+        for y in range(alto):
+            img.putpixel((x, y), (255, 255, 255))
+    img.save(path)
+
+
+@pytest.fixture
+def carpetas_train_val(tmp_path):
+    """Dos carpetas **hermanas** con imágenes: ``train/`` (8) y ``val/`` (6, asimétricas).
+
+    Hermanas y no anidadas a propósito: el descubrimiento de imágenes es recursivo, así que un
+    ``val/`` dentro del ``root`` de entrenamiento contaminaría el set de train.
+    """
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    for i in range(8):
+        Image.new("RGB", (32, 32), color=(i * 20, 40, 200 - i * 10)).save(
+            train_dir / f"t{i}.png"
+        )
+    for i in range(6):
+        _imagen_asimetrica(val_dir / f"v{i}.png")
+    return train_dir, val_dir
+
+
+def _data_raw(train_dir, val_dir=None, **extra):
+    """Bloque ``data:`` de imágenes, con ``val_root`` solo si se pasa (clave opt-in)."""
+    raw = {"kind": "images", "root": str(train_dir), "image_size": 16, "batch_size": 4}
+    if val_dir is not None:
+        raw["val_root"] = str(val_dir)
+    raw.update(extra)
+    return raw
+
+
+def test_build_data_source_val_root_arma_fuente_de_validacion(carpetas_train_val):
+    """``data.val_root`` arma una segunda fuente con la MISMA forma de evento (2.1, 2.3).
+
+    La fuente de validación es finita: recorre las 6 imágenes completas (incluida la cola
+    parcial) con el mismo ``batch_size`` y el mismo ``image_size`` que la de entrenamiento.
+    """
+    train_dir, val_dir = carpetas_train_val
+    sources = build_data_source(_data_raw(train_dir, val_dir))
+
+    assert sources.val is not None
+    batches = list(sources.val)
+    assert [tuple(b.shape) for b in batches] == [(4, 3, 16, 16), (2, 3, 16, 16)]
+    # 2.3: la forma de evento de la validación coincide con la derivada para el entrenamiento.
+    assert all(tuple(b.shape[1:]) == sources.event_shape for b in batches)
+    assert sum(b.shape[0] for b in batches) == 6  # el set completo, sin descartar la cola
+
+
+def test_build_data_source_val_root_es_reiterable(carpetas_train_val):
+    """La fuente de validación es **re-iterable**: dos recorridos dan los mismos tensores (2.2).
+
+    Es la condición que hace reproducible el examen fijo, y de paso descarta cualquier aumento
+    de datos aleatorio (un espejado al azar haría diferir los dos recorridos).
+    """
+    train_dir, val_dir = carpetas_train_val
+    sources = build_data_source(_data_raw(train_dir, val_dir))
+
+    primera = [b.clone() for b in sources.val]
+    segunda = [b.clone() for b in sources.val]
+
+    assert len(primera) == len(segunda) == 2
+    for a, b in zip(primera, segunda):
+        assert torch.equal(a, b)
+
+
+def test_build_data_source_val_root_orientacion_canonica_sin_augmentation(carpetas_train_val):
+    """La validación se consume **sin espejado**: orientación canónica en todos los pasos (2.2).
+
+    Las imágenes de validación son asimétricas (mitad izquierda negra, derecha blanca). Con
+    ``augment=True`` el volteo horizontal aleatorio invertiría ese patrón en algunas imágenes;
+    acá se verifica que **ninguna** aparece invertida, en dos recorridos completos.
+    """
+    train_dir, val_dir = carpetas_train_val
+    sources = build_data_source(_data_raw(train_dir, val_dir))
+
+    for _ in range(2):
+        for batch in sources.val:
+            izquierda = batch[:, :, :, 0]   # primera columna: negro → normalizado a -1
+            derecha = batch[:, :, :, -1]    # última columna: blanco → normalizado a +1
+            assert bool((izquierda < 0).all()), "la validación llegó espejada"
+            assert bool((derecha > 0).all()), "la validación llegó espejada"
+
+
+def test_build_data_source_val_root_hereda_params_de_la_fuente_de_train(
+    carpetas_train_val, monkeypatch
+):
+    """La validación se deriva con el mismo batch/imagen/encuadre y carga in-process (2.3).
+
+    Se espía :func:`finite_batches` en el módulo de config para capturar con qué se construye la
+    fuente: ``batch_size``/``image_size``/``crop`` copiados de la de entrenamiento, y
+    ``num_workers=0``/``pin_memory=False`` forzados (una evaluación no amortiza workers).
+    """
+    train_dir, val_dir = carpetas_train_val
+    captura: dict = {}
+    real_finite = config_module.finite_batches
+
+    def spy(root, batch_size, **kwargs):
+        captura["root"] = root
+        captura["batch_size"] = batch_size
+        captura.update(kwargs)
+        return real_finite(root, batch_size, **kwargs)
+
+    monkeypatch.setattr(config_module, "finite_batches", spy)
+
+    build_data_source(_data_raw(train_dir, val_dir, image_size=8, batch_size=3, crop=False))
+
+    assert captura["root"] == str(val_dir)
+    assert captura["batch_size"] == 3        # mismo batch que la fuente de entrenamiento
+    assert captura["image_size"] == 8        # mismo tamaño de imagen
+    assert captura["crop"] is False          # mismo modo de encuadre
+    assert captura["num_workers"] == 0
+    assert captura["pin_memory"] is False
+
+
+def test_build_data_source_val_root_mas_chico_que_batch_size_es_batch_parcial(tmp_path):
+    """Un set de validación más chico que el batch se acepta como un único batch parcial (2.7).
+
+    A diferencia de la fuente de entrenamiento (que con ``drop_last=True`` exige el mínimo), la
+    finita no descarta la cola: 3 imágenes con ``batch_size=8`` son un batch parcial válido.
+    """
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    for i in range(8):
+        Image.new("RGB", (32, 32), color=(i * 20, 40, 60)).save(train_dir / f"t{i}.png")
+    for i in range(3):
+        Image.new("RGB", (32, 32), color=(10, 20, 30)).save(val_dir / f"v{i}.png")
+
+    sources = build_data_source(_data_raw(train_dir, val_dir, batch_size=8))
+
+    batches = list(sources.val)
+    assert len(batches) == 1
+    assert tuple(batches[0].shape) == (3, 3, 16, 16)
+
+
+def test_build_data_source_val_root_inexistente_es_value_error(carpetas_train_val, tmp_path):
+    """Un ``val_root`` inexistente aborta con ``ValueError`` nombrando la ruta (2.5)."""
+    train_dir, _ = carpetas_train_val
+    inexistente = tmp_path / "no_existe"
+
+    with pytest.raises(ValueError, match="no_existe"):
+        build_data_source(_data_raw(train_dir, inexistente))
+
+
+def test_build_data_source_val_root_vacio_es_value_error(carpetas_train_val, tmp_path):
+    """Un ``val_root`` sin imágenes aborta con ``ValueError`` nombrando la ruta (2.5)."""
+    train_dir, _ = carpetas_train_val
+    vacio = tmp_path / "vacio"
+    vacio.mkdir()
+
+    with pytest.raises(ValueError, match="No se encontraron imágenes"):
+        build_data_source(_data_raw(train_dir, vacio))
+
+
+def test_build_data_source_val_root_con_puntos_es_value_error(tmp_path):
+    """``val_root`` sobre una fuente de puntos aborta explícitamente (2.6).
+
+    Sin el chequeo la clave se ignoraría **en silencio**: ``make_distribution`` filtra kwargs por
+    firma, así que ``val_root`` se descartaría sin avisar y la corrida entrenaría sin validación.
+    """
+    with pytest.raises(ValueError, match="val_root") as exc:
+        build_data_source(
+            {"shape": "gaussian", "dim": 2, "n_samples": 32, "batch_size": 4,
+             "val_root": str(tmp_path)}
+        )
+
+    msg = str(exc.value)
+    assert "images" in msg
+
+
+def test_build_data_source_val_root_forma_inesperada_es_value_error(
+    carpetas_train_val, monkeypatch
+):
+    """Si la fuente de validación emite otra forma, el peek levanta ``ValueError`` (2.3).
+
+    La fuente real siempre coacciona al tamaño pedido, así que se falsea :func:`finite_batches`
+    con una que emite la forma equivocada para ejercitar genuinamente el guard.
+    """
+    train_dir, val_dir = carpetas_train_val
+
+    def fake_finite_batches(root, batch_size, **kwargs):
+        return [torch.zeros(batch_size, 3, 8, 8)]  # 8x8 ≠ image_size=16 pedido
+
+    monkeypatch.setattr(config_module, "finite_batches", fake_finite_batches)
+
+    with pytest.raises(ValueError, match="validación|val_root"):
+        build_data_source(_data_raw(train_dir, val_dir))
+
+
+def test_build_data_source_val_root_no_muta_dict_del_caller(carpetas_train_val):
+    """El resolver copia el bloque ``data:`` antes de popear ``val_root`` (no muta al caller)."""
+    train_dir, val_dir = carpetas_train_val
+    raw = _data_raw(train_dir, val_dir)
+    snapshot = dict(raw)
+
+    build_data_source(raw)
+
+    assert raw == snapshot
 
 
 # ------------------------------------------------- build_run: cableado imágenes
@@ -341,6 +572,52 @@ def test_build_run_imagenes_model_unet_explicito_respetado(carpeta_imagenes):
 
     assert isinstance(spec.model, ScoreUNet)
     assert spec.sde.data_dim == (3, 16, 16)
+
+
+def test_build_run_imagenes_val_root_cablea_val_data(carpetas_train_val):
+    """``build_run`` copia la fuente de validación del resolver al ``RunSpec`` (2.1, 2.3).
+
+    El ``RunSpec`` gana ``val_data``: no nula cuando el config declara ``data.val_root``, con la
+    misma forma de evento que la fuente de entrenamiento (la que alimenta la SDE).
+    """
+    train_dir, val_dir = carpetas_train_val
+    raw = {"sde": {"name": "vp"}, "data": _data_raw(train_dir, val_dir)}
+
+    spec = build_run(raw)
+
+    assert spec.val_data is not None
+    assert spec.sde.data_dim == (3, 16, 16)
+    batch = next(iter(spec.val_data))
+    assert tuple(batch.shape[1:]) == spec.sde.data_dim
+
+
+def test_build_run_imagenes_sin_val_root_val_data_es_none(carpetas_train_val):
+    """Sin ``data.val_root`` el ``RunSpec`` sale igual que antes de la feature (2.4).
+
+    ``val_data`` nula y todos los campos previos poblados como siempre: la clave ausente ⇒
+    comportamiento sin cambios (la validación es opt-in).
+    """
+    train_dir, _ = carpetas_train_val
+    raw = {"sde": {"name": "vp"}, "data": _data_raw(train_dir)}
+
+    spec = build_run(raw)
+
+    assert spec.val_data is None
+    assert spec.sde.data_dim == (3, 16, 16)
+    assert isinstance(spec.model, ScoreUNet)
+    assert spec.model_spec["name"] == "unet"
+    assert next(iter(spec.data)).shape == (4, 3, 16, 16)
+
+
+def test_build_run_puntos_val_root_es_value_error(tmp_path):
+    """``build_run`` propaga el rechazo de ``val_root`` en una corrida de puntos (2.6)."""
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 64, "batch_size": 8,
+                 "val_root": str(tmp_path)},
+    }
+    with pytest.raises(ValueError, match="val_root"):
+        build_run(raw)
 
 
 def test_build_run_puntos_data_dim_entero_y_mlp():

@@ -17,6 +17,9 @@ Estructura esperada del YAML::
       n_samples: 4000
       batch_size: 256
       n_components: 8
+      val_root: data/cats_val  # opcional, SOLO kind: images: carpeta held-out sobre la que se
+                          #   mide la pérdida de validación. Sin la clave no se mide nada
+                          #   (opt-in); con una fuente de puntos se rechaza.
     train:                # -> campos de TrainConfig (solo el loop de optimización)
       num_steps: 300
       lr: 0.002
@@ -36,10 +39,15 @@ Estructura esperada del YAML::
 from __future__ import annotations
 
 import pathlib
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, fields
 
-from ..data_generation import infinite_bare, infinite_batches, make_distribution
+from ..data_generation import (
+    finite_batches,
+    infinite_bare,
+    infinite_batches,
+    make_distribution,
+)
 from ..models import EpsilonScoreWrapper, ScoreModel, make_model
 from ..sde import ForwardSDE, make_sde
 from .trainer import TrainConfig
@@ -63,6 +71,9 @@ class RunSpec:
     Además transporta ``model_spec`` —la receta ``{name, kwargs}`` con la que se construyó la
     red— para que ``scripts/train.py`` la pase a :func:`~diffusion.training.save_checkpoint` y
     el checkpoint quede reconstruible sin el config original.
+
+    ``val_data`` es la fuente del examen de validación (feature ``validation-loss``): no nula
+    **exactamente** cuando el config declara ``data.val_root``, y el CLI la reenvía al loop.
     """
 
     sde: ForwardSDE
@@ -73,6 +84,34 @@ class RunSpec:
     checkpoint: pathlib.Path | None = None
     loss_curve: pathlib.Path | None = None
     train_log: pathlib.Path | None = None  # .jsonl de estados del entrenamiento (opcional, con timestamps)
+    val_data: Iterable | None = None  # examen de validación (None = corrida sin validación)
+
+
+@dataclass
+class DataSources:
+    """Las fuentes que salen del bloque ``data:`` y la forma de evento derivada.
+
+    Valor de retorno de :func:`build_data_source`. Es un dataclass y no una tupla porque con
+    más de una fuente las posiciones se leen mal (y sumar una fuente futura no vuelve a romper
+    la firma). ``train`` y ``event_shape`` son el contrato de siempre; ``val`` es la fuente de
+    validación de la feature ``validation-loss``, no nula **exactamente** cuando el config
+    declara ``data.val_root``.
+
+    Attributes:
+        train: Fuente **infinita** de tensores crudos que consume el loop de entrenamiento.
+        event_shape: Forma de evento ``(C, H, W)`` para imágenes; ``None`` para puntos (dato
+            plano: la dimensión la lleva la SDE).
+        val: Fuente **finita y re-iterable** del examen de validación, o ``None`` si no se
+            declaró ``data.val_root``.
+        train_exam: Fuente finita del examen fijo de **entrenamiento** (la referencia que hace
+            legible la curva de validación), o ``None``. Se deriva en una tarea posterior de la
+            feature; hoy queda siempre en ``None``.
+    """
+
+    train: Iterator
+    event_shape: tuple[int, ...] | None
+    val: Iterable | None = None
+    train_exam: Iterable | None = None
 
 
 def load_config(path: str | pathlib.Path) -> dict:
@@ -98,18 +137,23 @@ def load_config(path: str | pathlib.Path) -> dict:
         return yaml.safe_load(f)
 
 
-def build_data_source(
-    data_raw: dict,
-) -> tuple[Iterator, tuple[int, ...] | None]:
+def build_data_source(data_raw: dict) -> DataSources:
     """Dispatcha la fuente de datos por ``data_raw['kind']`` ('points' default | 'images').
 
-    Es el **único dueño** del parseo del bloque ``data:``: :func:`build_run` obtiene su fuente
+    Es el **único dueño** del parseo del bloque ``data:``: :func:`build_run` obtiene sus fuentes
     a través de este resolver, sin duplicar el parseo. Para puntos arma la distribución de
     juguete y la envuelve en un iterador infinito de tensores crudos; la forma de evento es
     ``None`` (dato plano, la dimensión la lleva la SDE). Para imágenes arma la fuente infinita
     con :func:`~diffusion.data_generation.infinite_batches`, deriva la forma de evento
     ``(3, image_size, image_size)`` (canales fijos en 3) y la valida **peekeando** el primer
     batch del iterador real, que devuelve tal cual (ya posicionado tras ese batch).
+
+    Con ``val_root`` (feature ``validation-loss``) arma **además** la fuente del examen de
+    validación con :func:`~diffusion.data_generation.finite_batches`: finita, re-iterable, en
+    orden y orientación canónicos, y con el **mismo** ``batch_size``, ``image_size`` y ``crop``
+    que la de entrenamiento, para que ambas pérdidas se computen sobre la misma forma de evento.
+    Su forma también se valida con un peek, inocuo acá porque la fuente es re-iterable (a
+    diferencia de la infinita, donde el peek obliga a devolver el iterador ya avanzado).
 
     Args:
         data_raw: El bloque ``data:`` del config (se copia; no se muta el ``dict`` del caller).
@@ -119,24 +163,41 @@ def build_data_source(
             imágenes: ``root`` (obligatorio), ``image_size`` (default 64),
             ``batch_size`` (default de la corrida previa), ``augment``/``crop``/``shuffle``
             (default True), ``seed`` (default None), ``num_workers`` (default 0: carga en el
-            proceso principal), ``pin_memory`` (default False: sin memoria fijada). Otras claves
-            se rechazan (``infinite_batches`` no filtra por firma).
+            proceso principal), ``pin_memory`` (default False: sin memoria fijada),
+            ``val_root`` (default None: sin validación). Otras claves se rechazan
+            (``infinite_batches`` no filtra por firma).
 
     Returns:
-        ``(data, event_shape)``: el iterador infinito de tensores crudos y la forma de evento
-        ``(C, H, W)`` para imágenes o ``None`` para puntos.
+        Un :class:`DataSources` con la fuente infinita de entrenamiento, la forma de evento
+        (``(C, H, W)`` para imágenes o ``None`` para puntos) y la fuente de validación —no nula
+        exactamente cuando se declaró ``val_root``—.
 
     Raises:
-        ValueError: Si ``kind`` no está reconocido (lista los válidos); —camino de puntos— si
-            falta ``data.shape``/``data.name``; —camino de imágenes— si falta ``data.root``, si
-            quedan claves desconocidas, si la carpeta no existe/está vacía/tiene menos imágenes
-            que ``batch_size`` (propagado desde ``infinite_batches``), o si la forma emitida no
-            coincide con la derivada.
+        ValueError: Si ``kind`` no está reconocido (lista los válidos); si se declara
+            ``val_root`` con una fuente que no es de imágenes; —camino de puntos— si falta
+            ``data.shape``/``data.name``; —camino de imágenes— si falta ``data.root``, si quedan
+            claves desconocidas, si la carpeta no existe/está vacía/tiene menos imágenes que
+            ``batch_size`` (propagado desde ``infinite_batches``), si la forma emitida no
+            coincide con la derivada, o si ``val_root`` no existe/está vacía (propagado desde
+            ``finite_batches``, que **no** exige un mínimo de ``batch_size``: un set más chico
+            que el batch es un batch parcial válido) o emite otra forma de evento.
     """
     data_raw = dict(data_raw or {})
     kind = data_raw.pop("kind", "points")
+    # La clave de validación se popea ACÁ, antes del dispatch, porque las dos ramas la necesitan
+    # fuera del dict por motivos opuestos: la de imágenes rechaza claves desconocidas (dejarla
+    # sin popear haría fallar toda config que la declare) y la de puntos pasa el resto a
+    # make_distribution, que filtra por firma (la clave se ignoraría en silencio). Ausente ⇒
+    # comportamiento idéntico al de antes de la feature.
+    val_root = data_raw.pop("val_root", None)
 
     if kind == "points":
+        if val_root is not None:
+            raise ValueError(
+                "config: 'data.val_root' solo aplica a kind: images; la pérdida de validación "
+                "se mide sobre una fuente de imágenes y esta corrida es de puntos "
+                f"(kind={kind!r}). Saca la clave o pasá la corrida a kind: images."
+            )
         # Camino de puntos (movido verbatim desde build_run): n_samples/batch_size son params de
         # la fuente (no del TrainConfig); el resto de las claves van a make_distribution, que
         # filtra por firma.
@@ -151,7 +212,8 @@ def build_data_source(
         shuffle = data_raw.pop("shuffle", True)
         distribution = make_distribution(shape, dim, **data_raw)
         data = infinite_bare(distribution.dataloader(n_samples, batch_size, shuffle=shuffle))
-        return data, None  # dato plano: sin forma de evento (la dimensión la lleva la SDE)
+        # Dato plano: sin forma de evento (la dimensión la lleva la SDE) y sin validación.
+        return DataSources(train=data, event_shape=None)
 
     if kind == "images":
         # Camino de imágenes: se mapean SOLO los params conocidos de infinite_batches (que NO
@@ -200,7 +262,32 @@ def build_data_source(
                 f"config: la fuente de imágenes emite forma {obtained}, se esperaba "
                 f"{event_shape} (derivada de image_size={image_size}, canales=3)."
             )
-        return data, event_shape
+        # Examen de validación (opt-in): misma forma de evento que el entrenamiento (mismos
+        # batch_size / image_size / crop) pero recorrido de medición, no de entrenamiento — la
+        # fuente finita fuerza orden y orientación canónicos (sin barajado ni espejado) y entrega
+        # la cola como batch parcial, sin mínimo de batch_size. num_workers/pin_memory se fijan
+        # en los valores in-process: una evaluación no amortiza el arranque de los workers.
+        val = None
+        if val_root is not None:
+            val = finite_batches(
+                val_root,
+                batch_size,
+                image_size=image_size,
+                crop=crop,
+                num_workers=0,
+                pin_memory=False,
+            )
+            # Peek de validación de la forma, con el mismo criterio que la fuente de
+            # entrenamiento. Acá es inocuo: la fuente es re-iterable, así que consumir el primer
+            # batch no le saca ningún dato al examen (arranca de cero en cada recorrido).
+            obtained_val = tuple(next(iter(val)).shape[1:])
+            if obtained_val != event_shape:
+                raise ValueError(
+                    f"config: la fuente de validación ('data.val_root': {val_root}) emite forma "
+                    f"{obtained_val}, se esperaba {event_shape} (la misma que la de "
+                    "entrenamiento, para que ambas pérdidas sean comparables)."
+                )
+        return DataSources(train=data, event_shape=event_shape, val=val)
 
     raise ValueError(
         f"config: data.kind desconocido: {kind!r}. Válidos: {', '.join(_VALID_KINDS)}."
@@ -215,7 +302,8 @@ def build_run(raw: dict) -> RunSpec:
 
     Returns:
         Un :class:`RunSpec` con la SDE, la red, la fuente de datos infinita, el
-        :class:`TrainConfig` y las rutas.
+        :class:`TrainConfig`, las rutas y —si el config declara ``data.val_root``— la fuente del
+        examen de validación.
 
     Raises:
         ValueError: Si faltan claves obligatorias (``sde.name``, ``data.shape``), si una corrida
@@ -223,7 +311,8 @@ def build_run(raw: dict) -> RunSpec:
             fuente de verdad), si el bloque ``train:`` trae claves desconocidas para
             :class:`TrainConfig`, si el ``name`` del bloque ``model:`` no está registrado en
             ``make_model``, o si ``model.score_parametrization`` trae un valor distinto de
-            ``"epsilon"``.
+            ``"epsilon"``. Propaga además los errores del bloque ``data:`` (ver
+            :func:`build_data_source`, incluida la validación de ``val_root``).
     """
     raw = dict(raw or {})
 
@@ -231,7 +320,8 @@ def build_run(raw: dict) -> RunSpec:
     # puntos devuelve event_shape=None (comportamiento idéntico al de antes); para imágenes la
     # forma de evento (C, H, W) alimenta la SDE de abajo. Se arma ANTES que la SDE para que la
     # forma derivada pueda configurarla (única fuente de verdad en 'data:'). ---
-    data, event_shape = build_data_source(raw.get("data") or {})
+    sources = build_data_source(raw.get("data") or {})
+    data, event_shape = sources.train, sources.event_shape
 
     # --- SDE: para imágenes se construye con la forma de evento como data_dim (derivada de
     # 'data:', no declarada en 'sde:'); para puntos, exactamente como antes. ---
@@ -308,4 +398,7 @@ def build_run(raw: dict) -> RunSpec:
         checkpoint=pathlib.Path(checkpoint) if checkpoint else None,
         loss_curve=pathlib.Path(loss_curve) if loss_curve else None,
         train_log=pathlib.Path(train_log) if train_log else None,
+        # Se copia tal cual desde el resolver, sin más lógica: es None exactamente cuando el
+        # config no declara 'data.val_root' (validación opt-in).
+        val_data=sources.val,
     )
