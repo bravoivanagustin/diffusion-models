@@ -10,8 +10,11 @@ Torch es dependencia dura del módulo (igual que en `test_training.py`), así qu
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import pathlib
+from typing import NamedTuple
 
 import pytest
 
@@ -2241,13 +2244,14 @@ def _val_history(pasos, raws, emas=None, trains=None):
     ]
 
 
-def _capturar_figura(module, monkeypatch, path, history, title="titulo", **kwargs):
-    """Ejecuta ``save_loss_curve`` y devuelve la figura que armó, para inspeccionarla.
+def _espiar_figuras(monkeypatch) -> list:
+    """Espía el ``plt.close`` y devuelve la lista donde se apilan las figuras cerradas.
 
-    Se intercepta el ``plt.close(fig)`` del script para quedarse con la referencia a la figura y se
-    lo deja correr igual (el script tiene que seguir cerrándola: si no, una corrida larga acumularía
-    figuras). Cerrar una figura la saca del registro de pyplot pero **no** destruye el objeto ni sus
-    artistas, así que sigue siendo interrogable: series, etiquetas, leyenda y escala del eje.
+    Se intercepta el ``plt.close(fig)`` para quedarse con la referencia a la figura y se lo deja
+    correr igual (el código bajo test tiene que seguir cerrándola: si no, una corrida larga
+    acumularía figuras). Cerrar una figura la saca del registro de pyplot pero **no** destruye el
+    objeto ni sus artistas, así que sigue siendo interrogable: series, etiquetas, leyenda y escala
+    del eje.
 
     El ``import matplotlib.pyplot`` del script es diferido, pero devuelve el mismo objeto módulo que
     este, así que el parche llega.
@@ -2258,7 +2262,7 @@ def _capturar_figura(module, monkeypatch, path, history, title="titulo", **kwarg
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    capturadas = []
+    capturadas: list = []
     close_real = plt.close
 
     def _close_espia(fig=None, *a, **k):
@@ -2266,6 +2270,12 @@ def _capturar_figura(module, monkeypatch, path, history, title="titulo", **kwarg
         return close_real(fig, *a, **k)
 
     monkeypatch.setattr(plt, "close", _close_espia)
+    return capturadas
+
+
+def _capturar_figura(module, monkeypatch, path, history, title="titulo", **kwargs):
+    """Ejecuta ``save_loss_curve`` y devuelve la figura que armó, para inspeccionarla."""
+    capturadas = _espiar_figuras(monkeypatch)
     module.save_loss_curve(path, history, title, **kwargs)
     assert len(capturadas) == 1, "save_loss_curve debe cerrar exactamente una figura"
     assert capturadas[0] is not None, "debe cerrar la figura que creó, no todas"
@@ -2549,3 +2559,184 @@ def test_cli_sin_validacion_escribe_el_png_igual(tmp_path):
 
     png = ckpt.parent / "vp_imgs_loss.png"
     assert png.exists() and png.stat().st_size > 0
+
+
+# =============================================================================
+# validation-loss task 8.1 — E2E del CLI: el par con y sin validación
+# =============================================================================
+#
+# Las tasks 7.1 y 7.2 aseveran **cada superficie por separado** (una corrida para el ``.jsonl``, otra
+# para la consola, otra para el PNG, y la figura del gráfico con series construidas a mano). Acá se
+# cierra el **par**: dos corridas reales del CLI —una con ``data.val_root`` y otra sin la clave, con
+# el mismo YAML, las mismas imágenes y los mismos pasos— y sobre cada una los **cuatro observables
+# juntos**: código de salida, ``.jsonl``, PNG/figura y consola.
+#
+# Lo que agrega sobre 7.1/7.2:
+#
+# - la figura que se interroga es la que dibujó **el CLI durante la corrida**, no una que el test
+#   armó llamando a ``save_loss_curve`` con una serie sintética;
+# - las tres superficies informan **la misma medición**: el valor del ``.jsonl``, el que el resumen
+#   de consola imprime y el que la curva del PNG dibuja salen del mismo ``ValPoint``. Un cableado que
+#   graficara otra serie —o que informara el primer punto en vez del último— pasa los tests por
+#   superficie y falla acá;
+# - el **contraste** está en un solo lugar (:func:`test_e2e_el_par_difiere_solo_en_la_validacion`):
+#   lo que no es de validación sale igual en las dos corridas y lo que sí, difiere. Así ninguna de
+#   las dos mitades puede pasar por la razón equivocada.
+#
+# Cada corrida del CLI cuesta unos segundos de CPU, así que el par se corre **una vez** por módulo
+# (fixture :func:`par_e2e`) y los tres tests leen los observables cacheados.
+
+
+class _ObservablesCLI(NamedTuple):
+    """Los cuatro observables de una corrida del CLI, para poder aseverarlos juntos."""
+
+    codigo: int                 # código de salida de ``main``
+    lineas: list[dict]          # el ``.jsonl`` entero, parseado
+    vals: list[dict]            # solo los registros de validación (``event == "val"``)
+    figura: object              # la figura de matplotlib que dibujó el CLI
+    png: pathlib.Path           # la ruta del PNG que escribió
+    consola: str                # todo lo que salió por stdout (resumen + avisos por evaluación)
+
+
+def _correr_cli_e2e(tmp_path, monkeypatch, *, con_validacion: bool) -> _ObservablesCLI:
+    """Corre ``scripts/train.py`` de punta a punta y devuelve sus observables.
+
+    Una corrida real con **todas** las salidas declaradas (``.jsonl`` + PNG + checkpoint) y **sin**
+    ``--quiet`` —barra de progreso y consola activas—, que es la forma en que el autor la corre a
+    mano. ``con_validacion=False`` escribe el mismo YAML sin la clave ``data.val_root``: es la única
+    diferencia entre las dos mitades del par (las dos carpetas de imágenes se sintetizan igual, así
+    que la carpeta de validación existe también en la corrida que no la declara).
+
+    La consola se captura con ``redirect_stdout`` en lugar del fixture ``capsys`` para que el helper
+    sirva también desde un fixture de módulo (``capsys`` es de función). ``print`` y ``tqdm.write``
+    resuelven ``sys.stdout`` en la llamada, así que los dos caen adentro.
+    """
+    _, val_dir = _carpetas_imagenes_cli(tmp_path)
+    cfg, ckpt, log_path = _write_cli_config_val(
+        tmp_path,
+        val_dir=val_dir if con_validacion else None,
+        num_steps=3,
+        checkpoint_every=2,
+        ema_decay=0.6,
+        with_loss_curve=True,
+    )
+    module = _load_train_module()
+    figuras = _espiar_figuras(monkeypatch)
+    consola = io.StringIO()
+    with contextlib.redirect_stdout(consola):
+        codigo = module.main(["--config", cfg])
+
+    assert len(figuras) == 1, "el CLI dibuja y cierra exactamente una curva de pérdida"
+    lineas = _leer_jsonl(log_path)
+    return _ObservablesCLI(
+        codigo=codigo,
+        lineas=lineas,
+        vals=[r for r in lineas if r.get("event") == "val"],
+        figura=figuras[0],
+        png=ckpt.parent / "vp_imgs_loss.png",
+        consola=consola.getvalue(),
+    )
+
+
+@pytest.fixture(scope="module")
+def par_e2e(tmp_path_factory):
+    """Las dos corridas del par (con y sin ``data.val_root``), cacheadas para los tres tests.
+
+    Los tests solo **leen** los observables, así que compartirlos entre los tres es seguro y evita
+    pagar cuatro corridas del CLI. ``pytest.MonkeyPatch.context()`` reemplaza al fixture
+    ``monkeypatch``, que es de función y no se puede pedir desde un fixture de módulo.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        con = _correr_cli_e2e(
+            tmp_path_factory.mktemp("e2e_con_val"), mp, con_validacion=True
+        )
+    with pytest.MonkeyPatch.context() as mp:
+        sin = _correr_cli_e2e(
+            tmp_path_factory.mktemp("e2e_sin_val"), mp, con_validacion=False
+        )
+    return con, sin
+
+
+# ------------------------------------- la mitad CON validación (5.1, 5.3, 5.4)
+
+
+def test_e2e_cli_con_validacion_log_grafico_y_consola(par_e2e):
+    """Con ``data.val_root``: código 0, líneas ``val`` en el ``.jsonl``, PNG con las cuatro curvas y
+    el resumen en consola — los cuatro observables de **una misma** corrida (5.1, 5.3, 5.4).
+
+    El cierre que no cubren 7.1 ni 7.2: las tres superficies informan **la misma medición**. La
+    curva de validación con pesos vivos es la primera serie dispersa (orden de dibujo del CLI) y sus
+    puntos son exactamente los pasos y los valores que quedaron en el ``.jsonl``; el resumen de
+    consola trae el **último** de ellos.
+    """
+    con, _ = par_e2e
+    assert con.codigo == 0
+
+    # (1) Log: una línea de validación por evaluación — la cadencia (2) y el último paso (3).
+    assert [r["step"] for r in con.vals] == [2, 3]
+
+    # (2) PNG: el archivo existe y la figura que dibujó el CLI trae las cuatro series con leyenda.
+    assert con.png.exists() and con.png.stat().st_size > 0
+    ax = con.figura.axes[0]
+    densa, *dispersas = ax.get_lines()
+    assert len(dispersas) == 3
+    assert _etiquetas_de_leyenda(ax) == _etiquetas(ax)
+
+    # (3) Consola: el resumen final informa el ÚLTIMO punto medido, con el mismo formato del aviso.
+    ultimo = con.vals[-1]
+    assert (
+        f"Validación -> paso {ultimo['step']}: val={ultimo['val_raw']:.6f}" in con.consola
+    )
+
+    # (4) La misma medición en las tres superficies: la curva del PNG contra los registros del log.
+    assert list(densa.get_xdata()) == [1, 2, 3]  # la densa sigue indexada por posición
+    assert list(dispersas[0].get_xdata()) == [r["step"] for r in con.vals]
+    assert list(dispersas[0].get_ydata()) == [r["val_raw"] for r in con.vals]
+
+
+# --------------------------------------------- la mitad SIN validación (5.5)
+
+
+def test_e2e_cli_sin_validacion_log_grafico_y_consola(par_e2e):
+    """Sin la clave: código 0, ni una línea ``val``, PNG de una sola serie y consola sin mención de
+    validación — los mismos cuatro observables de la mitad de arriba (5.5).
+
+    Mismo YAML, mismas imágenes sintéticas (la carpeta de validación existe igual) y los mismos
+    pasos: la única diferencia es que ``data.val_root`` no se declara.
+    """
+    _, sin = par_e2e
+    assert sin.codigo == 0
+    assert sin.vals == []
+    assert sin.png.exists() and sin.png.stat().st_size > 0
+    ax = sin.figura.axes[0]
+    assert len(ax.get_lines()) == 1
+    assert _etiquetas_de_leyenda(ax) is None
+    assert "Validación" not in sin.consola
+
+
+# ------------------------------------------- el contraste, en un solo lugar (5.5, 6.5)
+
+
+def test_e2e_el_par_difiere_solo_en_la_validacion(par_e2e):
+    """Los dos observables lado a lado: lo que no es de validación sale igual; lo que sí, difiere.
+
+    Es lo que impide que alguna de las dos mitades pase por la razón equivocada —una corrida que
+    fallara temprano no escribiría registros de validación y satisfaría por accidente la mitad "sin
+    validación"—, y la evidencia de que la clave es realmente **opt-in**: nada más cambia.
+    """
+    con, sin = par_e2e
+
+    # Igual en las dos: cierran bien, registran los mismos pasos de entrenamiento y grafican.
+    assert (con.codigo, sin.codigo) == (0, 0)
+    pasos_con = [r["step"] for r in con.lineas if r.get("event") == "step"]
+    pasos_sin = [r["step"] for r in sin.lineas if r.get("event") == "step"]
+    assert pasos_con == pasos_sin == [1, 2, 3]
+    assert con.png.exists() and sin.png.exists()
+
+    # Distinto SOLO en la validación: registros, curvas, leyenda y resumen de consola.
+    assert len(con.vals) == 2 and sin.vals == []
+    assert len(con.figura.axes[0].get_lines()) == 4
+    assert len(sin.figura.axes[0].get_lines()) == 1
+    assert _etiquetas_de_leyenda(con.figura.axes[0]) is not None
+    assert _etiquetas_de_leyenda(sin.figura.axes[0]) is None
+    assert "Validación ->" in con.consola and "Validación" not in sin.consola

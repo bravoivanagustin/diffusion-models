@@ -1,6 +1,7 @@
 # Smoke rápido del pipeline completo — para probar en CPU en segundos que TODO lo que venimos
 # implementando funciona junto: imágenes → U-Net → AMP → EMA → checkpointing intermedio → retención
-# rolling → barra de progreso → (y después, reanudación).
+# rolling → barra de progreso → (y después, reanudación) → pérdida de validación (opt-in, ver el
+# bloque `data:`).
 #
 # Correr desde diffusion-models/:
 #   uv run python scripts/train.py --config config/test_pipeline.yaml
@@ -19,6 +20,9 @@
 #     y la curva `test_pipeline_loss.png`.
 #   - probar la REANUDACIÓN: cortar con Ctrl-C a mitad y volver a correr el mismo comando →
 #     "Acción: reanudando desde …_stepNNNNN.pt (paso N)"; o borrar el final y relanzar.
+#   - con la VALIDACIÓN activada (bloque `data:`): una línea "Validación (paso N): val=… val(EMA)=…
+#     train fijo=…" en cada checkpoint (misma cadencia), el cierre "Validación -> paso 150: …", los
+#     registros `"event": "val"` en el `.jsonl` y la curva del PNG con CUATRO series y leyenda.
 
 sde:
   name: vp                  # forward VP-SDE (Eje 1)
@@ -33,6 +37,17 @@ data:
   seed: 0
   num_workers: 0            # knob de carga (en GPU con dataset grande subilo a 4-8); 0 = sin overhead en CPU
   pin_memory: false         # knob de carga (en GPU ponelo true); en CPU no aplica
+  # PÉRDIDA DE VALIDACIÓN (`val_root`, opt-in) — queda COMENTADA porque `data/` está gitignored y no
+  # hay ninguna carpeta held-out lista: el reparto se hace UNA vez a mano, y la carpeta de validación
+  # tiene que quedar HERMANA de la de train (el descubrimiento de imágenes es recursivo, así que un
+  # `val/` adentro del `root` de train lo contaminaría). Con las 2 imágenes de cats-prueba el reparto
+  # más chico posible es 1 y 1:
+  #   uv run python scripts/split_dataset.py --src data/cats-prueba --out data/cats-prueba-split --val-frac 0.5 --seed 0
+  # Después reemplazá el `root` y el `batch_size` de arriba por estas tres líneas (batch_size baja a
+  # 1: infinite_batches exige batch_size <= cantidad de imágenes de la carpeta de train):
+  #   root: data/cats-prueba-split/train
+  #   batch_size: 1
+  #   val_root: data/cats-prueba-split/val
 
 model:                      # U-Net mínima (~pocos miles de params) para que vuele en CPU
   name: unet
