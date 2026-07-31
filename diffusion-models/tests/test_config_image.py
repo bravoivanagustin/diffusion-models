@@ -8,7 +8,9 @@ agrega en tareas posteriores.
 
 La feature ``validation-loss`` (task 6.1) cambió el contrato del resolver: devuelve un
 :class:`~diffusion.training.DataSources` en lugar de la 2-tupla ``(data, event_shape)``, y suma
-la clave ``data.val_root``. Los tests previos se migraron a la firma nueva en el mismo paso.
+la clave ``data.val_root``. Los tests previos se migraron a la firma nueva en el mismo paso. La
+task 6.2 sumó el **examen fijo de entrenamiento**, derivado de ``data.root`` sin ninguna clave
+nueva y dimensionado como el set de validación.
 """
 
 from __future__ import annotations
@@ -166,8 +168,9 @@ def test_build_data_source_imagenes_happy_path(carpeta_imagenes):
     assert isinstance(batch, torch.Tensor)
     assert batch.shape == (4, 3, 16, 16)
     assert batch.dtype == torch.float32
-    # validation-loss (2.4): sin 'val_root' las fuentes de examen quedan nulas.
+    # validation-loss (2.4): sin 'val_root' las fuentes de examen quedan nulas (las dos).
     assert sources.val is None
+    assert sources.train_exam is None
 
 
 def test_build_data_source_imagenes_falta_root_es_value_error():
@@ -299,17 +302,21 @@ def test_build_data_source_imagenes_clave_de_carga_desconocida_es_value_error(ca
 # --------------------------------------------- data.val_root (validation-loss, 6.1)
 
 
-def _imagen_asimetrica(path, ancho=32, alto=32):
-    """Guarda una imagen con la mitad izquierda negra y la derecha blanca.
+def _imagen_asimetrica(path, ancho=32, alto=32, invertida=False):
+    """Guarda una imagen con una mitad negra y la otra blanca.
 
-    Sirve para detectar espejado horizontal: la fuente de validación se arma con
+    Por defecto la mitad izquierda es negra y la derecha blanca; con ``invertida`` se
+    intercambian. Sirve para detectar espejado horizontal: la fuente de validación se arma con
     ``augment=False``, así que la orientación tiene que ser siempre la canónica (izquierda
-    oscura, derecha clara) en todos los recorridos.
+    oscura, derecha clara) en todos los recorridos. El par de orientaciones opuestas se usa
+    además en los tests de la task 6.2 para distinguir de qué carpeta salió cada examen.
     """
-    img = Image.new("RGB", (ancho, alto), color=(0, 0, 0))
+    oscuro, claro = (0, 0, 0), (255, 255, 255)
+    izquierda, derecha = (claro, oscuro) if invertida else (oscuro, claro)
+    img = Image.new("RGB", (ancho, alto), color=izquierda)
     for x in range(ancho // 2, ancho):
         for y in range(alto):
-            img.putpixel((x, y), (255, 255, 255))
+            img.putpixel((x, y), derecha)
     img.save(path)
 
 
@@ -401,16 +408,19 @@ def test_build_data_source_val_root_hereda_params_de_la_fuente_de_train(
 
     Se espía :func:`finite_batches` en el módulo de config para capturar con qué se construye la
     fuente: ``batch_size``/``image_size``/``crop`` copiados de la de entrenamiento, y
-    ``num_workers=0``/``pin_memory=False`` forzados (una evaluación no amortiza workers).
+    ``num_workers=0``/``pin_memory=False`` forzados (una evaluación no amortiza workers). Desde la
+    task 6.2 el resolver arma **dos** fuentes finitas (validación y examen de train), así que se
+    captura sólo la **primera** —la de validación, la que este test cubre—.
     """
     train_dir, val_dir = carpetas_train_val
     captura: dict = {}
     real_finite = config_module.finite_batches
 
     def spy(root, batch_size, **kwargs):
-        captura["root"] = root
-        captura["batch_size"] = batch_size
-        captura.update(kwargs)
+        if not captura:  # sólo la primera construcción: la fuente de validación
+            captura["root"] = root
+            captura["batch_size"] = batch_size
+            captura.update(kwargs)
         return real_finite(root, batch_size, **kwargs)
 
     monkeypatch.setattr(config_module, "finite_batches", spy)
@@ -512,6 +522,186 @@ def test_build_data_source_val_root_no_muta_dict_del_caller(carpetas_train_val):
     assert raw == snapshot
 
 
+# ------------------------- examen fijo de entrenamiento (validation-loss, 6.2)
+
+
+@pytest.fixture
+def carpetas_asimetricas_opuestas(tmp_path):
+    """``train/`` (8 imágenes) y ``val/`` (6) asimétricas con orientación **opuesta**.
+
+    Las de validación van oscuro→claro (izquierda negra) y las de entrenamiento claro→oscuro
+    (izquierda blanca). Con ese contraste un solo par de asserts distingue tres cosas a la vez:
+    de qué carpeta salió cada examen, y si alguno llegó **espejado** —el espejado de una
+    orientación es exactamente la canónica de la otra, así que un flip se ve como "vino de la
+    otra carpeta" y no puede pasar desapercibido—.
+    """
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    for i in range(8):
+        _imagen_asimetrica(train_dir / f"t{i}.png", invertida=True)
+    for i in range(6):
+        _imagen_asimetrica(val_dir / f"v{i}.png")
+    return train_dir, val_dir
+
+
+def _cuenta_imagenes(fuente):
+    """Cantidad total de imágenes que entrega una fuente finita, **recorriéndola**.
+
+    Se cuenta iterando (no leyendo un parámetro de construcción): es lo único que prueba que el
+    examen entrega realmente esa cantidad de imágenes.
+    """
+    return sum(int(batch.shape[0]) for batch in fuente)
+
+
+def test_build_data_source_val_root_deriva_examen_de_train_del_mismo_tamano(
+    carpetas_train_val,
+):
+    """Con ``val_root`` se derivan **ambos** exámenes y con la misma cantidad de imágenes (2.8, 3.9).
+
+    El examen de entrenamiento se dimensiona con el tope ``max_images`` igual al conteo del set
+    de validación: 6 imágenes de las 8 de ``train/``. La igualdad de tamaño es lo que iguala la
+    varianza del estimador y hace interpretable el gap train↔val.
+    """
+    train_dir, val_dir = carpetas_train_val
+    sources = build_data_source(_data_raw(train_dir, val_dir))
+
+    assert sources.val is not None
+    assert sources.train_exam is not None
+    n_val = _cuenta_imagenes(sources.val)
+    n_exam = _cuenta_imagenes(sources.train_exam)
+    assert n_val == 6                     # el set de validación completo
+    assert n_exam == n_val                # mismo tamaño ⇒ misma varianza de estimador
+    # Misma forma de evento que el resto del pipeline (mismos batch_size/image_size/crop).
+    for batch in sources.train_exam:
+        assert tuple(batch.shape[1:]) == sources.event_shape
+
+
+def test_build_data_source_sin_val_root_ambos_examenes_son_none(carpetas_train_val):
+    """Sin ``val_root`` **las dos** fuentes de examen quedan nulas: nunca una sin la otra (2.4)."""
+    train_dir, _ = carpetas_train_val
+    sources = build_data_source(_data_raw(train_dir))
+
+    assert sources.val is None
+    assert sources.train_exam is None
+
+
+def test_build_data_source_examen_de_train_hereda_params_y_tope(
+    carpetas_train_val, monkeypatch
+):
+    """El examen de train se arma desde ``data.root`` con los mismos params y el tope del val (2.8).
+
+    Se espía :func:`finite_batches` para capturar las **dos** construcciones: la de validación
+    (desde ``val_root``, sin tope) y la del examen de entrenamiento (desde ``root``, con
+    ``max_images`` igual al conteo del set de validación). Los demás parámetros son idénticos:
+    mismo ``batch_size``/``image_size``/``crop`` y carga in-process.
+    """
+    train_dir, val_dir = carpetas_train_val
+    capturas: list[dict] = []
+    real_finite = config_module.finite_batches
+
+    def spy(root, batch_size, **kwargs):
+        capturas.append({"root": root, "batch_size": batch_size, **kwargs})
+        return real_finite(root, batch_size, **kwargs)
+
+    monkeypatch.setattr(config_module, "finite_batches", spy)
+
+    build_data_source(_data_raw(train_dir, val_dir, image_size=8, batch_size=3, crop=False))
+
+    assert len(capturas) == 2, "se esperan dos fuentes finitas: validación y examen de train"
+    val_call, exam_call = capturas
+    assert val_call["root"] == str(val_dir)
+    # El examen de train sale de la carpeta de ENTRENAMIENTO, no de la de validación.
+    assert exam_call["root"] == str(train_dir)
+    assert exam_call["max_images"] == 6          # = count_images(val_root)
+    assert val_call.get("max_images") is None    # el de validación se recorre completo
+    # Mismos parámetros que la fuente de entrenamiento (y que el examen de validación).
+    for clave in ("batch_size", "image_size", "crop"):
+        assert exam_call[clave] == val_call[clave]
+    assert exam_call["batch_size"] == 3
+    assert exam_call["image_size"] == 8
+    assert exam_call["crop"] is False
+    assert exam_call["num_workers"] == 0
+    assert exam_call["pin_memory"] is False
+
+
+def test_build_data_source_examen_de_train_no_recorta_si_train_es_mas_chico(tmp_path):
+    """Un set de entrenamiento más chico que el de validación no se recorta ni aborta (2.8).
+
+    El tope es un máximo, no un requisito: con 4 imágenes de entrenamiento y 6 de validación el
+    examen de train entrega sus 4 y la corrida sigue (los exámenes dejan de tener el mismo
+    tamaño, pero eso no es un error del config layer).
+    """
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    for i in range(4):
+        Image.new("RGB", (32, 32), color=(i * 20, 40, 60)).save(train_dir / f"t{i}.png")
+    for i in range(6):
+        Image.new("RGB", (32, 32), color=(10, 20, 30)).save(val_dir / f"v{i}.png")
+
+    sources = build_data_source(_data_raw(train_dir, val_dir, batch_size=4))
+
+    assert sources.train_exam is not None
+    assert _cuenta_imagenes(sources.train_exam) == 4   # todo el set, sin recorte
+    assert _cuenta_imagenes(sources.val) == 6
+
+
+def test_build_data_source_examen_de_train_es_subconjunto_deterministico(carpetas_train_val):
+    """Dos construcciones del mismo config dan **las mismas** imágenes en el examen de train (3.9).
+
+    El tope toma las primeras N del orden ordenado del descubrimiento (sin sorteo), así que el
+    subconjunto es reproducible entre corridas; y la fuente es re-iterable, así que dos
+    recorridos de la misma instancia también coinciden.
+    """
+    train_dir, val_dir = carpetas_train_val
+    raw = _data_raw(train_dir, val_dir)
+
+    primera = [b.clone() for b in build_data_source(raw).train_exam]
+    fuente_b = build_data_source(raw).train_exam
+    segunda = [b.clone() for b in fuente_b]
+    tercera = [b.clone() for b in fuente_b]   # re-iterable: mismo recorrido dos veces
+
+    assert len(primera) == len(segunda) == len(tercera) == 2   # 6 imágenes con batch 4 → 4 + 2
+    for a, b, c in zip(primera, segunda, tercera):
+        assert torch.equal(a, b)
+        assert torch.equal(a, c)
+
+
+def test_build_data_source_examen_de_train_sale_de_root_en_orientacion_canonica(
+    carpetas_asimetricas_opuestas,
+):
+    """El examen de train sale de ``data.root`` y **sin espejado**, aunque el loop sí augmente (3.9).
+
+    Las dos carpetas tienen orientaciones opuestas (train: izquierda clara; val: izquierda
+    oscura), así que la orientación identifica el origen: si el examen de train llegara espejado
+    se leería como si viniera de ``val_root``. La asimetría con la fuente del loop es
+    deliberada: **la misma carpeta** alimenta el entrenamiento con espejado aleatorio y el
+    examen en orientación canónica — el examen mide, no entrena.
+    """
+    train_dir, val_dir = carpetas_asimetricas_opuestas
+    sources = build_data_source(_data_raw(train_dir, val_dir, seed=0))
+
+    # El examen de train: izquierda clara (+1) y derecha oscura (-1), en dos recorridos completos.
+    for _ in range(2):
+        for batch in sources.train_exam:
+            assert bool((batch[:, :, :, 0] > 0).all()), "el examen de train llegó espejado"
+            assert bool((batch[:, :, :, -1] < 0).all()), "el examen de train llegó espejado"
+    # El examen de validación mantiene su propia orientación: los dos exámenes no se cruzaron.
+    for batch in sources.val:
+        assert bool((batch[:, :, :, 0] < 0).all())
+        assert bool((batch[:, :, :, -1] > 0).all())
+    # Contraste: la fuente del loop, sobre la MISMA carpeta, sí espeja al azar (augment=True).
+    espejadas = sum(
+        int(bool((img[:, :, 0] < 0).all()))
+        for _ in range(5)
+        for img in next(sources.train)
+    )
+    assert espejadas > 0, "la fuente de entrenamiento debería augmentar (espejar) — asimetría esperada"
+
+
 # ------------------------------------------------- build_run: cableado imágenes
 
 from diffusion.models import ScoreUNet  # noqa: E402
@@ -589,6 +779,39 @@ def test_build_run_imagenes_val_root_cablea_val_data(carpetas_train_val):
     assert spec.sde.data_dim == (3, 16, 16)
     batch = next(iter(spec.val_data))
     assert tuple(batch.shape[1:]) == spec.sde.data_dim
+
+
+def test_build_run_imagenes_val_root_cablea_los_dos_examenes(carpetas_train_val):
+    """El ``RunSpec`` transporta **ambos** exámenes, del mismo tamaño, para que el CLI los reenvíe (2.8).
+
+    ``build_run`` copia ``val`` y ``train_exam`` del ``DataSources`` sin más lógica: la corrida
+    ensamblada llega al CLI con las dos fuentes listas para ``train(val_batches=…,
+    train_exam_batches=…)``.
+    """
+    train_dir, val_dir = carpetas_train_val
+    raw = {"sde": {"name": "vp"}, "data": _data_raw(train_dir, val_dir)}
+
+    spec = build_run(raw)
+
+    assert spec.val_data is not None
+    assert spec.train_exam_data is not None
+    assert _cuenta_imagenes(spec.train_exam_data) == _cuenta_imagenes(spec.val_data) == 6
+    # Misma forma de evento que la fuente de entrenamiento (la que alimenta la SDE).
+    assert tuple(next(iter(spec.train_exam_data)).shape[1:]) == spec.sde.data_dim
+
+
+def test_build_run_imagenes_sin_val_root_no_hay_examenes(carpetas_train_val):
+    """Sin ``data.val_root`` la corrida no trae ninguno de los dos exámenes (2.4).
+
+    El invariante es que van de la mano: nunca una fuente sin la otra.
+    """
+    train_dir, _ = carpetas_train_val
+    raw = {"sde": {"name": "vp"}, "data": _data_raw(train_dir)}
+
+    spec = build_run(raw)
+
+    assert spec.val_data is None
+    assert spec.train_exam_data is None
 
 
 def test_build_run_imagenes_sin_val_root_val_data_es_none(carpetas_train_val):

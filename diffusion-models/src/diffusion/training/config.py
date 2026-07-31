@@ -19,7 +19,9 @@ Estructura esperada del YAML::
       n_components: 8
       val_root: data/cats_val  # opcional, SOLO kind: images: carpeta held-out sobre la que se
                           #   mide la pérdida de validación. Sin la clave no se mide nada
-                          #   (opt-in); con una fuente de puntos se rechaza.
+                          #   (opt-in); con una fuente de puntos se rechaza. Declararla deriva
+                          #   ADEMÁS el examen fijo de entrenamiento (desde `root`, con tantas
+                          #   imágenes como tenga `val_root`): no hay clave que lo controle.
     train:                # -> campos de TrainConfig (solo el loop de optimización)
       num_steps: 300
       lr: 0.002
@@ -43,6 +45,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, fields
 
 from ..data_generation import (
+    count_images,
     finite_batches,
     infinite_bare,
     infinite_batches,
@@ -72,8 +75,10 @@ class RunSpec:
     red— para que ``scripts/train.py`` la pase a :func:`~diffusion.training.save_checkpoint` y
     el checkpoint quede reconstruible sin el config original.
 
-    ``val_data`` es la fuente del examen de validación (feature ``validation-loss``): no nula
-    **exactamente** cuando el config declara ``data.val_root``, y el CLI la reenvía al loop.
+    ``val_data`` y ``train_exam_data`` son las dos fuentes de examen de la feature
+    ``validation-loss``: la de validación y la del examen fijo de **entrenamiento** (su
+    referencia). Son no nulas **exactamente** cuando el config declara ``data.val_root`` —las dos
+    juntas, nunca una sin la otra— y el CLI las reenvía al loop.
     """
 
     sde: ForwardSDE
@@ -85,6 +90,7 @@ class RunSpec:
     loss_curve: pathlib.Path | None = None
     train_log: pathlib.Path | None = None  # .jsonl de estados del entrenamiento (opcional, con timestamps)
     val_data: Iterable | None = None  # examen de validación (None = corrida sin validación)
+    train_exam_data: Iterable | None = None  # examen fijo de train (None junto con val_data)
 
 
 @dataclass
@@ -93,9 +99,9 @@ class DataSources:
 
     Valor de retorno de :func:`build_data_source`. Es un dataclass y no una tupla porque con
     más de una fuente las posiciones se leen mal (y sumar una fuente futura no vuelve a romper
-    la firma). ``train`` y ``event_shape`` son el contrato de siempre; ``val`` es la fuente de
-    validación de la feature ``validation-loss``, no nula **exactamente** cuando el config
-    declara ``data.val_root``.
+    la firma). ``train`` y ``event_shape`` son el contrato de siempre; ``val`` y ``train_exam``
+    son las dos fuentes de examen de la feature ``validation-loss``, no nulas **exactamente**
+    cuando el config declara ``data.val_root`` (las dos juntas, nunca una sin la otra).
 
     Attributes:
         train: Fuente **infinita** de tensores crudos que consume el loop de entrenamiento.
@@ -104,8 +110,10 @@ class DataSources:
         val: Fuente **finita y re-iterable** del examen de validación, o ``None`` si no se
             declaró ``data.val_root``.
         train_exam: Fuente finita del examen fijo de **entrenamiento** (la referencia que hace
-            legible la curva de validación), o ``None``. Se deriva en una tarea posterior de la
-            feature; hoy queda siempre en ``None``.
+            legible la curva de validación), o ``None`` si no se declaró ``data.val_root``. Sale
+            de ``data.root`` —la misma carpeta que la fuente del loop— pero recortada a tantas
+            imágenes como tenga el set de validación, para que los dos exámenes tengan el mismo
+            tamaño y, por lo tanto, la misma varianza de estimador.
     """
 
     train: Iterator
@@ -155,6 +163,16 @@ def build_data_source(data_raw: dict) -> DataSources:
     Su forma también se valida con un peek, inocuo acá porque la fuente es re-iterable (a
     diferencia de la infinita, donde el peek obliga a devolver el iterador ya avanzado).
 
+    Con ``val_root`` deriva **además** el examen fijo de **entrenamiento**, desde ``root`` y con
+    los mismos parámetros, acotado con ``max_images`` a la cantidad de imágenes de ``val_root``
+    (contada con :func:`~diffusion.data_generation.count_images`, sin introspeccionar el loader).
+    Que los dos exámenes tengan **exactamente** la misma cantidad de imágenes es lo que les da la
+    misma varianza de estimador y hace interpretable el gap train↔val. **No hay ninguna clave
+    para pedirlo ni para apagarlo**: el examen de train no es una preferencia del usuario sino la
+    referencia que hace legible la curva de validación, así que se construye siempre que haya
+    ``val_root``. Si el set de entrenamiento tuviera menos imágenes que el de validación, el tope
+    simplemente no recorta (los exámenes dejan de ser del mismo tamaño y no es un error).
+
     Args:
         data_raw: El bloque ``data:`` del config (se copia; no se muta el ``dict`` del caller).
             ``kind`` ausente ⇒ ``points``. Para puntos: ``shape``/``name`` (obligatorio),
@@ -169,8 +187,9 @@ def build_data_source(data_raw: dict) -> DataSources:
 
     Returns:
         Un :class:`DataSources` con la fuente infinita de entrenamiento, la forma de evento
-        (``(C, H, W)`` para imágenes o ``None`` para puntos) y la fuente de validación —no nula
-        exactamente cuando se declaró ``val_root``—.
+        (``(C, H, W)`` para imágenes o ``None`` para puntos) y las dos fuentes de examen —la de
+        validación y la del examen fijo de entrenamiento, no nulas **juntas** y exactamente
+        cuando se declaró ``val_root``—.
 
     Raises:
         ValueError: Si ``kind`` no está reconocido (lista los válidos); si se declara
@@ -179,8 +198,9 @@ def build_data_source(data_raw: dict) -> DataSources:
             claves desconocidas, si la carpeta no existe/está vacía/tiene menos imágenes que
             ``batch_size`` (propagado desde ``infinite_batches``), si la forma emitida no
             coincide con la derivada, o si ``val_root`` no existe/está vacía (propagado desde
-            ``finite_batches``, que **no** exige un mínimo de ``batch_size``: un set más chico
-            que el batch es un batch parcial válido) o emite otra forma de evento.
+            ``finite_batches`` y ``count_images``, que **no** exigen un mínimo de ``batch_size``:
+            un set más chico que el batch es un batch parcial válido) o emite otra forma de
+            evento.
     """
     data_raw = dict(data_raw or {})
     kind = data_raw.pop("kind", "points")
@@ -268,6 +288,7 @@ def build_data_source(data_raw: dict) -> DataSources:
         # la cola como batch parcial, sin mínimo de batch_size. num_workers/pin_memory se fijan
         # en los valores in-process: una evaluación no amortiza el arranque de los workers.
         val = None
+        train_exam = None
         if val_root is not None:
             val = finite_batches(
                 val_root,
@@ -287,7 +308,29 @@ def build_data_source(data_raw: dict) -> DataSources:
                     f"{obtained_val}, se esperaba {event_shape} (la misma que la de "
                     "entrenamiento, para que ambas pérdidas sean comparables)."
                 )
-        return DataSources(train=data, event_shape=event_shape, val=val)
+            # Examen fijo de ENTRENAMIENTO: la referencia que hace legible la curva de validación
+            # (sin ella, un valor de validación solo no dice si el modelo generaliza o si el
+            # examen es más difícil). Sale de la misma carpeta que la fuente del loop (``root``)
+            # pero con el recorrido de medición —orden y orientación canónicos, sin espejado—, y
+            # acotado a la MISMA cantidad de imágenes que el set de validación: igual tamaño ⇒
+            # igual varianza de estimador ⇒ el gap train↔val es atribuible al modelo. El conteo
+            # sale de ``count_images`` justamente para no introspeccionar el ``.dataset`` del
+            # loader de validación (rompería el contrato de ``finite_batches``, declarado como un
+            # simple iterable de tensores). Se construye SIEMPRE que haya validación: no hay
+            # clave que lo pida ni que lo apague (no es una preferencia del usuario). Si ``root``
+            # tuviera menos imágenes que ``val_root``, el tope no recorta y listo.
+            train_exam = finite_batches(
+                root,
+                batch_size,
+                image_size=image_size,
+                crop=crop,
+                max_images=count_images(val_root),
+                num_workers=0,
+                pin_memory=False,
+            )
+        return DataSources(
+            train=data, event_shape=event_shape, val=val, train_exam=train_exam
+        )
 
     raise ValueError(
         f"config: data.kind desconocido: {kind!r}. Válidos: {', '.join(_VALID_KINDS)}."
@@ -302,8 +345,8 @@ def build_run(raw: dict) -> RunSpec:
 
     Returns:
         Un :class:`RunSpec` con la SDE, la red, la fuente de datos infinita, el
-        :class:`TrainConfig`, las rutas y —si el config declara ``data.val_root``— la fuente del
-        examen de validación.
+        :class:`TrainConfig`, las rutas y —si el config declara ``data.val_root``— las dos
+        fuentes de examen: la de validación y la del examen fijo de entrenamiento.
 
     Raises:
         ValueError: Si faltan claves obligatorias (``sde.name``, ``data.shape``), si una corrida
@@ -398,7 +441,9 @@ def build_run(raw: dict) -> RunSpec:
         checkpoint=pathlib.Path(checkpoint) if checkpoint else None,
         loss_curve=pathlib.Path(loss_curve) if loss_curve else None,
         train_log=pathlib.Path(train_log) if train_log else None,
-        # Se copia tal cual desde el resolver, sin más lógica: es None exactamente cuando el
-        # config no declara 'data.val_root' (validación opt-in).
+        # Se copian tal cual desde el resolver, sin más lógica: son None exactamente cuando el
+        # config no declara 'data.val_root' (validación opt-in), y no nulas las DOS cuando sí lo
+        # declara — nunca una sin la otra. El CLI las reenvía al loop.
         val_data=sources.val,
+        train_exam_data=sources.train_exam,
     )
