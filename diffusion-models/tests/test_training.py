@@ -3090,14 +3090,16 @@ def test_train_sin_val_batches_no_construye_nada_ni_cambia_la_corrida(monkeypatc
 
 @pytest.mark.parametrize("cadencia", [0, -1])
 def test_train_rechaza_validacion_con_cadencia_deshabilitada(cadencia):
-    """Validación pedida + ``checkpoint_every <= 0`` ⇒ ``ValueError`` antes del primer batch (3.7).
+    """Validación pedida + cadencia **efectiva** <= 0 ⇒ ``ValueError`` antes del primer batch (3.7).
 
-    La cadencia de checkpoints es la que gobierna cada cuántos pasos se evalúa, así que pedir
+    Sin ``val_every`` declarado la cadencia efectiva es la de los checkpoints, así que pedir
     validación con esa cadencia apagada es una corrida que nunca mediría nada: se falla temprano en
     lugar de entrenar en silencio sin validación. El chequeo vive en el loop —no en el config
     layer— porque es el único punto que ve el valor **efectivo** (el CLI lo sobreescribe después de
-    armar la corrida). La fuente centinela convierte cualquier consumo prematuro de datos en un
-    ``AssertionError`` distinto del error esperado, y la fuente del examen tampoco se recorre.
+    armar la corrida). El mensaje nombra además ``val_every``: con esa clave la corrida **sí** puede
+    medir con los snapshots apagados, así que el error tiene que ofrecer la salida y no solo exigir
+    ``checkpoint_every > 0``. La fuente centinela convierte cualquier consumo prematuro de datos en
+    un ``AssertionError`` distinto del error esperado, y la fuente del examen tampoco se recorre.
     """
     sde = make_sde("vp")
     net = _small_net(sde)
@@ -3109,6 +3111,7 @@ def test_train_rechaza_validacion_con_cadencia_deshabilitada(cadencia):
 
     mensaje = str(exc.value)
     assert "checkpoint_every" in mensaje
+    assert "val_every" in mensaje  # la salida sin snapshots, ofrecida en el propio error (3.10)
     assert str(cadencia) in mensaje  # nombra el valor recibido
     assert fuente_val.recorridos == 0
 
@@ -3720,3 +3723,261 @@ def test_el_hermano_de_crudos_sin_validacion_no_gana_la_clave(tmp_path):
     _raw_state, raw_meta = load_checkpoint(tmp_path / "vp_final_sin_val_raw.pt")
     assert set(raw_meta) == _META_SIN_VAL | {"raw_of"}
     assert "val_history" not in raw_meta
+
+
+# ------------- validation-loss: cadencia propia de la validación (val_every)
+#
+# Corrección de diseño **posterior** a la feature (3.10 y 3.11 nuevos; 3.1 y 3.7 reformulados): la
+# cadencia de la evaluación dejó de estar atada a ``checkpoint_every``. Atarlas mezclaba dos
+# concerns — subir la resolución de la curva obligaba a escribir más snapshots (708 MB cada uno en
+# la celda de gatos), así que una palanca de **observabilidad** cargaba con un costo de disco que no
+# le corresponde; con ``checkpoint_every: 15000`` sobre ``num_steps: 60000`` la curva quedaba en 4
+# puntos. ``val_every`` fija la cadencia por su cuenta y con el default ``None`` cae en
+# ``checkpoint_every``, así que la corrida de antes no cambia en nada.
+#
+# ``log_every`` fue **evaluado y descartado** como cadencia alternativa: está documentado como "solo
+# consola" y el CLI lo pone en 0 con ``--quiet``, así que una corrida larga en background dejaría de
+# medir sola. Un flag de verbosidad no puede decidir si se mide.
+#
+# Se reusan los helpers de las secciones previas (``_fresh_ema`` / ``_generador`` /
+# ``_fuente_examen`` / ``_pasos_de_val`` / ``_fingerprint`` / ``_assert_mismo_fingerprint``).
+
+
+def test_trainconfig_declara_val_every_con_default_none():
+    """El campo nuevo existe y su default es ``None`` = "usar ``checkpoint_every``" (3.10).
+
+    El default es la palanca apagada: mientras nadie declare el campo, la cadencia efectiva es la
+    de siempre y ninguna corrida ya hecha cambia de comportamiento.
+    """
+    assert TrainConfig().val_every is None
+    assert TrainConfig(val_every=250).val_every == 250
+
+
+def test_sin_val_every_la_cadencia_efectiva_es_checkpoint_every():
+    """Flag-off: sin declarar ``val_every`` se evalúa en la cadencia de los snapshots (3.1).
+
+    10 pasos con ``checkpoint_every=4`` siguen dando puntos en 4, 8 y **10** (el último paso), que
+    es exactamente lo que medía la feature antes de esta corrección. Además, una llamada que ni
+    menciona el campo y una que lo pasa explícitamente en ``None`` producen la **misma** corrida:
+    misma serie densa, mismos pesos, misma sombra, mismo azar consumido y la misma serie dispersa.
+    """
+    def corrida(**overrides):
+        torch.manual_seed(777)  # mismo punto de partida del RNG global en ambas corridas
+        sde, net, data, cfg = _fresh_ema(
+            num_steps=10, checkpoint_every=4, ema_decay=0.6, **overrides
+        )
+        g = _generador(cfg)
+        res = train(
+            sde,
+            net,
+            data,
+            cfg,
+            generator=g,
+            val_batches=_fuente_examen(),
+            train_exam_batches=_fuente_examen(seed=7),
+        )
+        return res, _fingerprint(res, res.net, g)
+
+    res_ausente, fp_ausente = corrida()  # el campo NI SE MENCIONA
+    res_explicito, fp_explicito = corrida(val_every=None)  # declarado, pero apagado
+
+    assert _pasos_de_val(res_ausente) == [4, 8, 10]  # la cadencia de siempre
+    assert res_explicito.val_history == res_ausente.val_history  # misma serie dispersa, exacta
+    _assert_mismo_fingerprint(fp_explicito, fp_ausente)
+
+
+def test_val_every_desacopla_la_curva_de_los_snapshots():
+    """``val_every=2`` con ``checkpoint_every=5``: dos cadencias genuinamente independientes (3.10).
+
+    En **una sola** corrida de 10 pasos: la curva gana un punto cada 2 pasos (más el último) sin que
+    se escriba un snapshot de más — el ``on_checkpoint`` recibe únicamente el del paso 5 (el 10 lo
+    excluye el disparador de snapshots, que deja el último paso al checkpoint final del caller).
+    Ese es el punto entero de la corrección: la resolución de la curva ya no se paga en disco.
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=10, checkpoint_every=5, val_every=2)
+    tags: list[str] = []
+
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        on_checkpoint=lambda tag, _snapshot: tags.append(tag),
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    assert _pasos_de_val(res) == [2, 4, 6, 8, 10]  # la cadencia de validación, propia
+    assert tags == ["step00005"]  # la de snapshots, intacta y sin puntos de más
+
+
+def test_val_every_mide_con_los_snapshots_apagados():
+    """``checkpoint_every=0`` + ``val_every`` = medir sin escribir un solo snapshot (3.10, 3.7).
+
+    Antes de la corrección esta combinación era un ``ValueError``: la cadencia de la validación
+    *era* la de los snapshots, así que apagar los snapshots apagaba la medición. Ahora es una
+    corrida **legítima** —observabilidad sin costo de disco— y tiene que correr sin levantar nada,
+    con el ``on_checkpoint`` inyectado y sin usarse.
+    """
+    sde, net, data, cfg = _fresh_ema(num_steps=4, checkpoint_every=0, val_every=2)
+    tags: list[str] = []
+
+    res = train(
+        sde,
+        net,
+        data,
+        cfg,
+        generator=_generador(cfg),
+        on_checkpoint=lambda tag, _snapshot: tags.append(tag),
+        val_batches=_fuente_examen(),
+        train_exam_batches=_fuente_examen(seed=7),
+    )
+
+    assert _pasos_de_val(res) == [2, 4]
+    assert tags == []  # ni un snapshot escrito
+    assert len(res.history) == 4
+
+
+@pytest.mark.parametrize("checkpoint_every", [0, 5], ids=["sin_snapshots", "con_snapshots"])
+@pytest.mark.parametrize("val_every", [0, -1])
+def test_train_rechaza_val_every_menor_que_uno(val_every, checkpoint_every):
+    """``val_every < 1`` ⇒ ``ValueError`` nombrando el valor, antes del primer batch (3.11).
+
+    Un ``val_every`` declarado en 0 o negativo no es "usar el default" —eso lo dice ``None``— sino
+    una cadencia imposible: se rechaza explícitamente en lugar de degradar en silencio a la de los
+    snapshots. El error es el **del campo declarado**, con independencia de que ``checkpoint_every``
+    sea válido: la parametrización cruzada lo fija (con ``checkpoint_every=5`` la corrida podría
+    "funcionar" cayendo al default, y eso es justamente lo que no debe pasar).
+
+    La fuente centinela convierte cualquier consumo prematuro de datos en un ``AssertionError``
+    distinto del error esperado, y la fuente del examen tampoco se recorre.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    cfg = TrainConfig(
+        num_steps=2, seed=0, checkpoint_every=checkpoint_every, val_every=val_every
+    )
+    fuente_val = _FuenteValVigilada(_fuente_examen())
+
+    with pytest.raises(ValueError) as exc:
+        train(sde, net, _DataProhibidaVal(), cfg, val_batches=fuente_val)
+
+    mensaje = str(exc.value)
+    assert "val_every" in mensaje
+    assert str(val_every) in mensaje  # nombra el valor recibido
+    assert fuente_val.recorridos == 0  # ni siquiera se tocó la fuente de validación
+
+
+@pytest.mark.parametrize("val_every", [0, -1])
+def test_train_rechaza_val_every_menor_que_uno_aunque_no_haya_validacion(val_every):
+    """El valor DECLARADO se valida siempre, haya o no fuente de validación (3.11).
+
+    El criterio 3.11 dice "if ``val_every`` **se declara** con un valor menor que 1", sin
+    condicionarlo a que haya validación, y es el criterio de la casa para un knob mal formado:
+    ``keep_last_checkpoints`` se rechaza aunque no haya checkpoints y ``amp`` aunque el device sea
+    CPU. Un ``val_every: 0`` en un config sin ``data.val_root`` es un malentendido —el autor creyó
+    estar apagando la validación, o le falta la clave de datos—, y tolerarlo esconde el error hasta
+    que alguien agregue la fuente y la corrida reviente recién ahí.
+
+    No confundir con :func:`test_val_every_sin_fuente_de_validacion_es_inerte`: un valor **válido**
+    sin fuente sí es inerte (no hay nada que medir); lo que se rechaza es el valor imposible.
+    """
+    sde = make_sde("vp")
+    net = _small_net(sde)
+    cfg = TrainConfig(num_steps=2, seed=0, checkpoint_every=5, val_every=val_every)
+
+    with pytest.raises(ValueError) as exc:
+        train(sde, net, _DataProhibidaVal(), cfg)  # SIN val_batches
+
+    assert "val_every" in str(exc.value)
+    assert str(val_every) in str(exc.value)
+
+
+def test_val_every_sin_fuente_de_validacion_es_inerte():
+    """Declarar ``val_every`` sin validación configurada no cambia **nada** de la corrida (6.1).
+
+    El campo describe *cada cuánto* medir, no *si* medir: sin ``val_batches`` no hay nada que medir
+    y la corrida tiene que ser idéntica —pesos, serie densa, sombra y los dos streams de azar— a la
+    de una config que ni lo menciona. Vale también para un valor válido pero absurdo para la
+    corrida (``val_every=3`` sobre 6 pasos): nada que hacer, nada que cambiar.
+    """
+    def corrida(**overrides):
+        torch.manual_seed(777)
+        sde, net, data, cfg = _fresh_ema(
+            num_steps=6, checkpoint_every=2, ema_decay=0.6, **overrides
+        )
+        g = _generador(cfg)
+        res = train(sde, net, data, cfg, generator=g)  # sin val_batches
+        return res, _fingerprint(res, res.net, g)
+
+    res_con, fp_con = corrida(val_every=3)
+    _res_sin, fp_sin = corrida()
+
+    assert res_con.val_history == []  # sin fuente no se mide, con campo o sin él
+    _assert_mismo_fingerprint(fp_con, fp_sin)
+
+
+def test_build_run_acepta_val_every_y_sigue_estricto():
+    """El bloque ``train:`` acepta ``val_every`` sin tocar el config layer, y sigue estricto.
+
+    ``build_run`` valida las claves de ``train:`` por **introspección de los fields** de
+    ``TrainConfig``, así que el campo nuevo queda disponible desde la config por construcción — sin
+    una lista de claves paralela que mantener. Se ejercita con un ``dict`` (el mismo que produce
+    ``load_config``) para no depender de PyYAML; el camino de archivo va en el test hermano. Una
+    clave inválida se sigue rechazando nombrándola.
+    """
+    raw = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2, "n_samples": 128, "batch_size": 64, "seed": 0},
+        "train": {"num_steps": 2, "seed": 0, "checkpoint_every": 4, "val_every": 1},
+    }
+    spec = build_run(raw)
+    assert spec.config.val_every == 1
+    assert spec.config.checkpoint_every == 4  # las dos cadencias conviven, independientes
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    assert len(result.history) == 2
+
+    bad = {
+        "sde": {"name": "vp"},
+        "data": {"shape": "gaussian", "dim": 2},
+        "train": {"num_steps": 1, "val_every_typo": 5},
+    }
+    with pytest.raises(ValueError, match="val_every_typo"):
+        build_run(bad)
+
+
+def test_build_run_desde_yaml_con_val_every(tmp_path):
+    """El mismo camino desde un archivo YAML real: ``train.val_every`` llega al ``TrainConfig``.
+
+    Complementa al test hermano cubriendo el front-end de archivo (``load_config``); se skipea si
+    PyYAML no está instalado, como el resto de los tests del camino YAML de la suite. El YAML deja
+    ``checkpoint_every`` en 0 a propósito: es la combinación que la corrección habilita (medir sin
+    escribir snapshots) y prueba que llega entera desde el archivo.
+    """
+    pytest.importorskip("yaml")
+    text = (
+        "sde:\n"
+        "  name: vp\n"
+        "data:\n"
+        "  shape: gaussian\n"
+        "  dim: 2\n"
+        "  n_samples: 128\n"
+        "  batch_size: 64\n"
+        "  seed: 0\n"
+        "train:\n"
+        "  num_steps: 2\n"
+        "  seed: 0\n"
+        "  checkpoint_every: 0\n"
+        "  val_every: 2\n"
+    )
+    path = tmp_path / "run_val_every.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    spec = build_run(load_config(path))
+    assert spec.config.val_every == 2
+    assert spec.config.checkpoint_every == 0
+
+    result = train(spec.sde, spec.model, spec.data, spec.config)
+    assert len(result.history) == 2

@@ -55,16 +55,19 @@ model:                    # arquitectura U-Net "Premium" (37.1M parámetros, 142
 
 train:                     # hiperparámetros del loop
   num_steps: 60000         # aumentamos pasos para procesar el dataset muchas veces
-  # checkpoint_every gobierna DOS cosas: los snapshots y —desde validation-loss— la cadencia de
-  # evaluación. Con 15000 sobre 60000 pasos la curva de validación queda con solo 4 puntos
-  # (15k/30k/45k/60k), que alcanza para ver el nivel pero es poco para leer una divergencia.
-  # Alternativas medidas (cada snapshot intermedio pesa ~708 MB: 142 de pesos + 567 de sidecar):
-  #   15000 ->  4 puntos,  3 snapshots  (~2.1 GB escritos)
-  #   10000 ->  6 puntos,  5 snapshots  (~3.5 GB escritos)
-  #    5000 -> 12 puntos, 11 snapshots  (~7.6 GB escritos)
-  # La retención de abajo acota el disco OCUPADO (4 snapshots vivos), no el total escrito.
-  checkpoint_every: 15000  # cada snapshot deja su sidecar …_stepNNNNN.resume.pt para reanudar
+  # Las dos cadencias son INDEPENDIENTES a propósito: checkpoint_every cuesta disco (cada snapshot
+  # intermedio pesa ~708 MB: 142 de pesos + 567 de sidecar), val_every no cuesta ninguno. Antes la
+  # validación seguía a checkpoint_every y subir la resolución de la curva obligaba a escribir más
+  # snapshots; con val_every la observabilidad ya no se paga en disco.
+  checkpoint_every: 15000  # snapshots: 3 intermedios (~2.1 GB escritos). Cada uno deja su sidecar …_stepNNNNN.resume.pt para reanudar
   keep_last_checkpoints: 4 # retención rolling: conserva solo los 4 snapshots más nuevos (borra los viejos); el final y su _raw nunca se tocan. Subilo/bajalo o quitalo (= conservar todos)
+  # Cadencia de la validación, desacoplada de los snapshots: 60 puntos en la corrida en vez de los 4
+  # que daría checkpoint_every, sin escribir un snapshot de más. Costo: 12 forwards por evaluación
+  # (~1.2% del cómputo) más el re-decode de las 465x2 imágenes del examen, que es CPU-bound y no lo
+  # acelera la GPU. Se lo dejó múltiplo de checkpoint_every para que cada snapshot guardado tenga un
+  # punto medido en su paso exacto (útil para decidir de cuál samplear). Quitala y la validación
+  # vuelve a seguir a checkpoint_every.
+  val_every: 1000
   lr: 1.0e-4               # LR más estándar para entrenamientos grandes y estables
   t_eps: 1.0e-4
   device: cuda             # usar la GPU (RTX 3090). El examen fijo es específico del device: un

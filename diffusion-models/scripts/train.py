@@ -23,7 +23,10 @@ crudos** ``…_raw.pt`` con los pesos del último paso de Adam, para poder compa
 dentro de la misma corrida.
 
 Con ``data.val_root`` (solo ``kind: images``) la corrida mide además la **pérdida de validación**
-por examen fijo cada ``train.checkpoint_every`` pasos y en el paso final: el CLI reenvía al loop las
+por examen fijo cada ``train.val_every`` pasos —o, si esa clave no se declara, cada
+``train.checkpoint_every``— y en el paso final. ``val_every`` es la palanca para elegir la
+resolución de la curva **sin** escribir más snapshots (subirla vía ``checkpoint_every`` cuesta un
+archivo de pesos por punto), y sirve incluso con los snapshots apagados. El CLI reenvía al loop las
 dos fuentes que armó el config layer (el examen de validación y el examen fijo de entrenamiento que
 lo hace legible), escribe un registro propio por evaluación en el ``.jsonl`` —``event: "val"``, con
 los tres valores y el ``device``—, suma las tres curvas al gráfico de pérdida (con leyenda, ver

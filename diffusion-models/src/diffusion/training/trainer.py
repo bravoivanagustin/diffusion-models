@@ -79,6 +79,18 @@ class TrainConfig:
     # valor que el CLI lee para aplicar :func:`~diffusion.training.prune_snapshots` tras cada snapshot.
     # El checkpoint final nunca cuenta ni se borra. ``train`` no lo usa; un ``N < 1`` lo rechaza el CLI.
     keep_last_checkpoints: int | None = None
+    # Cadencia de la **pérdida de validación**, independiente de la de los snapshots (3.10): ``None``
+    # = usar ``checkpoint_every`` (default, comportamiento bit a bit idéntico al previo al campo);
+    # ``N >= 1`` = evaluar cada N pasos sin importar cada cuánto se persisten snapshots. Existe
+    # porque atar la medición a ``checkpoint_every`` mezclaba dos concerns: subir la resolución de la
+    # curva obligaba a escribir más snapshots (708 MB cada uno en la celda de gatos), así que una
+    # palanca de observabilidad cargaba con un costo de disco que no le corresponde. La consecuencia
+    # es que las dos cadencias se eligen por separado —60 puntos de curva sin un snapshot de más, e
+    # incluso medir con ``checkpoint_every=0``—; conviene mantener ``checkpoint_every`` **múltiplo**
+    # de ``val_every`` para que cada snapshot guardado tenga un punto medido en su paso exacto. Un
+    # ``N < 1`` declarado lo rechaza :func:`train` fail-fast (3.11); sin fuente de validación el campo
+    # es inerte.
+    val_every: int | None = None
     # Distribución de muestreo de t del loop (ver :mod:`diffusion.training.time_sampling`):
     # "uniform" = el default retrocompatible (misma secuencia por seed que antes del campo);
     # "log_uniform" = la recomendada para concentrar señal de entrenamiento en t chico (la
@@ -271,9 +283,10 @@ def train(
               ``num_steps//20``— **independiente** del print/barra, así emite estados aun con
               ``log_every=0`` (p. ej. corridas `--quiet` en background).
             - **Validación** (solo con ``val_batches``) — ``{"event": "val", "step", "val_raw",
-              "val_ema", "train_fijo", "device"}``, en la cadencia de la evaluación
-              (``config.checkpoint_every`` y el último paso). ``val_ema`` / ``train_fijo`` son
-              ``None`` cuando no hay sombra EMA / fuente de examen de train. El ``device`` va en el
+              "val_ema", "train_fijo", "device"}``, en la cadencia de la evaluación (la **efectiva**:
+              ``config.val_every`` si se declara, si no ``config.checkpoint_every``; más el último
+              paso). ``val_ema`` / ``train_fijo`` son ``None`` cuando no hay sombra EMA / fuente de
+              examen de train. El ``device`` va en el
               registro porque el examen fijo es **específico del device**: sin ese dato, una serie
               medida en dos máquinas es indistinguible de una serie con un salto real del modelo.
               Se emite **después** de agregar el punto a ``val_history``.
@@ -294,9 +307,10 @@ def train(
             nuevas activas— y la corrida es idéntica a la de antes de esta feature para la misma
             semilla (6.1). Con una fuente, el loop arma un
             :class:`~diffusion.training.validation.FixedValExam` en el bloque de fail-fast —antes de
-            consumir el primer batch— y **exige** ``config.checkpoint_every > 0``: esa es la cadencia
-            de la evaluación, así que con ella deshabilitada la corrida nunca mediría nada y se falla
-            temprano (3.7). La validación **observa y no interviene**: corre sin gradientes, saca su
+            consumir el primer batch— y **exige una cadencia efectiva > 0**: ``config.val_every`` si
+            se declara, si no ``config.checkpoint_every`` (3.1/3.10). Con las dos apagadas la corrida
+            nunca mediría nada y se falla temprano (3.7); un ``val_every`` declarado por debajo de 1
+            también (3.11). La validación **observa y no interviene**: corre sin gradientes, saca su
             azar de un generator propio y no altera los pesos, el optimizador ni la sombra EMA.
         train_exam_batches: Fuente **re-iterable** y **opcional** del **examen fijo de
             entrenamiento** (imágenes del set de train, la misma cantidad que las de validación),
@@ -326,9 +340,15 @@ def train(
     construcción (3.4)— y la serie medida viaja en ``TrainResult.val_history``. Sin la fuente no se
     construye nada y la corrida es la de siempre (6.1).
 
-    La evaluación corre cuando el paso completado es múltiplo de ``config.checkpoint_every`` **o** es
-    el último de la corrida (3.1) — un disparador **independiente** del de los snapshots, que excluye
-    el último paso y exige ``on_checkpoint``: la validación mide aunque la corrida no persista nada.
+    La evaluación corre cuando el paso completado es múltiplo de la **cadencia efectiva** —
+    ``config.val_every`` si se declara, si no ``config.checkpoint_every`` (3.10)— **o** es el último
+    de la corrida (3.1). Es un disparador **independiente** del de los snapshots, que excluye el
+    último paso y exige ``on_checkpoint``: la validación mide aunque la corrida no persista nada, y
+    con ``val_every`` la resolución de la curva se elige sin escribir un snapshot de más (incluso con
+    ``checkpoint_every=0``). Conviene, eso sí, mantener ``checkpoint_every`` **múltiplo** de
+    ``val_every``, así cada snapshot guardado tiene un punto medido en su paso exacto; no es un
+    requisito del código (con cadencias no alineadas el ``meta`` del checkpoint del paso *N*
+    simplemente lleva los puntos acumulados hasta *N*).
     Cada evaluación produce hasta **tres** valores, en este orden: validación con los pesos vivos,
     validación con la sombra EMA si está activa (4.1; ``None`` si no, nunca un valor inventado, 4.2)
     y el examen fijo de entrenamiento con los pesos vivos (3.8, ``None`` sin su fuente). Va **después**
@@ -356,9 +376,11 @@ def train(
 
     Raises:
         ValueError: Si ``config.ema_decay`` es inválido (R1.6), si ``config.amp`` no es ``bool``
-            (R1.5), si ``config.time_sampling`` no existe, si se pide validación
-            (``val_batches``) con ``config.checkpoint_every <= 0`` (3.7), o si al reanudar la config y
-            el sidecar no coinciden en el uso del EMA (R3.4). Todos antes de consumir el primer batch.
+            (R1.5), si ``config.time_sampling`` no existe, si se pide validación (``val_batches``)
+            con ``config.val_every`` declarado por debajo de 1 (3.11) o con la cadencia **efectiva**
+            en 0 o menos —sin ``val_every`` y con ``config.checkpoint_every <= 0`` (3.7)—, o si al
+            reanudar la config y el sidecar no coinciden en el uso del EMA (R3.4). Todos antes de
+            consumir el primer batch.
     """
     device = torch.device(config.device)
     # Autotune de kernels convolucionales: auto-on en GPU (aprovecha los shapes fijos de la corrida),
@@ -419,20 +441,44 @@ def train(
     # fail-fast: ANTES de consumir el primer batch, mismo criterio que el time sampler / el decay del
     # EMA / el ``amp``.
     #
-    # La cadencia se rechaza en ESTE punto y no en el config layer (3.7) porque el loop es el único
-    # que ve el valor **efectivo** de ``checkpoint_every``: el CLI lo sobreescribe *después* de armar
+    # La cadencia se rechaza en ESTE punto y no en el config layer (3.7/3.11) porque el loop es el
+    # único que ve el valor **efectivo**: el CLI sobreescribe ``checkpoint_every`` *después* de armar
     # la corrida, así que un chequeo en la config se saltearía (o dispararía sobre un valor que la
     # corrida ya no usa).
+    #
+    # CADENCIA EFECTIVA (3.10): ``val_every`` si se declara, ``checkpoint_every`` si no. Las dos son
+    # independientes a propósito — la resolución de la curva es observabilidad y no puede costar
+    # snapshots de 708 MB—, así que con ``val_every`` la corrida mide incluso con los snapshots
+    # apagados (``checkpoint_every=0``, que deja de ser un error). Se computa acá arriba, fuera del
+    # ``if``, para que el disparador del loop la lea ya resuelta; sin fuente de validación puede
+    # valer 0 y nunca se usa (el disparador la gatea con ``val_exam is not None``).
+    val_cadence = config.val_every if config.val_every is not None else config.checkpoint_every
+    # El valor DECLARADO se valida SIEMPRE (3.11), haya o no fuente de validación: es el criterio de
+    # la casa para un knob mal formado —``keep_last_checkpoints`` se rechaza igual aunque no haya
+    # checkpoints, y ``amp`` aunque el device sea CPU—. Un ``val_every: 0`` en un config sin
+    # ``val_root`` es un malentendido del autor (creyó estar apagando la validación, o le falta la
+    # clave de datos), y avisarlo cuesta nada; tolerarlo en silencio esconde el error hasta que
+    # alguien agregue la fuente y la corrida reviente recién ahí.
+    if config.val_every is not None and config.val_every < 1:
+        raise ValueError(
+            f"config.val_every={config.val_every} no es una cadencia válida: la validación se "
+            "evalúa cada N pasos, así que N tiene que ser >= 1. Declarar 0 o un negativo NO es "
+            "'usar el default' —eso lo dice val_every: null, que cae en checkpoint_every—: es "
+            "pedir una cadencia imposible, y se rechaza en vez de degradar en silencio."
+        )
     val_exam: FixedValExam | None = None
     train_exam: FixedValExam | None = None
     if val_batches is not None:
-        if config.checkpoint_every <= 0:
+        # La cadencia EFECTIVA (3.7) sí depende de que haya fuente: sin validación, un
+        # ``checkpoint_every=0`` es perfectamente válido y no hay nada que medir.
+        if val_cadence <= 0:
             raise ValueError(
-                "La corrida pide pérdida de validación pero tiene la cadencia de checkpoints "
-                f"deshabilitada (config.checkpoint_every={config.checkpoint_every}): esa cadencia es "
-                "la que gobierna cada cuántos pasos se evalúa, así que la corrida entrenaría "
-                "completa sin medir ni un punto de validación. Declará checkpoint_every > 0 o quitá "
-                "la fuente de validación."
+                "La corrida pide pérdida de validación pero se queda sin cadencia de evaluación: no "
+                f"declara val_every y tiene los checkpoints deshabilitados "
+                f"(config.checkpoint_every={config.checkpoint_every}), así que entrenaría completa "
+                "sin medir ni un punto. Declará val_every > 0 —fija la cadencia de la validación con "
+                "independencia de los snapshots, así que podés medir sin escribir ninguno— o poné "
+                "checkpoint_every > 0; si no querés medir, quitá la fuente de validación."
             )
         # Los dos exámenes reciben el ``time_sampler`` recién construido —EL MISMO objeto que usa el
         # loop— y la semilla por defecto del examen: así "val y train usan el mismo criterio de
@@ -663,15 +709,16 @@ def train(
         # paso N ya contiene el punto medido en N, y reanudar desde ahí restaura todos los puntos ya
         # medidos en lugar de perder el último (6.3).
         #
-        # El DISPARADOR NO ES EL DE LOS SNAPSHOTS, aunque se le parezca: incluye el último paso
-        # (``is_last``, que el snapshot excluye porque el checkpoint final lo guarda el caller) y no
-        # exige ``on_checkpoint`` (``do_checkpoints``), porque la validación es una medición de la
-        # corrida y no un artefacto de checkpointing — una corrida sin persistencia igual mide. Los
-        # dos disparadores comparten solo la cadencia ``checkpoint_every``, garantizada > 0 acá por
-        # el fail-fast de más arriba (3.7). Conflacionarlos es el error más probable de esta feature:
-        # reusar la condición del snapshot perdería el punto final; reusar esta para el snapshot
-        # escribiría un snapshot de más.
-        if val_exam is not None and ((step + 1) % config.checkpoint_every == 0 or is_last):
+        # El DISPARADOR NO ES EL DE LOS SNAPSHOTS, aunque se le parezca: corre sobre la **cadencia
+        # efectiva** (``val_every`` si se declaró, ``checkpoint_every`` si no — 3.10), incluye el
+        # último paso (``is_last``, que el snapshot excluye porque el checkpoint final lo guarda el
+        # caller) y no exige ``on_checkpoint`` (``do_checkpoints``), porque la validación es una
+        # medición de la corrida y no un artefacto de checkpointing — una corrida sin persistencia
+        # igual mide. Con ``val_every`` declarado los dos ni siquiera comparten la cadencia. La
+        # ``val_cadence`` está garantizada > 0 acá por el fail-fast de más arriba (3.7/3.11).
+        # Conflacionarlos es el error más probable de esta feature: reusar la condición del snapshot
+        # perdería el punto final; reusar esta para el snapshot escribiría snapshots de más.
+        if val_exam is not None and ((step + 1) % val_cadence == 0 or is_last):
             # Hasta TRES mediciones, en este orden. La primera con los pesos vivos.
             val_raw = val_exam.evaluate(net)
             # La segunda con la sombra EMA, y solo si está activa (4.1): sin sombra el valor queda
