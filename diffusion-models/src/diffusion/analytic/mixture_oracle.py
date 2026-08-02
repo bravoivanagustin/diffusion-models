@@ -49,10 +49,17 @@ caller ocurre recién en la salida de las cantidades que consumen los samplers.
 
 from __future__ import annotations
 
+import math
+import numbers
+
 import torch
 
 from ..data_generation import ExactGaussianMixture
 from ..sde import ForwardSDE
+from .quadrature import QuadratureGrid, auto_grid, integrate
+
+#: Término constante de la log-densidad gaussiana en dos dimensiones: ``-(d/2) log(2π)``.
+_LOG_NORMALIZACION_2D: float = -math.log(2.0 * math.pi)
 
 #: Puntos de sondeo del chequeo estructural de familia. Sus coordenadas son **no nulas**
 #: (para poder despejar ``α_t`` dividiendo) y **distintas entre sí**: con un vector de unos
@@ -184,13 +191,163 @@ class MixtureOracle:
             ValueError: Si ``t`` no cumple el contrato de :meth:`marginal_params`.
         """
         alpha, sigma = self.marginal_params(t)
-        base = self._covariances.to(device=alpha.device)  # (K, 2, 2)
-        identidad = torch.eye(2, dtype=torch.float64, device=alpha.device)
-        alpha2 = (alpha**2).reshape(-1, 1, 1, 1)  # (B, 1, 1, 1)
-        sigma2 = (sigma**2).reshape(-1, 1, 1, 1)
-        return alpha2 * base + sigma2 * identidad
+        return _perturbed_covariances(
+            self._covariances.to(device=alpha.device), alpha, sigma
+        )
+
+    # ------------------------------------------------- densidad y log-densidad
+
+    def log_prob(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Log-densidad exacta ``log p_t(x)`` de la mixtura ruideada.
+
+        Se calcula **en el dominio logarítmico**: la log-densidad de cada componente se
+        combina con ``logsumexp`` sobre ``log w_k + log N(x; α_t μ_k, Σ_k(t))``, nunca
+        sumando densidades para después tomarles el logaritmo. Esa es la diferencia que
+        importa cuando el desvío del kernel se hace chico: lejos de los modos cada
+        componente vale ``exp(-10^5)``, que en doble precisión es cero, así que el camino
+        ingenuo devolvería ``-inf`` mientras este devuelve el valor correcto.
+
+        Está construida enteramente con operaciones tensoriales, sin cortes de grafo ni
+        desvíos por fuera del tensor, así que ``torch.autograd`` puede derivarla respecto de
+        ``x`` (dos veces, lo que habilita la traza exacta del jacobiano que necesitan las
+        métricas). El gradiente respecto de ``t``, en cambio, **no** fluye: el tiempo se
+        desconecta al normalizarse.
+
+        Los pasos intermedios corren en doble precisión aunque ``x`` llegue en ``float32``;
+        solo el resultado se degrada al dtype del caller.
+
+        Args:
+            x: Puntos del plano, de forma ``(B, 2)``, en punto flotante.
+            t: Tiempos, de forma ``(B,)`` o ``(B, 1)``, finitos y no negativos: un tiempo
+                por punto, evaluado punto a punto.
+
+        Returns:
+            Tensor ``(B,)`` con la log-densidad de cada punto, en el dtype y el device de
+            ``x``.
+
+        Raises:
+            ValueError: Si ``x`` no es un tensor de punto flotante de forma ``(B, 2)`` con
+                ``B >= 1``, si ``t`` no cumple el contrato de :meth:`marginal_params`, o si
+                ``t`` no trae exactamente un tiempo por punto de ``x``.
+        """
+        return self._log_prob_double(x, t).to(x.dtype)
+
+    def prob(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Densidad exacta ``p_t(x)`` de la mixtura ruideada.
+
+        Se **deriva** de :meth:`log_prob` exponenciándola, de modo que las dos cantidades no
+        pueden discrepar. Donde la densidad no es representable el resultado desborda a
+        cero, que es el valor correcto en punto flotante; la log-densidad sigue siendo
+        informativa ahí.
+
+        Args:
+            x: Puntos del plano, de forma ``(B, 2)``, en punto flotante.
+            t: Tiempos, de forma ``(B,)`` o ``(B, 1)``, finitos y no negativos.
+
+        Returns:
+            Tensor ``(B,)`` no negativo con la densidad de cada punto, en el dtype y el
+            device de ``x``.
+
+        Raises:
+            ValueError: Igual que :meth:`log_prob`.
+        """
+        return torch.exp(self._log_prob_double(x, t)).to(x.dtype)
+
+    def total_mass(self, t: float, *, grid: QuadratureGrid | None = None) -> float:
+        """Masa integrada de la densidad en un tiempo dado: el autochequeo del oráculo.
+
+        Que ``∫ p_t = 1`` es la forma de *verificar* la verdad analítica en vez de confiar
+        en ella. La malla por defecto la dimensiona ``auto_grid`` a partir de las covarianzas
+        **ya evaluadas en** ``t`` y de las medias contraídas ``α_t μ_k``, es decir de la
+        escala real de la densidad que se está integrando; el paso **no** se deriva del
+        desvío del kernel, porque la concentración tiene piso ``α_t² λ_min(Σ_k)`` y no
+        colapsa cuando ``t → 0``.
+
+        Un valor que se aparta de uno delata una malla insuficiente, no un error de la
+        densidad.
+
+        Args:
+            t: Tiempo escalar, finito y no negativo, en el que se integra.
+            grid: Malla explícita. Si se omite, se dimensiona automáticamente.
+
+        Returns:
+            La masa integrada como ``float``.
+
+        Raises:
+            ValueError: Si ``t`` no es un número real finito y no negativo.
+        """
+        instante = _normalize_scalar_time(t)
+        tt = torch.tensor([[instante]], dtype=torch.float64)
+        alpha, sigma = self.marginal_params(tt)
+        covarianzas = _perturbed_covariances(self._covariances, alpha, sigma)[0]
+        medias = (alpha.reshape(-1, 1, 1) * self._means)[0]
+        malla = (
+            grid
+            if grid is not None
+            else auto_grid(means=medias, covariances=covarianzas)
+        )
+
+        def densidad(puntos: torch.Tensor) -> torch.Tensor:
+            """Densidad evaluada en los nodos de un bloque de la malla."""
+            tiempos = torch.full(
+                (puntos.shape[0],),
+                instante,
+                dtype=puntos.dtype,
+                device=puntos.device,
+            )
+            return self.prob(puntos, tiempos)
+
+        return integrate(densidad, malla)
 
     # ------------------------------------------------------------------ internos
+
+    def _log_prob_double(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Log-densidad en doble precisión, sin degradar al dtype del caller.
+
+        Es el único lugar donde vive la forma cerrada; :meth:`log_prob` y :meth:`prob` solo
+        la exponencian o la degradan, así que no pueden discrepar entre sí.
+
+        Args:
+            x: Puntos del plano candidatos.
+            t: Tiempos candidatos.
+
+        Returns:
+            Tensor ``(B,)`` ``float64`` en el device de ``x``, conectado al grafo de ``x``.
+
+        Raises:
+            ValueError: Si ``x`` o ``t`` no cumplen su contrato, o si los lotes no coinciden.
+        """
+        xx = _normalize_state(x)
+        tt = _normalize_time(t).to(device=xx.device)
+        if tt.shape[0] != xx.shape[0]:
+            raise ValueError(
+                "t debe traer un tiempo por punto de x (un valor por fila); recibí "
+                f"{tt.shape[0]} tiempos para {xx.shape[0]} puntos."
+            )
+
+        alpha, sigma = self.marginal_params(tt)  # (B, 1) cada uno
+        base = self._covariances.to(device=xx.device)  # (K, 2, 2)
+        covarianzas = _perturbed_covariances(base, alpha, sigma)  # (B, K, 2, 2)
+        precisiones, determinantes = _inverse_and_det_2x2(covarianzas)
+
+        # Medias contraídas por el kernel: alpha_t mu_k, con forma (B, K, 2).
+        medias = alpha.reshape(-1, 1, 1) * self._means.to(device=xx.device)
+        diferencia = xx.unsqueeze(1) - medias  # (B, K, 2)
+        # Forma cuadrática (x - mu_k)^T Sigma_k(t)^{-1} (x - mu_k), de forma (B, K).
+        cuadratica = (
+            diferencia * (precisiones @ diferencia.unsqueeze(-1)).squeeze(-1)
+        ).sum(dim=-1)
+
+        log_componentes = (
+            _LOG_NORMALIZACION_2D
+            - 0.5 * torch.log(determinantes)
+            - 0.5 * cuadratica
+        )
+        # Un peso nulo entra como -inf y logsumexp lo absorbe sin producir nan, así que no
+        # hace falta recortar los pesos (recortarlos haría aportar densidad a una componente
+        # que la mixtura declaró inexistente).
+        log_pesos = torch.log(self._weights.to(device=xx.device))  # (K,)
+        return torch.logsumexp(log_pesos + log_componentes, dim=1)
 
     def _validate_scalar_gaussian_family(self) -> None:
         """Verifica estructuralmente que la SDE sea de la familia escalar-gaussiana.
@@ -283,6 +440,97 @@ def _normalize_time(t: torch.Tensor) -> torch.Tensor:
             "rango el schedule de la SDE no está definido."
         )
     return tt
+
+
+def _normalize_scalar_time(t: float) -> float:
+    """Valida un tiempo **escalar** y lo devuelve como ``float``.
+
+    Es la contraparte de :func:`_normalize_time` para las cantidades que se calculan en un
+    solo instante (la masa integrada), donde pedir un tensor sería ceremonia inútil.
+
+    Se valida **por tipo** y no intentando una conversión: ``float()`` acepta cadenas como
+    ``"0.3"``, y colar un tiempo escrito como texto es exactamente la clase de error que
+    conviene que falle fuerte.
+
+    Args:
+        t: Tiempo candidato.
+
+    Returns:
+        El tiempo como ``float``.
+
+    Raises:
+        ValueError: Si ``t`` no es un número real (un tensor tampoco lo es: acá el tiempo es
+            un escalar), o si no es finito y no negativo.
+    """
+    if not isinstance(t, numbers.Real):
+        raise ValueError(
+            "t debe ser un número real que exprese un instante del proceso; recibí un "
+            f"objeto de tipo {type(t).__name__}."
+        )
+    instante = float(t)
+    if not math.isfinite(instante) or instante < 0.0:
+        raise ValueError(
+            "t debe ser finito y no negativo: el proceso corre en [0, T] y fuera de ese "
+            f"rango el schedule de la SDE no está definido; recibí {instante!r}."
+        )
+    return instante
+
+
+def _normalize_state(x: torch.Tensor) -> torch.Tensor:
+    """Valida el estado y lo promueve a doble precisión **sin cortar el grafo**.
+
+    La promoción es una operación derivable, así que el gradiente respecto de un ``x`` en
+    ``float32`` sigue llegando al caller. No se hace ``detach``: es justamente ``∂/∂x`` lo
+    que los consumidores necesitan.
+
+    Args:
+        x: Puntos del plano candidatos.
+
+    Returns:
+        ``x`` como tensor ``(B, 2)`` ``float64``, en su device y conectado a su grafo.
+
+    Raises:
+        ValueError: Si ``x`` no es un tensor de torch, si su forma no es ``(B, 2)`` con
+            ``B >= 1``, o si su dtype no es de punto flotante.
+    """
+    if not isinstance(x, torch.Tensor):
+        raise ValueError(
+            "x debe ser un tensor de torch de forma (B, 2) con un punto del plano por "
+            f"fila; recibí un objeto de tipo {type(x).__name__}."
+        )
+    if x.ndim != 2 or x.shape[1] != 2 or x.shape[0] < 1:
+        raise ValueError(
+            "x debe tener forma (B, 2) con B >= 1 (el laboratorio analítico es 2D); "
+            f"recibí forma {tuple(x.shape)}."
+        )
+    if not x.dtype.is_floating_point:
+        raise ValueError(
+            "x debe ser un tensor de punto flotante: un estado entero no describe un punto "
+            f"del plano; recibí dtype {x.dtype}."
+        )
+    return x.to(torch.float64)
+
+
+def _perturbed_covariances(
+    base: torch.Tensor, alpha: torch.Tensor, sigma: torch.Tensor
+) -> torch.Tensor:
+    """Propaga las covarianzas de los datos al tiempo del kernel.
+
+    Es ``Σ_k(t) = α_t² Σ_k + σ_t² I``, la única fórmula de la que dependen la densidad, el
+    score y la masa integrada. Vive en un solo lugar para que no puedan divergir.
+
+    Args:
+        base: Covarianzas de los datos, de forma ``(K, 2, 2)``.
+        alpha: Factor de contracción por muestra, de forma ``(B, 1)``.
+        sigma: Desvío del kernel por muestra, de forma ``(B, 1)``.
+
+    Returns:
+        Tensor ``(B, K, 2, 2)`` en el dtype y el device de ``base``.
+    """
+    identidad = torch.eye(2, dtype=base.dtype, device=base.device)
+    alpha2 = (alpha**2).reshape(-1, 1, 1, 1)  # (B, 1, 1, 1)
+    sigma2 = (sigma**2).reshape(-1, 1, 1, 1)
+    return alpha2 * base + sigma2 * identidad
 
 
 def _as_column(value: torch.Tensor, batch: int) -> torch.Tensor:

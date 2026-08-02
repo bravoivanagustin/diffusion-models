@@ -960,3 +960,625 @@ def test_rechaza_un_tiempo_negativo_o_no_finito(valor: float):
     oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
     with pytest.raises(ValueError, match=r"^t debe"):
         oraculo.marginal_params(torch.tensor([valor], dtype=torch.float64))
+
+
+# ------------------------------- oráculo: densidad, log-densidad y masa integrada
+
+
+#: Puntos de evaluación: el origen, los dos modos y dos puntos de cola.
+_PUNTOS = torch.tensor(
+    [[0.0, 0.0], [-1.5, 0.5], [2.0, -1.0], [1.0, 3.0], [-3.0, -2.0]],
+    dtype=torch.float64,
+)
+
+
+def _tiempo(valor: float, batch: int) -> "torch.Tensor":
+    """Vector ``(batch,)`` con el mismo tiempo en todas las filas."""
+    return torch.full((batch,), valor, dtype=torch.float64)
+
+
+def _log_gaussiana_cerrada(
+    punto: tuple[float, float],
+    media: tuple[float, float],
+    cov: tuple[tuple[float, float], tuple[float, float]],
+) -> float:
+    """Log-densidad gaussiana 2D escrita con floats de Python.
+
+    Tercera implementación independiente —``_gaussiana`` trabaja en el dominio lineal con el
+    álgebra lineal genérica de torch, y la producción usa su propia forma cerrada—. Sirve
+    justamente en el régimen en el que la densidad **no** es representable y el dominio
+    lineal ya no alcanza.
+    """
+    dx = punto[0] - media[0]
+    dy = punto[1] - media[1]
+    (a, b), (c, d) = cov[0], cov[1]
+    det = a * d - b * c
+    cuadratica = (dx * (d * dx - b * dy) + dy * (-c * dx + a * dy)) / det
+    return -math.log(2.0 * math.pi) - 0.5 * math.log(det) - 0.5 * cuadratica
+
+
+def _params_ruideados(
+    nombre: str, t: float, mixtura: ExactGaussianMixture
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """``(alpha_t mu_k, Sigma_k(t))`` armados con la forma cerrada escrita a mano en el test."""
+    a, s = _alpha_sigma_cerrados(nombre, t)
+    base = torch.as_tensor(mixtura.covariances_, dtype=torch.float64)
+    medias = a * torch.as_tensor(mixtura.means_, dtype=torch.float64)
+    covs = a**2 * base + (s**2) * torch.eye(2, dtype=torch.float64)
+    return medias, covs
+
+
+def _log_mixtura_independiente(
+    mixtura: ExactGaussianMixture,
+    medias: "torch.Tensor",
+    covs: "torch.Tensor",
+    puntos: "torch.Tensor",
+) -> "torch.Tensor":
+    """Log-densidad de referencia: mixtura sumada en el dominio **lineal** y recién ahí log.
+
+    Es la fuente independiente del criterio 3.1: no usa ``logsumexp`` ni la forma cerrada
+    2×2 de la producción, sino ``torch.linalg.inv``/``det`` sobre cada componente.
+    """
+    densidad = _mixtura(mixtura.weights_.tolist(), medias, covs)
+    return torch.log(densidad(puntos))
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_la_log_densidad_coincide_con_la_formula_independiente(nombre: str):
+    """Criterio 3.1/3.2: ``log p_t`` contra una mixtura gaussiana escrita aparte.
+
+    Tolerancia: ``rtol=1e-10`` sobre log-densidades de magnitud hasta ~50, es decir unos
+    ``5e-9`` absolutos, varios órdenes por encima del ruido de la doble precisión y muy por
+    debajo de cualquier error estructural (olvidar los pesos, usar ``Sigma_k`` en lugar de
+    ``Sigma_k(t)``, perder el factor de contracción), que se aparta en unidades enteras.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+
+    for valor in _TIEMPOS:
+        medias, covs = _params_ruideados(nombre, valor, mixtura)
+        esperada = _log_mixtura_independiente(mixtura, medias, covs, _PUNTOS)
+        obtenida = oraculo.log_prob(_PUNTOS, _tiempo(valor, _PUNTOS.shape[0]))
+
+        assert obtenida.shape == (_PUNTOS.shape[0],)
+        assert torch.allclose(obtenida, esperada, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_la_densidad_coincide_con_la_formula_independiente(nombre: str):
+    """La densidad es la de la misma mixtura ruideada, no la de otra cosa (criterio 3.1)."""
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+
+    for valor in [0.05, 0.5]:
+        medias, covs = _params_ruideados(nombre, valor, mixtura)
+        esperada = _mixtura(mixtura.weights_.tolist(), medias, covs)(_PUNTOS)
+        obtenida = oraculo.prob(_PUNTOS, _tiempo(valor, _PUNTOS.shape[0]))
+        assert torch.allclose(obtenida, esperada, rtol=1e-10, atol=1e-300)
+
+
+def test_la_log_densidad_sigue_siendo_finita_donde_la_densidad_ya_no_se_representa():
+    """Criterio 3.2: el dominio logarítmico es lo que salva el régimen no representable.
+
+    El punto está tan lejos de los dos modos que **cada** componente vale ``exp(-5e5)``, es
+    decir cero en doble precisión: sumar densidades y recién ahí tomar el logaritmo da
+    ``-inf``. El test fija las dos caras —que el resultado es finito y coincide con la
+    componente dominante, y que el camino ingenuo de verdad desborda—, así que una
+    implementación que sume en el dominio lineal falla acá.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    punto = (200.0, 200.0)
+    valor = 1e-4
+
+    medias, covs = _params_ruideados("vp", valor, mixtura)
+    logs = [
+        math.log(peso)
+        + _log_gaussiana_cerrada(
+            punto,
+            (float(medias[k, 0]), float(medias[k, 1])),
+            (
+                (float(covs[k, 0, 0]), float(covs[k, 0, 1])),
+                (float(covs[k, 1, 0]), float(covs[k, 1, 1])),
+            ),
+        )
+        for k, peso in enumerate(mixtura.weights_.tolist())
+    ]
+    # El camino ingenuo: exponenciar cada componente y sumar. Desborda por abajo a cero.
+    assert sum(math.exp(log_componente) for log_componente in logs) == 0.0
+
+    obtenida = oraculo.log_prob(
+        torch.tensor([punto], dtype=torch.float64), _tiempo(valor, 1)
+    )
+    assert torch.isfinite(obtenida).all()
+    assert float(obtenida[0]) == pytest.approx(max(logs), rel=1e-12)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+@pytest.mark.parametrize("valor", [1e-5, 1e-4, 1e-3])
+def test_la_log_densidad_es_finita_con_el_desvio_del_kernel_diminuto(
+    nombre: str, valor: float
+):
+    """Criterio 4.7: con ``sigma_t`` de ``1e-5`` o menos no hay desbordes ni indeterminaciones.
+
+    sub-VP llega a ``sigma_t ≈ 1e-6`` en el extremo del barrido. La densidad **no** explota,
+    porque la concentración tiene piso ``alpha_t² Sigma_k``; lo que se verifica es que ni la
+    log-densidad ni la densidad producen ``nan`` ni ``inf``.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    t = _tiempo(valor, _PUNTOS.shape[0])
+
+    log_densidad = oraculo.log_prob(_PUNTOS, t)
+    densidad = oraculo.prob(_PUNTOS, t)
+
+    assert torch.isfinite(log_densidad).all()
+    assert torch.isfinite(densidad).all()
+    assert bool((densidad >= 0.0).all())
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_la_densidad_es_la_exponencial_de_la_log_densidad(nombre: str):
+    """Las dos cantidades son la misma: la densidad se deriva de la log-densidad."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    t = _tiempo(0.2, _PUNTOS.shape[0])
+
+    log_densidad = oraculo.log_prob(_PUNTOS, t)
+    densidad = oraculo.prob(_PUNTOS, t)
+
+    assert torch.allclose(densidad, torch.exp(log_densidad), rtol=1e-12, atol=1e-300)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_tiempo_plano_y_en_columna_dan_la_misma_densidad(nombre: str):
+    """Criterio 3.5: ``t`` se acepta como ``(B,)`` y como ``(B, 1)``, con un valor por punto."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    plano = _tiempo(0.35, _PUNTOS.shape[0])
+    columna = plano.reshape(-1, 1)
+
+    assert torch.equal(
+        oraculo.log_prob(_PUNTOS, plano), oraculo.log_prob(_PUNTOS, columna)
+    )
+    assert torch.equal(oraculo.prob(_PUNTOS, plano), oraculo.prob(_PUNTOS, columna))
+
+
+def test_cada_punto_se_evalua_en_su_propio_tiempo():
+    """Un valor por punto significa eso: el lote no comparte un tiempo único.
+
+    Discrimina la versión que toma el primer tiempo del lote (o su promedio) y lo aplica a
+    todas las filas: acá los dos tiempos son extremos del horizonte.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    punto = torch.tensor([[0.4, -0.3]], dtype=torch.float64)
+    juntos = torch.cat([punto, punto], dim=0)
+
+    mezclado = oraculo.log_prob(juntos, torch.tensor([0.01, 1.0], dtype=torch.float64))
+    solo_temprano = oraculo.log_prob(punto, _tiempo(0.01, 1))
+    solo_tardio = oraculo.log_prob(punto, _tiempo(1.0, 1))
+
+    assert float(mezclado[0]) == pytest.approx(float(solo_temprano[0]), rel=1e-12)
+    assert float(mezclado[1]) == pytest.approx(float(solo_tardio[0]), rel=1e-12)
+    assert abs(float(solo_temprano[0]) - float(solo_tardio[0])) > 0.5
+
+
+@pytest.mark.parametrize("nombre", ["vp", "sub_vp"])
+def test_con_el_tiempo_en_cero_la_log_densidad_es_la_mixtura_original(nombre: str):
+    """Criterio 3.4 en las variantes cuyo desvío llega a cero: el límite es ``p_0`` exacta."""
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+    esperada = _log_mixtura_independiente(
+        mixtura,
+        torch.as_tensor(mixtura.means_, dtype=torch.float64),
+        torch.as_tensor(mixtura.covariances_, dtype=torch.float64),
+        _PUNTOS,
+    )
+
+    obtenida = oraculo.log_prob(_PUNTOS, _tiempo(0.0, _PUNTOS.shape[0]))
+
+    assert torch.allclose(obtenida, esperada, rtol=1e-12, atol=1e-14)
+
+
+@pytest.mark.parametrize("nombre", ["vp", "sub_vp"])
+def test_la_log_densidad_converge_a_la_mixtura_original_al_bajar_el_tiempo(nombre: str):
+    """Criterio 3.4: la convergencia es monótona al acercarse a cero, no solo el valor en cero."""
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+    esperada = _log_mixtura_independiente(
+        mixtura,
+        torch.as_tensor(mixtura.means_, dtype=torch.float64),
+        torch.as_tensor(mixtura.covariances_, dtype=torch.float64),
+        _PUNTOS,
+    )
+
+    errores = [
+        float(
+            (oraculo.log_prob(_PUNTOS, _tiempo(v, _PUNTOS.shape[0])) - esperada)
+            .abs()
+            .max()
+        )
+        for v in (1e-2, 1e-4, 1e-6)
+    ]
+
+    assert errores[0] > errores[1] > errores[2]
+    assert errores[-1] < 1e-3
+
+
+def test_en_ve_el_limite_es_la_mixtura_suavizada_por_el_piso_del_schedule():
+    """Criterio 3.4 en VE: su schedule no baja de ``sigma_min``, así que el límite no es ``p_0``.
+
+    Es la cara por variante del invariante de diseño. El test fija las dos direcciones: que
+    el límite **es** la mixtura convolucionada con ``N(0, sigma_min² I)`` y que **no** es
+    ``p_0``, así que comparar las tres SDEs contra ``p_0`` falla acá.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("ve"))
+    # Puntos desplazados sobre el eje angosto de la segunda componente (desvío ``0.2``),
+    # donde el piso del schedule deja su huella más visible.
+    puntos = torch.tensor(
+        [[2.0, -1.6], [2.0, -0.4], [-1.5, 0.5], [0.0, 0.0]], dtype=torch.float64
+    )
+    medias = torch.as_tensor(mixtura.means_, dtype=torch.float64)
+    base = torch.as_tensor(mixtura.covariances_, dtype=torch.float64)
+    suavizadas = base + (_SIGMA_MIN**2) * torch.eye(2, dtype=torch.float64)
+
+    obtenida = oraculo.log_prob(puntos, _tiempo(0.0, puntos.shape[0]))
+    esperada = _log_mixtura_independiente(mixtura, medias, suavizadas, puntos)
+    sin_suavizar = _log_mixtura_independiente(mixtura, medias, base, puntos)
+
+    assert torch.allclose(obtenida, esperada, rtol=1e-12, atol=1e-14)
+    assert float((obtenida - sin_suavizar).abs().max()) > 1e-3
+
+
+def test_la_densidad_contrae_las_medias_por_el_factor_del_kernel():
+    """Sin ``alpha_t mu_k`` la densidad quedaría centrada donde estaban los datos.
+
+    En VP con ``t = 1`` el factor de contracción vale ``0.0064``, así que ``p_1`` está
+    prácticamente centrada en el origen: la log-densidad tiene que ser mayor ahí que sobre
+    la media original de una componente. Con las medias sin contraer la desigualdad se
+    invierte.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    puntos = torch.tensor([[0.0, 0.0], [2.0, -1.0]], dtype=torch.float64)
+
+    obtenida = oraculo.log_prob(puntos, _tiempo(1.0, 2))
+
+    assert float(obtenida[0]) > float(obtenida[1]) + 1.0
+
+
+def test_la_densidad_usa_la_covarianza_en_el_tiempo_y_no_la_de_los_datos():
+    """``Sigma_k(t) = alpha_t² Sigma_k + sigma_t² I``: en VE con ``t = 1`` domina el ruido.
+
+    Con ``sigma_t = 5`` la densidad es mucho más plana que ``p_0``; quedarse con ``Sigma_k``
+    da valores que difieren en unidades enteras de log-densidad.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("ve"))
+    medias, covs = _params_ruideados("ve", 1.0, mixtura)
+
+    obtenida = oraculo.log_prob(_PUNTOS, _tiempo(1.0, _PUNTOS.shape[0]))
+    con_tiempo = _log_mixtura_independiente(mixtura, medias, covs, _PUNTOS)
+    sin_tiempo = _log_mixtura_independiente(
+        mixtura,
+        torch.as_tensor(mixtura.means_, dtype=torch.float64),
+        torch.as_tensor(mixtura.covariances_, dtype=torch.float64),
+        _PUNTOS,
+    )
+
+    assert torch.allclose(obtenida, con_tiempo, rtol=1e-10, atol=1e-12)
+    assert float((obtenida - sin_tiempo).abs().max()) > 1.0
+
+
+def test_un_peso_nulo_no_contamina_la_log_densidad():
+    """``log 0 = -inf`` entra a ``logsumexp`` sin producir ``nan``: no hace falta recortarlo.
+
+    Discrimina la versión que le pone un piso a los pesos: con un piso, la componente de
+    peso cero seguiría aportando densidad y el resultado no coincidiría con el de la mixtura
+    de una sola componente.
+    """
+    media_viva = [[2.0, -1.0]]
+    cov_viva = [_diagonal(0.25, 0.04).tolist()]
+    con_muerta = ExactGaussianMixture(
+        2,
+        weights=[0.0, 1.0],
+        means=[[-1.5, 0.5]] + media_viva,
+        covariances=[_rotada(1.0, 0.09, math.pi / 3).tolist()] + cov_viva,
+        seed=0,
+    )
+    sola = ExactGaussianMixture(
+        2, weights=[1.0], means=media_viva, covariances=cov_viva, seed=0
+    )
+    t = _tiempo(0.2, _PUNTOS.shape[0])
+
+    obtenida = MixtureOracle(con_muerta, make_sde("vp")).log_prob(_PUNTOS, t)
+    esperada = MixtureOracle(sola, make_sde("vp")).log_prob(_PUNTOS, t)
+
+    assert torch.isfinite(obtenida).all()
+    assert torch.allclose(obtenida, esperada, rtol=1e-12, atol=1e-14)
+
+
+def test_llamadas_repetidas_dan_el_mismo_valor():
+    """El oráculo no tiene estado mutable: la evaluación es pura."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("sub_vp"))
+    t = _tiempo(0.6, _PUNTOS.shape[0])
+    primera = oraculo.log_prob(_PUNTOS, t)
+    assert torch.equal(primera, oraculo.log_prob(_PUNTOS, t))
+
+
+# --------------------------- oráculo: la log-densidad es derivable respecto del estado
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_gradiente_de_la_log_densidad_atraviesa_el_oraculo(nombre: str):
+    """La log-densidad se arma con operaciones tensoriales, sin cortes de grafo.
+
+    Es la adyacencia declarada con la spec de métricas, que necesita ``d/dx log p_t``. Un
+    ``.item()``, un desvío por numpy o un ``no_grad()`` interno romperían el grafo y este
+    test fallaría con ``RuntimeError``.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    x = _PUNTOS.clone().requires_grad_(True)
+
+    log_densidad = oraculo.log_prob(x, _tiempo(0.3, _PUNTOS.shape[0]))
+    (gradiente,) = torch.autograd.grad(log_densidad.sum(), x)
+
+    assert gradiente.shape == x.shape
+    assert torch.isfinite(gradiente).all()
+    assert float(gradiente.abs().max()) > 0.0
+
+
+def test_el_gradiente_fluye_tambien_desde_un_estado_en_precision_simple():
+    """No se pierde el grafo al promover el estado a doble precisión."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    x = _PUNTOS.to(torch.float32).clone().requires_grad_(True)
+
+    log_densidad = oraculo.log_prob(x, _tiempo(0.3, _PUNTOS.shape[0]))
+    (gradiente,) = torch.autograd.grad(log_densidad.sum(), x)
+
+    assert gradiente.dtype is torch.float32
+    assert torch.isfinite(gradiente).all()
+
+
+def test_la_traza_del_jacobiano_por_dos_backward_es_finita():
+    """Dos pasadas hacia atrás sobre la log-densidad: lo que pide la log-verosimilitud.
+
+    Verifica que la log-densidad es dos veces derivable respecto del estado, que es la forma
+    en la que la spec de métricas piensa calcular la traza exacta del jacobiano.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("ve"))
+    x = _PUNTOS.clone().requires_grad_(True)
+
+    log_densidad = oraculo.log_prob(x, _tiempo(0.4, _PUNTOS.shape[0]))
+    (gradiente,) = torch.autograd.grad(log_densidad.sum(), x, create_graph=True)
+    traza = torch.zeros(x.shape[0], dtype=torch.float64)
+    for eje in range(2):
+        (segunda,) = torch.autograd.grad(gradiente[:, eje].sum(), x, retain_graph=True)
+        traza = traza + segunda[:, eje]
+
+    assert torch.isfinite(traza).all()
+
+
+def _mixtura_de_una_componente() -> ExactGaussianMixture:
+    """Mixtura degenerada ``K = 1``: una sola gaussiana anisotrópica de media conocida."""
+    return ExactGaussianMixture(
+        2,
+        weights=[1.0],
+        means=[[0.3, -0.2]],
+        covariances=[_diagonal(0.25, 0.04).tolist()],
+        seed=0,
+    )
+
+
+def test_con_una_sola_componente_la_traza_del_jacobiano_es_menos_la_traza_de_la_precision():
+    """Fuente independiente de la segunda derivada: con ``K = 1`` el hessiano es ``-Sigma(t)⁻¹``.
+
+    La traza esperada se escribe a mano con ``math`` a partir de la forma cerrada de
+    ``alpha_t`` y ``sigma_t``, así que el test cruza la log-densidad de la producción contra
+    una identidad analítica que no depende de ella.
+    """
+    oraculo = MixtureOracle(_mixtura_de_una_componente(), make_sde("vp"))
+    valor = 0.3
+    x = torch.tensor([[0.5, 0.1], [-1.0, 2.0]], dtype=torch.float64, requires_grad=True)
+
+    log_densidad = oraculo.log_prob(x, _tiempo(valor, 2))
+    (gradiente,) = torch.autograd.grad(log_densidad.sum(), x, create_graph=True)
+    traza = torch.zeros(2, dtype=torch.float64)
+    for eje in range(2):
+        (segunda,) = torch.autograd.grad(gradiente[:, eje].sum(), x, retain_graph=True)
+        traza = traza + segunda[:, eje]
+
+    a, s = _alpha_sigma_cerrados("vp", valor)
+    esperada = -(1.0 / (a**2 * 0.25 + s**2) + 1.0 / (a**2 * 0.04 + s**2))
+    assert torch.allclose(
+        traza, torch.full((2,), esperada, dtype=torch.float64), rtol=1e-9
+    )
+
+
+# --------------------------------- oráculo: contrato de formas y precisión de salida
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("metodo", ["log_prob", "prob"])
+def test_devuelve_un_valor_por_punto_en_la_precision_del_caller(
+    dtype: "torch.dtype", metodo: str
+):
+    """Un valor por punto, en el dtype con el que llega el estado."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    x = _PUNTOS.to(dtype)
+    t = _tiempo(0.3, x.shape[0]).to(dtype)
+
+    salida = getattr(oraculo, metodo)(x, t)
+
+    assert salida.shape == (x.shape[0],)
+    assert salida.dtype is dtype
+
+
+def test_el_resultado_en_simple_precision_coincide_con_el_de_doble():
+    """La degradación es solo de salida: el valor es el mismo dentro del ruido de ``float32``."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    t = _tiempo(0.3, _PUNTOS.shape[0])
+
+    doble = oraculo.log_prob(_PUNTOS, t)
+    simple = oraculo.log_prob(_PUNTOS.to(torch.float32), t.to(torch.float32))
+
+    assert torch.allclose(simple.to(torch.float64), doble, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("metodo", ["log_prob", "prob"])
+@pytest.mark.parametrize(
+    "malo",
+    [
+        torch.zeros(3, dtype=torch.float64),
+        torch.zeros(3, 3, dtype=torch.float64),
+        torch.zeros(0, 2, dtype=torch.float64),
+        torch.zeros(2, 2, 2, dtype=torch.float64),
+    ],
+)
+def test_rechaza_un_estado_con_forma_invalida(metodo: str, malo: "torch.Tensor"):
+    """El estado del laboratorio 2D es ``(B, 2)`` con ``B >= 1``."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^x debe"):
+        getattr(oraculo, metodo)(malo, _tiempo(0.3, max(1, malo.shape[0])))
+
+
+def test_rechaza_un_estado_que_no_es_tensor():
+    """El contrato del proyecto es tensorial."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^x debe"):
+        oraculo.log_prob([[0.0, 0.0]], _tiempo(0.3, 1))  # type: ignore[arg-type]
+
+
+def test_rechaza_un_estado_que_no_es_de_punto_flotante():
+    """Un estado entero no es un punto del plano: se avisa en lugar de truncar en silencio."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^x debe"):
+        oraculo.log_prob(torch.zeros(2, 2, dtype=torch.int64), _tiempo(0.3, 2))
+
+
+def test_rechaza_un_tiempo_con_un_lote_distinto_al_del_estado():
+    """Un tiempo por punto: si los lotes no coinciden, el broadcast silencioso sería peor."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        oraculo.log_prob(_PUNTOS, _tiempo(0.3, _PUNTOS.shape[0] - 1))
+
+
+@pytest.mark.parametrize("metodo", ["log_prob", "prob"])
+def test_rechaza_un_tiempo_negativo_al_evaluar_la_densidad(metodo: str):
+    """La validación de tiempo del módulo también protege a la densidad."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        getattr(oraculo, metodo)(_PUNTOS, _tiempo(-0.1, _PUNTOS.shape[0]))
+
+
+# ------------------------------------------------- oráculo: masa integrada (3.6)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+@pytest.mark.parametrize("valor", [1e-4, 0.1, 1.0])
+def test_la_masa_integrada_da_uno(nombre: str, valor: float):
+    """Criterio 3.6: la densidad integra a uno sobre el plano, en las tres SDEs.
+
+    Tolerancia: ``1e-8`` absoluto. La malla adaptativa cubre ocho desvíos con seis nodos por
+    desvío y la suma de Riemann sobre gaussianas converge espectralmente, así que el error
+    queda en el ruido de la doble precisión (el prototipo de la spec midió ``1.00000000``
+    incluso con ``sigma_t ≈ 1e-5``). Cualquier normalización equivocada —perder el ``2 pi``,
+    olvidar la raíz del determinante, no pesar las componentes— se aparta en decenas de por
+    ciento.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    assert oraculo.total_mass(valor) == pytest.approx(1.0, abs=1e-8)
+
+
+def test_la_masa_integrada_da_uno_en_el_tiempo_cero():
+    """El extremo del horizonte: con ``t = 0`` la densidad es ``p_0`` y también integra a uno."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    assert oraculo.total_mass(0.0) == pytest.approx(1.0, abs=1e-8)
+
+
+def test_la_masa_integrada_de_una_sola_componente_da_uno():
+    """Caso ``K = 1``: la normalización gaussiana no depende de la mixtura."""
+    oraculo = MixtureOracle(_mixtura_de_una_componente(), make_sde("sub_vp"))
+    assert oraculo.total_mass(0.25) == pytest.approx(1.0, abs=1e-8)
+
+
+def test_la_masa_integrada_centra_la_malla_en_las_medias_contraidas():
+    """La malla se centra en ``alpha_t mu_k``, no en las medias de los datos.
+
+    Con los modos a ``±3000`` y VP en el horizonte, el factor de contracción vale
+    ``0.0066``: la densidad vive a menos de treinta unidades del origen y la malla
+    automática la resuelve con 334 nodos. Una malla centrada en las medias **sin** contraer
+    tendría que cubrir ``±3008`` con el mismo paso, se choca contra el tope de puntos y
+    pierde masa. El test fija las dos caras, así que es la que le da dientes al ``alpha_t``
+    del dimensionado.
+    """
+    cov = _diagonal(0.25, 0.04).tolist()
+    lejana = ExactGaussianMixture(
+        2,
+        weights=[0.4, 0.6],
+        means=[[-3000.0, 0.0], [3000.0, 1.0]],
+        covariances=[cov, cov],
+        seed=0,
+    )
+    oraculo = MixtureOracle(lejana, make_sde("vp"))
+    t = torch.tensor([1.0], dtype=torch.float64)
+    sin_contraer = auto_grid(
+        means=torch.as_tensor(lejana.means_, dtype=torch.float64),
+        covariances=oraculo.component_covariances(t)[0],
+    )
+
+    assert sin_contraer.truncated
+    assert oraculo.total_mass(1.0) == pytest.approx(1.0, abs=1e-8)
+    assert oraculo.total_mass(1.0, grid=sin_contraer) != pytest.approx(1.0, abs=1e-8)
+
+
+def test_la_masa_integrada_dimensiona_la_malla_con_las_covarianzas_en_el_tiempo():
+    """La malla usada por defecto es la que la cuadratura deriva de ``Sigma_k(t)``.
+
+    Se reconstruye con ``auto_grid`` a partir de los parámetros que publica el oráculo y se
+    exige el mismo número, así que dimensionar la malla de otra forma (por ``Sigma_k`` sin
+    tiempo, o por ``sigma_t``) cambiaría el resultado.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("ve"))
+    valor = 0.7
+    t = torch.tensor([valor], dtype=torch.float64)
+    alpha, _ = oraculo.marginal_params(t)
+    medias = float(alpha[0, 0]) * torch.as_tensor(
+        mixtura.means_, dtype=torch.float64
+    )
+    grid = auto_grid(means=medias, covariances=oraculo.component_covariances(t)[0])
+
+    assert oraculo.total_mass(valor, grid=grid) == pytest.approx(
+        oraculo.total_mass(valor), rel=1e-12
+    )
+
+
+def test_la_masa_integrada_sobre_una_malla_insuficiente_no_da_uno():
+    """La masa es el detector: sobre un dominio que no cubre la densidad, se pierde masa.
+
+    Le da dientes a la firma con malla explícita: si el argumento se ignorara y siempre se
+    usara la malla automática, este test daría uno.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    grid = QuadratureGrid(half_width=0.5, n_points=8)
+    assert oraculo.total_mass(0.1, grid=grid) < 0.5
+
+
+@pytest.mark.parametrize("valor", [-1e-3, float("nan"), float("inf")])
+def test_la_masa_integrada_rechaza_un_tiempo_invalido(valor: float):
+    """Mismo contrato de tiempo que el resto del módulo, con ``t`` escalar."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        oraculo.total_mass(valor)
+
+
+@pytest.mark.parametrize(
+    "malo", ["0.3", None, torch.tensor([0.3], dtype=torch.float64)]
+)
+def test_la_masa_integrada_rechaza_un_tiempo_que_no_es_un_numero(malo: object):
+    """``total_mass`` toma un tiempo escalar: cualquier otra cosa es un error del caller.
+
+    La cadena ``"0.3"`` es el caso con dientes: ``float("0.3")`` la convierte sin chistar, así
+    que una validación por conversión en lugar de por tipo la aceptaría en silencio.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        oraculo.total_mass(malo)  # type: ignore[arg-type]
