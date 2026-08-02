@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -2860,6 +2861,256 @@ def test_la_masa_reportada_es_la_de_la_misma_malla_que_el_valor():
 
     assert oraculo.total_mass(1.0, grid=automatica) != oraculo.total_mass(1.0, grid=fina)
     assert reporte.mass == oraculo.total_mass(1.0, grid=fina)
+
+
+# ------- oráculo: tendencias del sesgo y degradación de la cuadratura (6.4, 6.8, 6.9)
+
+
+#: Variantes que **contraen la media** hacia el origen (``alpha_t`` decreciente): son las
+#: únicas de las que el criterio 6.8 pide monotonía frente al horizonte. VE queda afuera a
+#: propósito, porque su ``alpha_t`` es constantemente uno y su tendencia es la del 6.9.
+_SDES_QUE_CONTRAEN_LA_MEDIA = ["vp", "sub_vp"]
+
+#: Horizontes crecientes del barrido de monotonía. Cuatro puntos alcanzan para fijar el
+#: sentido de la tendencia (el criterio pide monotonía, no una ley de decaimiento) y dejan
+#: el barrido en décimas de segundo; un muestreo denso solo repetiría la misma información
+#: pagando cuadraturas de más.
+_HORIZONTES_CRECIENTES = (0.1, 0.3, 0.6, 1.0)
+
+#: Escalas de ruido máximo con las que se construyen las VE del barrido del criterio 6.9.
+#: Arrancan **por debajo** de la escala de los datos de la mixtura de prueba (medias de
+#: módulo ``1.6`` y ``2.2``) y terminan una década por encima, así que el barrido cubre el
+#: régimen en el que el ruido todavía no domina —donde el sesgo tiene que seguir siendo
+#: visible— y el tramo en el que empieza a dominar. No se estira más arriba porque con
+#: ``sigma_max = 50`` el sesgo (``2.4e-4``) ya cae al orden de la tolerancia de la
+#: cuadratura y la comparación dejaría de ser significativa.
+_SIGMA_MAX_CRECIENTES = (2.0, 5.0, 10.0, 20.0)
+
+#: Horizontes en los que se comprueba la saturación de la cota con una sola componente.
+#: VE se evalúa **solo en el horizonte**: en tiempos intermedios su ``sigma_t`` es chico
+#: frente al desvío ``5`` del prior que ensancha el dominio, así que la malla automática se
+#: vuelve enorme y cada cuadratura cuesta segundos en vez de centésimas.
+_HORIZONTES_DE_SATURACION = {
+    "vp": (0.2, 0.5, 1.0),
+    "sub_vp": (0.2, 0.5, 1.0),
+    "ve": (1.0,),
+}
+
+#: Autovalores de la componente con la que se fuerza una malla insuficiente: anisotropía
+#: ``1e6``, es decir la dirección angosta con desvío ``1e-3``.
+#:
+#: El valor no es arbitrario. Las dos señales de degradación **no disparan juntas**: con el
+#: tope de ``4096`` nodos por eje la malla ya queda marcada como truncada con
+#: ``lambda_min = 1e-4`` (2.56 nodos por desvío) mientras la masa sigue dando uno con error
+#: ``2e-15``, porque las sumas de Riemann sobre gaussianas convergen espectralmente y
+#: aguantan mallas groseras; la masa recién se aparta en ``1e-5`` (``5e-6``) y se derrumba en
+#: ``1e-6`` (``0.462``). Para que el truncamiento **y** la pérdida de masa coincidan en el
+#: mismo caso —que es lo que hace fallar al sesgo por la ruta automática— hace falta
+#: ``lambda_min <= 1e-6``.
+_LAMBDA_MAYOR_ANGOSTA, _LAMBDA_MENOR_ANGOSTA = 1.0, 1e-6
+
+
+def _mixtura_de_anisotropia_extrema() -> ExactGaussianMixture:
+    """Mixtura de una componente con anisotropía ``1e6``, centrada en el origen.
+
+    Los autovalores se escriben acá directamente (``1.0`` y ``1e-6``) en lugar de pedirlos por
+    la palanca ``anisotropy`` de los constructores de geometría: lo que este caso necesita
+    fijar es el **autovalor menor**, que es lo que dimensiona el paso de la malla, y con la
+    palanca habría que despejarlo de la escala global. Una sola componente, además, porque el
+    caso ya cuesta una cuadratura de dieciséis millones de nodos y cada componente extra la
+    encarece sin agregar nada a la afirmación.
+    """
+    return ExactGaussianMixture(
+        2,
+        weights=[1.0],
+        means=[[0.0, 0.0]],
+        covariances=[_diagonal(_LAMBDA_MAYOR_ANGOSTA, _LAMBDA_MENOR_ANGOSTA).tolist()],
+        seed=0,
+    )
+
+
+def _alpha_en(oraculo: MixtureOracle, t: float) -> float:
+    """``alpha_t`` leído del contrato marginal que publica el oráculo."""
+    alpha, _ = oraculo.marginal_params(torch.tensor([t], dtype=torch.float64))
+    return float(alpha[0, 0])
+
+
+@pytest.mark.parametrize("nombre", _SDES_QUE_CONTRAEN_LA_MEDIA)
+def test_el_sesgo_decrece_al_crecer_el_horizonte_en_las_que_contraen_la_media(
+    nombre: str,
+):
+    """Criterio 6.8: con la media contrayéndose, el sesgo cae al alargar el horizonte.
+
+    Es la lectura cualitativa que el trabajo quiere poder afirmar con un número: cuanto más
+    tiempo corre el forward, más se parece ``p_t`` al ruido de partida. Los asserts son
+    **direccionales** —cada término tiene que ser estrictamente menor que el anterior, no
+    solo distinto—, así que invertir el sentido de la dependencia con el horizonte rompe el
+    test en lugar de pasarlo de casualidad.
+
+    Se fija la tendencia de las **dos** mitades del reporte (la cota, que es aritmética
+    sobre los parámetros, y el valor, que sale de la cuadratura) porque decaen por el mismo
+    motivo y una sola no distinguiría un decaimiento real de una malla que se degrada. Y se
+    fija además la causa: ``alpha_t`` decreciente. La caída medida es de cuatro o cinco
+    órdenes de magnitud entre ``t = 0.1`` y el horizonte, así que el margen sobra sobre la
+    tolerancia de la cuadratura (``1e-4``).
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+
+    reportes = [
+        oraculo.initialization_bias(_VARIANZA_DEL_PRIOR[nombre], t=t)
+        for t in _HORIZONTES_CRECIENTES
+    ]
+
+    valores = [r.value for r in reportes]
+    cotas = [r.bound for r in reportes]
+    alphas = [_alpha_en(oraculo, t) for t in _HORIZONTES_CRECIENTES]
+    for i in range(len(_HORIZONTES_CRECIENTES) - 1):
+        assert alphas[i + 1] < alphas[i], f"alpha_t no contrae la media: {alphas}"
+        assert valores[i + 1] < valores[i], f"el valor no decrece: {valores}"
+        assert cotas[i + 1] < cotas[i], f"la cota no decrece: {cotas}"
+    assert valores[0] > 1e3 * valores[-1]
+
+
+def test_el_sesgo_de_la_que_solo_agranda_la_varianza_persiste_en_el_horizonte():
+    """Criterio 6.9: VE llega al horizonte con un sesgo que **no** se apagó.
+
+    VE no contrae la media (``alpha_T`` es exactamente uno), así que en el horizonte su
+    ``p_T`` sigue teniendo las medias de los datos donde estaban y solo las tapó con ruido
+    de desvío ``sigma_max = 5``: con datos de escala ``2`` eso no alcanza para que ``p_T``
+    sea el prior, y el sesgo queda tres órdenes de magnitud por encima del de VP en el mismo
+    horizonte (``2.8e-2`` contra ``2.6e-5``). El contraste es la afirmación: no es que VE sea
+    "peor", es que su sesgo **persiste** mientras el de VP ya se apagó (el de VP, medido, cae
+    por debajo de la propia tolerancia de su cuadratura). Que el de VE supere a su tolerancia
+    por un factor de ``290`` es lo que hace la persistencia medible y no ruido numérico.
+    """
+    mixtura = _mixtura_exacta()
+    solo_varianza = MixtureOracle(mixtura, make_sde("ve"))
+    contrae = MixtureOracle(mixtura, make_sde("vp"))
+
+    reporte_ve = solo_varianza.initialization_bias(_VARIANZA_DEL_PRIOR["ve"])
+    reporte_vp = contrae.initialization_bias(_VARIANZA_DEL_PRIOR["vp"])
+
+    assert _alpha_en(solo_varianza, reporte_ve.horizon) == 1.0
+    assert _alpha_en(contrae, reporte_vp.horizon) < 1e-2
+    assert reporte_ve.value > 10.0 * reporte_ve.tolerance
+    assert reporte_ve.value > 100.0 * reporte_vp.value
+
+
+def test_el_sesgo_de_la_que_solo_agranda_la_varianza_cae_al_crecer_su_ruido_maximo():
+    """Criterio 6.9: el sesgo de VE decrece a medida que su escala de ruido crece.
+
+    La otra mitad del criterio: el sesgo persiste *mientras* el ruido no domine, y la forma
+    de comprobar que eso es lo que lo sostiene es hacerlo dominar. Se construyen VE con
+    ``sigma_max`` creciente y se le pasa a cada una la varianza de **su** prior
+    (``sigma_max²``), que es lo único que hace comparable la secuencia. Los asserts son
+    direccionales y se le pide además a cada término quedar por encima de la tolerancia de
+    su cuadratura, así que la caída no puede confundirse con la secuencia hundiéndose en el
+    ruido numérico (el término más chico la supera por un factor de ``14``).
+    """
+    mixtura = _mixtura_exacta()
+
+    reportes = [
+        MixtureOracle(mixtura, make_sde("ve", sigma_max=sigma_max)).initialization_bias(
+            sigma_max**2
+        )
+        for sigma_max in _SIGMA_MAX_CRECIENTES
+    ]
+
+    valores = [r.value for r in reportes]
+    cotas = [r.bound for r in reportes]
+    for reporte in reportes:
+        assert reporte.value > reporte.tolerance
+    for i in range(len(_SIGMA_MAX_CRECIENTES) - 1):
+        assert valores[i + 1] < valores[i], f"el valor no decrece: {valores}"
+        assert cotas[i + 1] < cotas[i], f"la cota no decrece: {cotas}"
+
+
+def test_la_tendencia_del_ruido_creciente_exige_la_varianza_del_prior_de_cada_sde():
+    """La tendencia del 6.9 compara contra ``N(0, sigma_max² I)``, no contra ``N(0, I)``.
+
+    ``prior_variance`` es un dato del llamador y el oráculo lo toma tal cual: si al barrido
+    de ``sigma_max`` se le pasara la varianza unitaria de VP, la secuencia no solo dejaría de
+    decrecer sino que **crecería** monótonamente (``3.7`` → ``395``), porque cada VE se estaría
+    comparando contra un prior mucho más angosto que el suyo. El test fija esa inversión para
+    que el barrido de arriba no pueda "arreglarse" pasándole la varianza equivocada: las dos
+    tendencias son incompatibles y solo una de las dos lecturas puede estar en verde.
+    """
+    mixtura = _mixtura_exacta()
+
+    valores = [
+        MixtureOracle(mixtura, make_sde("ve", sigma_max=sigma_max))
+        .initialization_bias(_VARIANZA_DEL_PRIOR["vp"])
+        .value
+        for sigma_max in _SIGMA_MAX_CRECIENTES
+    ]
+
+    for i in range(len(_SIGMA_MAX_CRECIENTES) - 1):
+        assert valores[i + 1] > valores[i], f"la secuencia equivocada no crece: {valores}"
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_con_una_sola_componente_la_cota_iguala_al_valor_en_todo_el_horizonte(
+    nombre: str,
+):
+    """Criterio 6.4: sin entropía de mezcla que acotar, la cota **es** la divergencia.
+
+    Con ``K = 1`` la desigualdad de convexidad no acota nada: los dos lados son la misma KL
+    gaussiana-gaussiana, que sí tiene forma cerrada, así que la cota y el valor tienen que
+    coincidir en **todo** el horizonte y no solo en un instante afortunado. El acuerdo medido
+    es de ``2e-12`` relativo en el peor punto —el residuo de la cuadratura, no una
+    coincidencia—, y se compara contra la tolerancia que el propio reporte declara.
+
+    El segundo assert es lo que hace informativa a la igualdad: en la mixtura de dos
+    componentes la brecha es real (la cota queda entre ``1.4`` y ``3.5`` veces el valor), así
+    que la coincidencia con ``K = 1`` no puede explicarse por una cota que devuelva el valor
+    de la cuadratura.
+    """
+    varianza = _VARIANZA_DEL_PRIOR[nombre]
+    una_componente = MixtureOracle(_mixtura_de_una_componente(), make_sde(nombre))
+    dos_componentes = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+
+    for t in _HORIZONTES_DE_SATURACION[nombre]:
+        saturada = una_componente.initialization_bias(varianza, t=t)
+        con_brecha = dos_componentes.initialization_bias(varianza, t=t)
+
+        assert saturada.bound == pytest.approx(saturada.value, rel=1e-9)
+        assert abs(saturada.bound - saturada.value) <= saturada.tolerance
+        assert con_brecha.bound > 1.2 * con_brecha.value
+
+
+def test_una_anisotropia_alta_marca_la_malla_y_hace_fallar_el_sesgo():
+    """Malla insuficiente: la degradación se delata y el sesgo se niega a devolver un número.
+
+    Es el caso que el barrido de anisotropía del laboratorio 2D va a pisar: con la dirección
+    angosta de desvío ``1e-3`` la malla automática necesitaría ``96000`` nodos por eje, el
+    tope de ``4096`` la recorta a ``0.26`` nodos por desvío y la suma de Riemann se queda con
+    menos de la mitad de la masa. Las tres señales que el diseño pide quedan fijadas: la
+    malla marcada como truncada, la masa apartada de uno, y ``initialization_bias``
+    levantando en lugar de devolver un número que viajaría con la misma pinta que uno bueno.
+
+    Se evalúa en ``t = 0``, donde el kernel no agrega nada y la covarianza integrada es la de
+    los datos: así la anisotropía que rompe la malla es exactamente la declarada y no una que
+    dependa del schedule. La masa se lee del mensaje de la excepción a propósito, para no
+    pagar una segunda cuadratura de dieciséis millones de nodos.
+    """
+    angosta = _mixtura_de_anisotropia_extrema()
+    oraculo = MixtureOracle(angosta, make_sde("vp"))
+    covarianzas = torch.as_tensor(angosta.covariances_, dtype=torch.float64)
+    autovalores = torch.linalg.eigvalsh(covarianzas)
+    malla = auto_grid(
+        means=torch.as_tensor(angosta.means_, dtype=torch.float64),
+        covariances=covarianzas,
+        prior_std=1.0,
+    )
+    assert float(autovalores.max() / autovalores.min()) == pytest.approx(1e6, rel=1e-9)
+    assert malla.truncated
+
+    with pytest.raises(ValueError, match=r"^la masa integrada") as excepcion:
+        oraculo.initialization_bias(1.0, t=0.0)
+
+    reportada = re.match(r"la masa integrada dio (\S+) ", str(excepcion.value))
+    assert reportada is not None, str(excepcion.value)
+    assert abs(float(reportada.group(1)) - 1.0) > 0.5
 
 
 # --------------- oráculo: verificación contra fuentes externas (7.1, 7.2, 7.3, 7.4)
