@@ -2860,3 +2860,509 @@ def test_la_masa_reportada_es_la_de_la_misma_malla_que_el_valor():
 
     assert oraculo.total_mass(1.0, grid=automatica) != oraculo.total_mass(1.0, grid=fina)
     assert reporte.mass == oraculo.total_mass(1.0, grid=fina)
+
+
+# --------------- oráculo: verificación contra fuentes externas (7.1, 7.2, 7.3, 7.4)
+
+
+#: Tiempos de la verificación independiente: el **mínimo admitido** (``t = 0``, donde VP y
+#: sub-VP no ruidean nada y VE se queda en el piso ``sigma_min`` de su schedule), el régimen
+#: casi singular, dos intermedios y el **horizonte** (criterio 7.4).
+_TIEMPOS_VERIFICACION = [0.0, 1e-4, 0.05, 0.5, 1.0]
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_los_tiempos_verificados_son_los_extremos_del_horizonte(nombre: str):
+    """Criterio 7.4: los extremos que barren estos tests son los del horizonte de verdad.
+
+    Fija las dos puntas para que la parametrización no se despegue del proceso sin que nadie
+    se entere: el tiempo final es el ``T`` que publica la SDE, y el mínimo es ``0`` porque es
+    el borde de lo admitido —el oráculo lo acepta y rechaza cualquier cosa por debajo—.
+    """
+    sde = make_sde(nombre)
+    oraculo = MixtureOracle(_mixtura_exacta(), sde)
+
+    assert max(_TIEMPOS_VERIFICACION) == sde.T
+    assert min(_TIEMPOS_VERIFICACION) == 0.0
+    assert torch.isfinite(oraculo.log_prob(_PUNTOS, _tiempo(0.0, _PUNTOS.shape[0]))).all()
+    with pytest.raises(ValueError, match=r"^t debe ser finito y no negativo"):
+        oraculo.log_prob(_PUNTOS, _tiempo(-1e-12, _PUNTOS.shape[0]))
+
+
+# ------------------------------------------- diferencias finitas de la log-densidad (7.2)
+
+
+#: Paso de las diferencias centradas, en unidades de la escala local de la densidad.
+#:
+#: Es el compromiso clásico del método: la truncación del esquema centrado va como
+#: ``h²·|∂³ log p|`` y el redondeo como ``eps·|log p|/h``, así que el óptimo cae cerca de
+#: ``h ≈ L·eps^{1/3} ≈ 6e-6·L`` con ``L`` la escala de longitud de la densidad y ``eps`` el
+#: épsilon de la doble precisión. Se toma ``1e-5·L``, del mismo orden que el óptimo y **atado
+#: a la escala local**, que es lo que mantiene el paso sensato tanto en el horizonte (``L ≈ 5``
+#: en VE) como en el régimen casi singular (``L ≈ 1e-3`` en sub-VP con ``t = 1e-4``).
+_PASO_RELATIVO = 1e-5
+
+#: Tolerancia **relativa** de las diferencias centradas, medida contra el mayor score del lote.
+#:
+#: Relativa y no absoluta porque el score exacto crece como ``1/sigma_t²`` cuando el tiempo
+#: baja: en las corridas de calibración su magnitud va de ``0.15`` (VE en el horizonte) a
+#: ``2e3`` (sub-VP con componentes angostas y ``t = 1e-4``), así que un ``atol`` único sería
+#: laxísimo en un extremo e imposible en el otro. El acuerdo observado con este paso es de
+#: ``1e-10`` relativo en la mixtura moderada y ``7e-10`` en la angosta —el residuo esperable
+#: del método, contra el ``1e-15`` que da autograd—, así que ``1e-7`` deja unos dos órdenes de
+#: margen y sigue siendo discriminante: cualquier error estructural del score se aparta en
+#: porcentajes, no en partes por diez millones.
+_RTOL_DIFERENCIAS = 1e-7
+
+
+def _escala_local(oraculo: MixtureOracle, t: float) -> float:
+    """Escala de longitud de ``p_t``: el desvío de la dirección más angosta de la mixtura.
+
+    Es ``min_k sqrt(lambda_min(Sigma_k(t)))``, el mismo criterio con el que la cuadratura
+    dimensiona su paso, y lo que hace que el paso de las diferencias finitas sea del orden
+    correcto en todo el horizonte.
+    """
+    tt = torch.tensor([t], dtype=torch.float64)
+    autovalores = torch.linalg.eigvalsh(oraculo.component_covariances(tt))
+    return float(autovalores.min().sqrt())
+
+
+def _score_por_diferencias_centradas(
+    oraculo: MixtureOracle, x: "torch.Tensor", t: float, paso: float
+) -> "torch.Tensor":
+    """Gradiente de ``log p_t`` por diferencias centradas, coordenada por coordenada.
+
+    Es la fuente **externa** al score del criterio 7.2: no toca ``score`` ni autograd, solo
+    evalúa la log-densidad en ``x ± h e_j``.
+
+    Args:
+        oraculo: Oráculo cuya log-densidad se deriva numéricamente.
+        x: Puntos de evaluación, de forma ``(B, 2)``.
+        t: Tiempo escalar, el mismo para todas las filas.
+        paso: Paso ``h`` de la diferencia centrada.
+
+    Returns:
+        Tensor ``(B, 2)`` con el gradiente numérico.
+    """
+    tiempos = torch.full((x.shape[0],), t, dtype=x.dtype)
+    columnas = []
+    for eje in range(x.shape[1]):
+        desplazamiento = torch.zeros_like(x)
+        desplazamiento[:, eje] = paso
+        adelante = oraculo.log_prob(x + desplazamiento, tiempos)
+        atras = oraculo.log_prob(x - desplazamiento, tiempos)
+        columnas.append((adelante - atras) / (2.0 * paso))
+    return torch.stack(columnas, dim=1)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_score_coincide_con_las_diferencias_finitas_de_la_log_densidad(nombre: str):
+    """Criterios 4.6 y 7.2: el score contra el gradiente **numérico** de ``log p_t``.
+
+    Es una fuente distinta de la del test de autograd: ahí el gradiente lo produce el mismo
+    grafo de la log-densidad, acá sale de evaluarla en puntos desplazados, así que ninguna
+    derivada analítica interviene. Cubre las tres SDEs y los cinco tiempos del horizonte
+    —mínimo, casi singular, dos intermedios y final (7.4)—.
+
+    Tolerancia: ``_RTOL_DIFERENCIAS`` relativo al mayor score del lote, justificada en el
+    comentario de esa constante por el balance truncación/redondeo del esquema centrado.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+
+    for valor in _TIEMPOS_VERIFICACION:
+        paso = _PASO_RELATIVO * _escala_local(oraculo, valor)
+        exacto = oraculo.score(_PUNTOS, _tiempo(valor, _PUNTOS.shape[0]))
+        numerico = _score_por_diferencias_centradas(oraculo, _PUNTOS, valor, paso)
+
+        escala = float(exacto.abs().max())
+        error = float((numerico - exacto).abs().max())
+        assert error <= _RTOL_DIFERENCIAS * escala, (
+            f"{nombre} en t={valor}: las diferencias centradas (paso {paso:.3e}) se apartan "
+            f"{error:.3e} del score exacto, cuya magnitud máxima es {escala:.3e}"
+        )
+
+
+def _mixtura_de_componentes_angostas() -> ExactGaussianMixture:
+    """Dos modos casi puntuales: ``Sigma_k = 1e-6 I``, así que la escala la fija ``sigma_t``.
+
+    Es el régimen en el que el score explota como ``1/sigma_t²``: con ``t`` chico la
+    covarianza de los datos es despreciable frente al ruido del kernel, al contrario de lo que
+    pasa con la mixtura moderada, donde ``Sigma_k(t) → Sigma_k`` y el score queda acotado.
+    """
+    cov = _identidad(1e-6).tolist()
+    return ExactGaussianMixture(
+        2,
+        weights=[0.5, 0.5],
+        means=[[-0.5, 0.0], [0.5, 0.0]],
+        covariances=[cov, cov],
+        seed=0,
+    )
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_las_diferencias_finitas_cierran_donde_el_score_explota(nombre: str):
+    """Criterios 4.7 y 7.2: la verificación numérica también vale con ``sigma_t`` diminuto.
+
+    Con componentes de covarianza ``1e-6`` y tiempos de ``1e-4`` a ``1e-3`` el score llega a
+    ``2e3``, y el test exige explícitamente que la magnitud sea grande para que el régimen no
+    se pierda en silencio. El paso de las diferencias se encoge con la escala local, así que la
+    comparación **relativa** cierra igual de fino que en la mixtura moderada.
+    """
+    oraculo = MixtureOracle(_mixtura_de_componentes_angostas(), make_sde(nombre))
+    puntos = torch.tensor([[-0.5, 0.0], [0.0, 0.0], [0.4, 0.002]], dtype=torch.float64)
+
+    for valor in [1e-4, 1e-3]:
+        paso = _PASO_RELATIVO * _escala_local(oraculo, valor)
+        exacto = oraculo.score(puntos, _tiempo(valor, puntos.shape[0]))
+        numerico = _score_por_diferencias_centradas(oraculo, puntos, valor, paso)
+
+        escala = float(exacto.abs().max())
+        assert escala >= 10.0, f"{nombre} en t={valor}: el régimen singular no se activó"
+        error = float((numerico - exacto).abs().max())
+        assert error <= _RTOL_DIFERENCIAS * escala, (
+            f"{nombre} en t={valor}: las diferencias centradas (paso {paso:.3e}) se apartan "
+            f"{error:.3e} del score exacto, cuya magnitud máxima es {escala:.3e}"
+        )
+
+
+# ---------------------------------- una sola componente contra una segunda cuenta (7.1)
+
+
+#: Componente única de la verificación ``K = 1``: autovalores, ángulo y media conocidos.
+_K1_AUTOVALORES = (0.6, 0.05)
+_K1_ANGULO = math.pi / 5
+_K1_MEDIA = (0.3, -0.2)
+
+
+def _rotada_en_doble(a: float, b: float, angulo: float) -> "torch.Tensor":
+    """``diag(a, b)`` rotada, con la rotación armada en **doble** precisión.
+
+    Hace falta una variante propia porque :func:`_rotada` construye el seno y el coseno
+    pasando por ``torch.tensor(angulo)``, que es ``float32``: el ángulo efectivo de esa
+    covarianza se aparta del pedido en unos ``1e-8``. La verificación por base propia compara
+    contra un ángulo escrito con ``math``, así que necesita que los dos coincidan en doble
+    precisión; para el resto de la suite la diferencia es irrelevante.
+    """
+    coseno, seno = math.cos(angulo), math.sin(angulo)
+    rotacion = torch.tensor([[coseno, -seno], [seno, coseno]], dtype=torch.float64)
+    return rotacion @ _diagonal(a, b) @ rotacion.T
+
+
+def _mixtura_de_una_componente_rotada() -> ExactGaussianMixture:
+    """``K = 1`` con una componente **rotada**: la base propia no es la canónica.
+
+    La rotación es lo que le da valor a la referencia por base propia: con una covarianza
+    diagonal cualquier transposición o cruce de ejes pasaría desapercibido.
+    """
+    cov = _rotada_en_doble(_K1_AUTOVALORES[0], _K1_AUTOVALORES[1], _K1_ANGULO)
+    return ExactGaussianMixture(
+        2, weights=[1.0], means=[list(_K1_MEDIA)], covariances=[cov.tolist()], seed=0
+    )
+
+
+def _gaussiana_en_su_base_propia(
+    nombre: str, t: float, punto: tuple[float, float]
+) -> tuple[float, tuple[float, float]]:
+    """Log-densidad y score de una gaussiana 2D, derivados desde cero en su base propia.
+
+    Segunda implementación **independiente** del criterio 7.1: no reordena la fórmula de la
+    producción ni invierte ninguna matriz. Parte de que sumar ``sigma_t² I`` no mueve los
+    autovectores, así que ``Sigma(t) = R diag(alpha²lambda_1 + sigma², alpha²lambda_2 +
+    sigma²) Rᵀ``; en las coordenadas ``u = Rᵀ(x - alpha mu)`` la gaussiana **factoriza** en dos
+    normales unidimensionales independientes, de las que se escriben a mano la log-densidad
+    (suma de ``-½(log 2πv_i + u_i²/v_i)``) y la derivada (``-u_i/v_i``), y el score se rota de
+    vuelta con ``R``. Todo con ``math`` y floats de Python.
+
+    Args:
+        nombre: Variante de SDE, para leer ``alpha_t`` y ``sigma_t`` de la forma cerrada
+            escrita a mano en el test.
+        t: Tiempo en el que se evalúa.
+        punto: Punto ``(x, y)`` de evaluación.
+
+    Returns:
+        El par ``(log p_t, (score_x, score_y))``.
+    """
+    alpha, sigma = _alpha_sigma_cerrados(nombre, t)
+    coseno, seno = math.cos(_K1_ANGULO), math.sin(_K1_ANGULO)
+
+    dx = punto[0] - alpha * _K1_MEDIA[0]
+    dy = punto[1] - alpha * _K1_MEDIA[1]
+    # u = Rᵀ d: las coordenadas del punto en la base propia de la componente.
+    u1 = coseno * dx + seno * dy
+    u2 = -seno * dx + coseno * dy
+    v1 = alpha * alpha * _K1_AUTOVALORES[0] + sigma * sigma
+    v2 = alpha * alpha * _K1_AUTOVALORES[1] + sigma * sigma
+
+    log_densidad = -0.5 * (math.log(2.0 * math.pi * v1) + u1 * u1 / v1)
+    log_densidad += -0.5 * (math.log(2.0 * math.pi * v2) + u2 * u2 / v2)
+
+    # Derivada de cada normal 1D y vuelta a la base canónica: score = R (-u_i/v_i).
+    g1, g2 = -u1 / v1, -u2 / v2
+    return log_densidad, (coseno * g1 - seno * g2, seno * g1 + coseno * g2)
+
+
+#: Puntos de la verificación ``K = 1``: el origen, dos cercanos y uno de cola.
+_PUNTOS_K1 = [(0.0, 0.0), (0.5, 0.1), (-1.0, 2.0), (2.0, -1.5)]
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_con_una_sola_componente_la_log_densidad_es_el_producto_de_dos_normales(nombre: str):
+    """Criterio 7.1: ``log p_t`` con ``K = 1`` contra la cuenta hecha en la base propia.
+
+    Tolerancia: ``rtol=1e-12`` sobre log-densidades de hasta ~65 (unos ``7e-11`` absolutos).
+    Las dos cuentas son de doble precisión pero recorren caminos distintos —forma cerrada 2×2
+    contra dos normales 1D rotadas—, y el desacuerdo observado es de ``4e-14``, así que la
+    tolerancia deja tres órdenes de margen sobre el redondeo y queda muy por debajo de
+    cualquier error estructural.
+    """
+    oraculo = MixtureOracle(_mixtura_de_una_componente_rotada(), make_sde(nombre))
+    x = torch.tensor(_PUNTOS_K1, dtype=torch.float64)
+
+    for valor in _TIEMPOS_VERIFICACION:
+        esperada = torch.tensor(
+            [_gaussiana_en_su_base_propia(nombre, valor, p)[0] for p in _PUNTOS_K1],
+            dtype=torch.float64,
+        )
+        obtenida = oraculo.log_prob(x, _tiempo(valor, x.shape[0]))
+        assert torch.allclose(obtenida, esperada, rtol=1e-12, atol=1e-13)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_con_una_sola_componente_el_score_sale_de_dos_normales_rotadas(nombre: str):
+    """Criterio 7.1: el score con ``K = 1`` contra la derivada hecha en la base propia.
+
+    La referencia deriva cada normal 1D por separado y rota el resultado, así que no comparte
+    con la producción ni la inversa de ``Sigma(t)`` ni su determinante.
+
+    Tolerancia: ``rtol=1e-12`` sobre magnitudes de hasta ~41 (unos ``4e-11`` absolutos), contra
+    un desacuerdo observado de ``3e-14``. Cubre el mínimo del horizonte y el tiempo final
+    además de los intermedios (7.4).
+    """
+    oraculo = MixtureOracle(_mixtura_de_una_componente_rotada(), make_sde(nombre))
+    x = torch.tensor(_PUNTOS_K1, dtype=torch.float64)
+
+    for valor in _TIEMPOS_VERIFICACION:
+        esperado = torch.tensor(
+            [list(_gaussiana_en_su_base_propia(nombre, valor, p)[1]) for p in _PUNTOS_K1],
+            dtype=torch.float64,
+        )
+        obtenido = oraculo.score(x, _tiempo(valor, x.shape[0]))
+        assert obtenido.shape == x.shape
+        assert torch.allclose(obtenido, esperado, rtol=1e-12, atol=1e-13)
+
+
+def _score_marginal_isotropico(sde: ForwardSDE, mu: "torch.Tensor", sigma0: float):
+    """El score analítico de ``N(mu, sigma0² I)`` tal como lo escribe la suite de samplers.
+
+    Réplica del helper que la suite del Eje 2 ya usa para validar los cuatro samplers sobre
+    las tres SDEs: lee ``alpha_t`` y ``sigma_t`` del contrato marginal sondeándolo con un
+    vector de unos y devuelve ``-(x - alpha_t mu) / (alpha_t² sigma0² + sigma_t²)``. Se
+    reescribe acá para no importar otra suite, y es isótropo: el denominador es un escalar por
+    muestra.
+    """
+
+    def score(x: "torch.Tensor", t: "torch.Tensor") -> "torch.Tensor":
+        unos = torch.ones(1, mu.shape[0], dtype=x.dtype)
+        media_alpha, sigma_t = sde.marginal_prob(unos, t)
+        alpha_t = media_alpha[:, :1]
+        varianza_t = alpha_t**2 * sigma0**2 + sigma_t**2
+        return -(x - alpha_t * mu) / varianza_t
+
+    return score
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_con_una_sola_componente_el_score_coincide_con_el_de_la_suite_de_samplers(
+    nombre: str,
+):
+    """Criterio 7.1 al pie de la letra: coincidir con el score gaussiano ya validado.
+
+    El helper de la suite de samplers es el score contra el que se verificaron las doce celdas
+    del Eje 2, así que hacer coincidir el oráculo con él es lo que permite reemplazar la red
+    por el oráculo y seguir midiendo lo mismo. Se usa la misma gaussiana isótropa de esa suite
+    (``mu = (1.5, -1)``, ``sigma0 = 0.5``).
+
+    Tolerancia: ``rtol=1e-12``; el desacuerdo observado es de ``2e-15``, es decir redondeo de
+    doble precisión, porque las dos cuentas son la misma matemática por caminos distintos.
+    """
+    mu = torch.tensor([1.5, -1.0], dtype=torch.float64)
+    sigma0 = 0.5
+    isotropica = ExactGaussianMixture(
+        2,
+        weights=[1.0],
+        means=[mu.tolist()],
+        covariances=[_identidad(sigma0**2).tolist()],
+        seed=0,
+    )
+    sde = make_sde(nombre)
+    oraculo = MixtureOracle(isotropica, sde)
+    referencia = _score_marginal_isotropico(sde, mu, sigma0)
+    x = torch.tensor(_PUNTOS_K1, dtype=torch.float64)
+
+    for valor in _TIEMPOS_VERIFICACION:
+        t = _tiempo(valor, x.shape[0])
+        assert torch.allclose(oraculo.score(x, t), referencia(x, t), rtol=1e-12, atol=1e-13)
+
+
+# ------------------------------- estadísticas empíricas del kernel forward (7.3, 7.4)
+
+
+#: Tamaño de muestra de las verificaciones por Monte Carlo, según la convención del proyecto.
+_N_MONTE_CARLO = 40_000
+
+#: Cuántos errores estándar del estimador se admiten de desacuerdo.
+#:
+#: Es la tolerancia de Monte Carlo **declarada** de esta sección, y se expresa en errores
+#: estándar en lugar de en porcentaje fijo porque las cantidades comparadas cambian de escala
+#: con el tiempo: la media de ``p_t`` colapsa a ``0.006`` en VP con ``t = T`` (contra ``0.95``
+#: en ``t = 0``) y un ``5%`` relativo sobre ella sería más estricto que el ruido de muestreo,
+#: mientras que la varianza de VE crece hasta ``27.8`` y ese mismo ``5%`` sería laxísimo.
+#: Cinco errores estándar equivalen a menos del ``5%`` relativo del convenio del proyecto en
+#: todos los casos medidos, y los desacuerdos observados no pasan de ``1.6`` errores estándar
+#: con las semillas fijas de estos tests.
+_ERRORES_ESTANDAR = 5.0
+
+
+def _momentos_propagados(
+    oraculo: MixtureOracle, mixtura: ExactGaussianMixture, t: float
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Media y covarianza de ``p_t`` armadas con los parámetros que publica el oráculo.
+
+    Son los momentos de la mixtura ruideada escritos a mano: ``m = Σ_k w_k alpha_t mu_k`` y
+    ``S = Σ_k w_k (Sigma_k(t) + alpha_t² mu_k mu_kᵀ) − m mᵀ``. Al salir de
+    ``marginal_params`` y ``component_covariances``, comparar contra las muestras del kernel
+    forward pone a prueba esos dos accesores del oráculo.
+
+    Args:
+        oraculo: Oráculo del que se leen ``alpha_t`` y ``Sigma_k(t)``.
+        mixtura: Mixtura de la que se leen los pesos verdaderos.
+        t: Tiempo en el que se evalúan los momentos.
+
+    Returns:
+        El par ``(media, covarianza)``, de formas ``(2,)`` y ``(2, 2)``.
+    """
+    tt = torch.tensor([t], dtype=torch.float64)
+    pesos = torch.as_tensor(mixtura.weights_, dtype=torch.float64)
+    medias = _medias_contraidas(oraculo, mixtura, t)
+    covarianzas = oraculo.component_covariances(tt)[0]
+
+    media = (pesos[:, None] * medias).sum(dim=0)
+    segundo = (
+        pesos[:, None, None]
+        * (covarianzas + medias.unsqueeze(-1) * medias.unsqueeze(-2))
+    ).sum(dim=0)
+    return media, segundo - media.unsqueeze(-1) * media.unsqueeze(-2)
+
+
+def _muestra_ruideada(
+    mixtura: ExactGaussianMixture, sde: ForwardSDE, t: float, semilla: int
+) -> "torch.Tensor":
+    """``n`` puntos de la mixtura pasados por el kernel forward de la SDE en el tiempo ``t``."""
+    x0 = torch.as_tensor(mixtura.sample(_N_MONTE_CARLO), dtype=torch.float64)
+    tiempos = _tiempo(t, _N_MONTE_CARLO)
+    x_t, _ = sde.perturb(x0, tiempos, generator=torch.Generator().manual_seed(semilla))
+    return x_t
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_los_momentos_empiricos_del_kernel_forward_coinciden_con_la_densidad(nombre: str):
+    """Criterio 7.3: la media y la covarianza de puntos ruideados contra las de ``p_t``.
+
+    Los puntos salen de la mixtura real pasados por ``perturb``, es decir del proceso forward
+    de verdad y no de la densidad del oráculo; los momentos esperados salen de los parámetros
+    que el oráculo publica. Se barren el tiempo mínimo, uno intermedio y el final (7.4).
+
+    Tolerancia de Monte Carlo: ``_ERRORES_ESTANDAR`` errores estándar del estimador
+    correspondiente —``sqrt(S_ii/n)`` para cada coordenada de la media y
+    ``sqrt((S_ii S_jj + S_ij²)/n)`` para cada entrada de la covarianza—, que se calculan acá a
+    partir de la covarianza exacta y no se eligen a mano. El muestreo de la mixtura reparte los
+    puntos entre componentes en proporción **exacta** a los pesos, así que la única
+    aleatoriedad es intra-componente y el error real queda por debajo de esa cota iid.
+    """
+    mixtura = _mixtura_exacta()
+    sde = make_sde(nombre)
+    oraculo = MixtureOracle(mixtura, sde)
+
+    for valor in [0.0, 0.5, 1.0]:
+        x_t = _muestra_ruideada(mixtura, sde, valor, semilla=1234)
+        media, covarianza = _momentos_propagados(oraculo, mixtura, valor)
+
+        varianzas = torch.diagonal(covarianza)
+        error_media = (varianzas / _N_MONTE_CARLO).sqrt()
+        error_covarianza = (
+            (varianzas[:, None] * varianzas[None, :] + covarianza**2) / _N_MONTE_CARLO
+        ).sqrt()
+
+        desvio_media = (x_t.mean(dim=0) - media).abs()
+        desvio_covarianza = (torch.cov(x_t.T) - covarianza).abs()
+        assert (desvio_media <= _ERRORES_ESTANDAR * error_media).all(), (
+            f"{nombre} en t={valor}: la media empírica se aparta {desvio_media.tolist()} de "
+            f"{media.tolist()} (cota {(_ERRORES_ESTANDAR * error_media).tolist()})"
+        )
+        assert (desvio_covarianza <= _ERRORES_ESTANDAR * error_covarianza).all(), (
+            f"{nombre} en t={valor}: la covarianza empírica se aparta "
+            f"{desvio_covarianza.tolist()} de {covarianza.tolist()}"
+        )
+
+
+#: Centro de la observable acotada de la verificación por Monte Carlo.
+_CENTRO_OBSERVABLE = (0.5, -0.25)
+
+
+def _observable_acotada(puntos: "torch.Tensor") -> "torch.Tensor":
+    """``f(x) = exp(-‖x - c‖²/2)``, elegida en el test y ajena al oráculo.
+
+    Acotada en ``(0, 1]``, así que su promedio empírico tiene varianza chica y su integral
+    contra la densidad converge sin cola pesada. Que la función la fije el test es lo que hace
+    que la comparación no pueda cancelarse contra un error de la propia densidad.
+    """
+    centro = torch.tensor(_CENTRO_OBSERVABLE, dtype=puntos.dtype, device=puntos.device)
+    return torch.exp(-0.5 * ((puntos - centro) ** 2).sum(dim=-1))
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_promedio_empirico_de_una_observable_coincide_con_su_integral(nombre: str):
+    """Criterio 7.3: ``E_{p_t}[f]`` empírico contra ``∫ f p_t`` por cuadratura.
+
+    Es la contracara del test de momentos: en vez de comparar dos resúmenes de la
+    distribución, integra la **densidad** del oráculo contra una función fija y la contrasta
+    con el promedio de esa misma función sobre puntos que salieron del kernel forward. Si
+    ``prob`` estuviera mal normalizada o corrida, los dos números se separan.
+
+    Tolerancia de Monte Carlo: ``_ERRORES_ESTANDAR`` errores estándar del promedio, estimados
+    con el desvío **de la propia muestra** (``s/sqrt(n)``), de modo que la cota no es una
+    constante elegida a mano. Con semillas fijas los desacuerdos observados llegan a ``1.6``
+    errores estándar. La cuadratura aporta un error despreciable frente al de Monte Carlo: la
+    misma malla integra la masa a ``1`` con error ``1e-8`` o menos.
+    """
+    mixtura = _mixtura_exacta()
+    sde = make_sde(nombre)
+    oraculo = MixtureOracle(mixtura, sde)
+
+    for valor in [0.0, 0.5, 1.0]:
+        x_t = _muestra_ruideada(mixtura, sde, valor, semilla=99)
+        valores = _observable_acotada(x_t)
+        empirico = float(valores.mean())
+        error_estandar = float(valores.std(unbiased=True)) / math.sqrt(_N_MONTE_CARLO)
+
+        malla = auto_grid(
+            means=_medias_contraidas(oraculo, mixtura, valor),
+            covariances=oraculo.component_covariances(
+                torch.tensor([valor], dtype=torch.float64)
+            )[0],
+        )
+
+        def integrando(puntos: "torch.Tensor", instante: float = valor) -> "torch.Tensor":
+            """``f(x) p_t(x)`` en los nodos de un bloque de la malla."""
+            tiempos = torch.full(
+                (puntos.shape[0],), instante, dtype=puntos.dtype, device=puntos.device
+            )
+            return _observable_acotada(puntos) * oraculo.prob(puntos, tiempos)
+
+        exacto = integrate(integrando, malla)
+        assert oraculo.total_mass(valor, grid=malla) == pytest.approx(1.0, abs=1e-8)
+        assert abs(empirico - exacto) <= _ERRORES_ESTANDAR * error_estandar, (
+            f"{nombre} en t={valor}: el promedio empírico {empirico:.6f} se aparta "
+            f"{abs(empirico - exacto):.6f} de la integral {exacto:.6f} (cota "
+            f"{_ERRORES_ESTANDAR * error_estandar:.6f})"
+        )
