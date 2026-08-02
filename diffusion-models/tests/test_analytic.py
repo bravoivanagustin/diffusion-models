@@ -3617,3 +3617,127 @@ def test_el_promedio_empirico_de_una_observable_coincide_con_su_integral(nombre:
             f"{abs(empirico - exacto):.6f} de la integral {exacto:.6f} (cota "
             f"{_ERRORES_ESTANDAR * error_estandar:.6f})"
         )
+
+
+# ------------------------- API pública del paquete y smoke ejecutable (3.6, 4.6)
+
+
+_API_PUBLICA = ("BiasReport", "MixtureOracle", "QuadratureGrid", "auto_grid", "integrate")
+
+
+def test_el_all_del_paquete_declara_exactamente_la_api_publica():
+    """El paquete publica el oráculo, el reporte de sesgo y las piezas de la cuadratura."""
+    assert sorted(diffusion.analytic.__all__) == sorted(_API_PUBLICA)
+
+
+def test_los_nombres_publicos_son_los_objetos_de_sus_modulos():
+    """La ruta corta no duplica nada: reexporta los mismos objetos de los submódulos."""
+    assert diffusion.analytic.MixtureOracle is MixtureOracle
+    assert diffusion.analytic.BiasReport is BiasReport
+    assert diffusion.analytic.QuadratureGrid is QuadratureGrid
+    assert diffusion.analytic.auto_grid is auto_grid
+    assert diffusion.analytic.integrate is integrate
+
+
+def test_dir_del_paquete_incluye_los_nombres_publicos():
+    """``dir()`` los lista aunque se resuelvan de forma diferida (autocompletado)."""
+    listados = dir(diffusion.analytic)
+    faltantes = [nombre for nombre in _API_PUBLICA if nombre not in listados]
+    assert not faltantes, faltantes
+
+
+def test_un_atributo_inexistente_del_paquete_levanta_attribute_error():
+    """La resolución diferida no convierte un typo en un import raro: falla como siempre."""
+    with pytest.raises(AttributeError, match="diffusion.analytic"):
+        diffusion.analytic.NoExiste  # noqa: B018
+
+
+def test_importar_la_api_con_estrella_resuelve_todos_los_nombres():
+    """``from diffusion.analytic import *`` trae los cinco nombres, sin ``AttributeError``."""
+    src = Path(diffusion.analytic.__file__).resolve().parents[2]
+    codigo = (
+        "ns = {}\n"
+        "exec('from diffusion.analytic import *', ns)\n"
+        "import diffusion.analytic as a\n"
+        "print(sorted(n for n in a.__all__ if n not in ns))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", codigo],
+        cwd=src,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "[]", proc.stdout
+
+
+def test_importar_el_paquete_no_carga_sde_hasta_pedir_el_oraculo():
+    """La reexportación es **diferida**: el paquete no arrastra sus dependencias al importar.
+
+    Es lo que mantiene viva la garantía de que ``diffusion.analytic.quadrature`` sea una
+    utilidad numérica autónoma: importar cualquier submódulo ejecuta el ``__init__`` del
+    paquete, así que si el ``__init__`` importara el oráculo de forma directa la cuadratura
+    quedaría acoplada a ``sde`` y a ``data_generation`` por la puerta de atrás. Se mide en un
+    intérprete nuevo porque el ``sys.modules`` de pytest ya los tiene cargados.
+    """
+    src = Path(diffusion.analytic.__file__).resolve().parents[2]
+    codigo = (
+        "import sys, diffusion.analytic as a; "
+        "pesados = ('diffusion.sde', 'diffusion.data_generation'); "
+        "antes = [m for m in pesados if m in sys.modules]; "
+        "a.MixtureOracle; "
+        "despues = [m for m in pesados if m in sys.modules]; "
+        "print(antes, sorted(despues))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", codigo],
+        cwd=src,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    esperado = "[] ['diffusion.data_generation', 'diffusion.sde']"
+    assert proc.stdout.strip() == esperado, proc.stdout
+
+
+def test_el_smoke_contrasta_el_score_contra_autograd_y_reporta_masa_unitaria():
+    """Criterios 3.6 y 4.6: el observable del smoke, chequeado sin parsear stdout.
+
+    El propio ``main`` devuelve, por SDE, el peor caso sobre los tiempos que barre: la
+    discrepancia máxima entre el score en forma cerrada y el gradiente de ``log_prob`` por
+    autograd, y la masa integrada más alejada de uno.
+
+    Tolerancias del método: las dos cuentas del score son caminos de doble precisión sobre los
+    mismos términos, así que el desacuerdo es error de redondeo amplificado por la magnitud
+    del score (que crece como ``1/σ_t²``); lo observado llega a ``1.4e-13`` en el tiempo más
+    chico del barrido, y la cota deja tres órdenes de margen. La cuadratura integra a uno con
+    error ``1e-8`` o menos, igual que en el resto de la suite.
+    """
+    from diffusion.analytic.__main__ import main
+
+    resumen = main()
+
+    assert sorted(resumen) == ["sub_vp", "ve", "vp"]
+    for nombre, (discrepancia, masa) in resumen.items():
+        assert discrepancia < 1e-10, f"{nombre}: score vs autograd difiere en {discrepancia}"
+        assert masa == pytest.approx(1.0, abs=1e-8), f"{nombre}: masa {masa}"
+
+
+def test_correr_el_paquete_como_programa_imprime_y_termina_sin_error():
+    """Correr ``python -m diffusion.analytic`` en CPU imprime la comparación y la masa."""
+    src = Path(diffusion.analytic.__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-m", "diffusion.analytic"],
+        cwd=src,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    salida = proc.stdout.lower()
+    assert "autograd" in salida, proc.stdout
+    assert "masa" in salida, proc.stdout
+    for nombre in ("vp", "ve", "sub_vp"):
+        assert nombre in salida, proc.stdout
