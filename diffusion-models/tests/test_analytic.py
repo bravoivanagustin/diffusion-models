@@ -3741,3 +3741,432 @@ def test_correr_el_paquete_como_programa_imprime_y_termina_sin_error():
     assert "masa" in salida, proc.stdout
     for nombre in ("vp", "ve", "sub_vp"):
         assert nombre in salida, proc.stdout
+
+
+# ================================================================================
+# Sampleo reverso con el oráculo inyectado como score (4.2, 4.3, 7.5)
+#
+# Es el cierre del círculo: si el oráculo es la verdad exacta y los samplers integran
+# bien el reverso, entonces sampleando con el oráculo en lugar de una red hay que
+# recuperar la mixtura de partida — y al refinar la grilla temporal hay que acercarse
+# más. Cubre las doce celdas del Eje 2 × Eje 1 escalar (cuatro samplers × VP/VE/sub-VP)
+# **sin tocar una línea de `diffusion.samplers`**: el oráculo se pasa como `score_fn` a
+# `make_sampler` porque su `__call__` ya cumple el contrato `ScoreFn` (no es `nn.Module`
+# ni necesita adaptador). Los samplers se importan *dentro* de las funciones para dejar
+# a la vista que la dependencia va en un solo sentido: `analytic` no los conoce.
+#
+# --- Observable ---------------------------------------------------------------------
+#
+# `_discrepancia_con_la_mixtura` reduce una muestra a **un** número adimensionado.
+# Asigna cada punto a su componente más probable bajo la mixtura verdadera (regla de
+# Bayes con los parámetros declarados) y toma el peor de tres errores por componente:
+#
+#   * ``|ŵ_k − w_k|``                      — composición: detecta modos perdidos o
+#                                            sobrerrepresentados;
+#   * ``‖μ̂_k − μ_k‖ / escala_k``          — ubicación, en unidades del propio radio
+#                                            RMS de la componente;
+#   * ``‖Σ̂_k − Σ_k‖_F / ‖Σ_k‖_F``        — forma: tamaño, anisotropía y orientación.
+#
+# Es deliberadamente elemental (cuentas de asignación y momentos), no una distancia
+# entre distribuciones: las métricas de discrepancia distribucional son materia de la
+# capa de evaluación, no de esta verificación. La mixtura de prueba tiene dos modos
+# separados 3.0, pesos desbalanceados (0.7, 0.3), anisotropía 3 y eje rotado π/6, así
+# que el observable de forma es exigente (una orientación equivocada lo mueve) y la
+# asignación es inequívoca: el punto medio queda a 3.8 desvíos de cada media sobre el
+# eje mayor, con lo que la tasa de mala asignación (≈ 7e-5) no aporta sesgo medible.
+#
+# --- Predicado de convergencia -----------------------------------------------------
+#
+# La discrepancia medida es error de discretización + ruido de Monte Carlo + (en VE)
+# desfasaje del prior. Al refinar, el primer término baja; los otros dos no. Así que la
+# afirmación direccional que se exige es: **cada refinamiento mejora al menos un 30 % o
+# ya llegó al piso irreducible**, y la grilla más fina está en el piso:
+#
+#   d(pasos_{i+1}) <= max(_FACTOR_DE_MEJORA · d(pasos_i), _PISO_IRREDUCIBLE)
+#   d(pasos_última) <= _PISO_IRREDUCIBLE
+#
+# Las dos viven en `_fallas_de_la_verificacion`, que es lo que el test de las doce celdas
+# exige vacío y el de discriminancia exige no vacío — el mismo predicado, sin reescribir.
+#
+# --- Calibración (medida, no adivinada) --------------------------------------------
+#
+# Barrido de las 12 celdas × 5 semillas con `n=2000`, `t_eps=1e-3` y pasos (3, 25, 200):
+#
+#   * peor discrepancia final observada: **0.2118** (VE con `pf_ode`; VE con `heun`
+#     0.1871). VE es la celda floja y por el mismo motivo que ya documenta la suite de
+#     samplers: su prior es `N(0, σ_max²I)` con `σ_max = 5`, mientras la marginal real
+#     en `t = T` tiene varianza `σ_max²` + la de los datos (≈ 26.8 contra 25, un 7 % de
+#     subdispersión de arranque). Los samplers estocásticos borran ese desfasaje; los
+#     deterministas (`pf_ode`, `heun`) lo arrastran, porque la PF-ODE es un mapa
+#     biyectivo del prior. `_PISO_IRREDUCIBLE = 0.35` deja ~1.65× de margen.
+#   * peor violación del predicado escalonado con `_FACTOR_DE_MEJORA = 0.70`:
+#     **−0.1382** (holgura, o sea que nunca se violó).
+#   * peor razón `d(3 pasos) / d(200 pasos)`: **10.95** — la mejora al refinar es de
+#     uno a dos órdenes de magnitud en la mayoría de las celdas (VE con `euler`/`pc`
+#     arranca en ~5000 y termina en ~0.07).
+#   * `t_eps = 1e-3` es el default de los samplers y se deja explícito: en las tres SDEs
+#     el desvío del kernel ahí vale σ ≈ 0.0105, que sobre una componente de radio RMS
+#     0.32 infla el desvío un 0.06 % — dos órdenes por debajo del piso, así que truncar
+#     la integración en `t_eps` no es lo que limita la verificación.
+#   * costo: el barrido de las 12 celdas con una semilla corre en ~20 s en CPU
+#     (101 s las 5 semillas de la calibración), más ~4 s el test de discriminancia.
+#
+# --- Discriminancia ----------------------------------------------------------------
+#
+# El observable no es un colador. Aplicando el **mismo** predicado a scores rotos —los
+# tres definidos acá en el test, sin tocar producción— y con el barrido completo (3, 25,
+# 200), las cuatro celdas de control con el score exacto pasan y las doce combinaciones
+# rotas fallan:
+#
+#   * signo invertido: la discrepancia final va de 7.5e4 (VE/`pf_ode`) a 1.0e16
+#     (`pc`/sub-VP), y **crece** en cada refinamiento — incumple las dos condiciones;
+#   * score nulo: 1.7e2 a 2.1e21, también creciente o estancado;
+#   * oráculo de **un solo modo** (estructura equivocada, magnitud del score
+#     perfectamente plausible): se estanca en 3.7–3.8, o sea 11× el piso, y como el
+#     estancamiento ocurre *por encima* del piso también incumple la condición
+#     direccional. Es el caso que muestra que el observable mira la mixtura y no solo la
+#     finitud o la escala global.
+#
+# El test de discriminancia usa una configuración barata (pasos (3, 60), `n=1000`) que
+# reproduce el mismo veredicto en ~4 s.
+# ================================================================================
+
+_SEPARACION_E2E = 3.0
+_PESOS_E2E = (0.7, 0.3)
+_ANISOTROPIA_E2E = 3.0
+_ESCALA_E2E = 0.3
+_ANGULO_E2E = math.pi / 6
+
+_SAMPLERS_DEL_REVERSO = ("euler", "pf_ode", "heun", "pc")
+# Cobertura 4×3: los cuatro samplers del Eje 2 × las tres SDEs escalares (4.3).
+_CELDAS_E2E = [(s, d) for s in _SAMPLERS_DEL_REVERSO for d in _SDES_ESCALARES]
+
+_PASOS_CRECIENTES = (3, 25, 200)
+_N_MUESTRAS_E2E = 2000
+_T_EPS_E2E = 1e-3
+_SEMILLA_E2E = 0
+_PISO_IRREDUCIBLE = 0.35
+_FACTOR_DE_MEJORA = 0.70
+
+
+def _mixtura_del_e2e() -> ExactGaussianMixture:
+    """Mixtura de dos modos separados, desbalanceados, anisotrópicos y rotados."""
+    return ExactGaussianMixture.two_modes(
+        separation=_SEPARACION_E2E,
+        weights=_PESOS_E2E,
+        anisotropy=_ANISOTROPIA_E2E,
+        scale=_ESCALA_E2E,
+        angle=_ANGULO_E2E,
+    )
+
+
+def _asignacion_mas_probable(
+    mixtura: ExactGaussianMixture, muestras: "torch.Tensor"
+) -> "torch.Tensor":
+    """Componente más probable de la mixtura para cada muestra (regla de Bayes).
+
+    Se calcula con los parámetros **declarados** de la mixtura, en doble precisión y en
+    el dominio logarítmico. La constante ``2π`` es común a las componentes y no cambia el
+    ``argmax``, así que se omite.
+
+    Args:
+        mixtura: Mixtura verdadera, de la que se leen pesos, medias y covarianzas.
+        muestras: Puntos ``(N, 2)``.
+
+    Returns:
+        Índices ``(N,)`` de la componente asignada a cada punto.
+    """
+    pesos = torch.as_tensor(mixtura.weights_, dtype=torch.float64)
+    medias = torch.as_tensor(mixtura.means_, dtype=torch.float64)
+    covarianzas = torch.as_tensor(mixtura.covariances_, dtype=torch.float64)
+    x = muestras.to(torch.float64)
+
+    logs = []
+    for k in range(pesos.shape[0]):
+        precision = torch.linalg.inv(covarianzas[k])
+        dif = x - medias[k]
+        cuadratica = ((dif @ precision) * dif).sum(dim=-1)
+        det = torch.linalg.det(covarianzas[k])
+        logs.append(torch.log(pesos[k]) - 0.5 * cuadratica - 0.5 * torch.log(det))
+    return torch.stack(logs, dim=1).argmax(dim=1)
+
+
+def _discrepancia_con_la_mixtura(
+    mixtura: ExactGaussianMixture, muestras: "torch.Tensor"
+) -> float:
+    """Peor error adimensionado del perfil por componente de ``muestras``.
+
+    Máximo, sobre las componentes de la mixtura, de tres errores: el del peso
+    (``|ŵ_k − w_k|``), el de la media en unidades del radio RMS de la componente
+    (``‖μ̂_k − μ_k‖ / escala_k``) y el relativo de la covarianza en norma de Frobenius
+    (``‖Σ̂_k − Σ_k‖_F / ‖Σ_k‖_F``). Los tres son adimensionados, así que el máximo es
+    comparable entre celdas.
+
+    Args:
+        mixtura: Mixtura verdadera contra la que se compara.
+        muestras: Puntos ``(N, 2)`` generados por el sampler.
+
+    Returns:
+        La discrepancia, o ``inf`` si las muestras no son finitas o alguna componente
+        se quedó con menos de tres puntos asignados (un modo colapsado es una falla
+        total, no un número chico).
+    """
+    if not bool(torch.all(torch.isfinite(muestras))):
+        return math.inf
+
+    pesos = torch.as_tensor(mixtura.weights_, dtype=torch.float64)
+    medias = torch.as_tensor(mixtura.means_, dtype=torch.float64)
+    covarianzas = torch.as_tensor(mixtura.covariances_, dtype=torch.float64)
+    x = muestras.to(torch.float64)
+    asignacion = _asignacion_mas_probable(mixtura, x)
+    n = x.shape[0]
+
+    peor = 0.0
+    for k in range(pesos.shape[0]):
+        propios = x[asignacion == k]
+        peor = max(peor, abs(propios.shape[0] / n - float(pesos[k])))
+        if propios.shape[0] < 3:
+            return math.inf
+
+        escala = math.sqrt(float(torch.diagonal(covarianzas[k]).sum()) / 2.0)
+        media_empirica = propios.mean(dim=0)
+        peor = max(peor, float(torch.linalg.norm(media_empirica - medias[k])) / escala)
+
+        centrado = propios - media_empirica
+        cov_empirica = centrado.T @ centrado / (propios.shape[0] - 1)
+        peor = max(
+            peor,
+            float(torch.linalg.norm(cov_empirica - covarianzas[k]))
+            / float(torch.linalg.norm(covarianzas[k])),
+        )
+    return peor
+
+
+def _barrido_de_discrepancias(
+    mixtura: ExactGaussianMixture,
+    sde: ForwardSDE,
+    nombre_sampler: str,
+    score_fn,
+    pasos: tuple[int, ...],
+    *,
+    n: int = _N_MUESTRAS_E2E,
+    semilla: int = _SEMILLA_E2E,
+) -> list[float]:
+    """Discrepancia con la mixtura para cada cantidad de pasos de integración.
+
+    Args:
+        mixtura: Mixtura verdadera contra la que se mide.
+        sde: Proceso forward que define el reverso a integrar.
+        nombre_sampler: Clave del registry de samplers.
+        score_fn: Invocable ``(x, t) -> score``; acá entra el oráculo tal cual.
+        pasos: Cantidades crecientes de pasos de integración.
+        n: Muestras por corrida.
+        semilla: Semilla del generador, la misma en todo el barrido.
+
+    Returns:
+        Una discrepancia por cada elemento de ``pasos``, en el mismo orden.
+    """
+    from diffusion.samplers import make_sampler
+
+    salida = []
+    for cantidad in pasos:
+        sampler = make_sampler(
+            nombre_sampler, sde, score_fn, n_steps=cantidad, t_eps=_T_EPS_E2E
+        )
+        muestras = sampler.sample(
+            n, generator=torch.Generator().manual_seed(semilla)
+        )
+        salida.append(_discrepancia_con_la_mixtura(mixtura, muestras))
+    return salida
+
+
+def _fallas_de_la_verificacion(
+    discrepancias: list[float], pasos: tuple[int, ...]
+) -> list[str]:
+    """Incumplimientos del predicado de convergencia sobre un barrido de discrepancias.
+
+    Es **la** definición de "el sampleo recupera la mixtura", usada tal cual por el test
+    de las doce celdas (que exige la lista vacía) y por el de discriminancia (que exige
+    que no lo esté). Dos condiciones, calibradas en el bloque de arriba:
+
+    1. Direccional: cada refinamiento baja la discrepancia al menos
+       ``1 − _FACTOR_DE_MEJORA``, salvo que ya haya llegado a ``_PISO_IRREDUCIBLE``.
+    2. Exactitud: la grilla más fina está en el piso.
+
+    Args:
+        discrepancias: Una discrepancia por cantidad de pasos, en orden creciente.
+        pasos: Las cantidades de pasos correspondientes, para el mensaje.
+
+    Returns:
+        Un mensaje por condición incumplida; lista vacía si el barrido convergió.
+    """
+    fallas = []
+    for i in range(len(discrepancias) - 1):
+        exigido = max(_FACTOR_DE_MEJORA * discrepancias[i], _PISO_IRREDUCIBLE)
+        if not discrepancias[i + 1] <= exigido:
+            fallas.append(
+                f"pasar de {pasos[i]} a {pasos[i + 1]} pasos llevó la discrepancia de "
+                f"{discrepancias[i]:.4g} a {discrepancias[i + 1]:.4g}, que no mejora lo "
+                f"suficiente ni llega al piso (se exigía <= {exigido:.4g})"
+            )
+    if not discrepancias[-1] <= _PISO_IRREDUCIBLE:
+        fallas.append(
+            f"con {pasos[-1]} pasos la discrepancia es {discrepancias[-1]:.4g}, por "
+            f"encima del piso {_PISO_IRREDUCIBLE}"
+        )
+    return fallas
+
+
+@pytest.mark.parametrize("nombre_sampler,nombre_sde", _CELDAS_E2E)
+def test_el_oraculo_entra_como_score_en_los_cuatro_samplers(
+    nombre_sampler: str, nombre_sde: str
+):
+    """Criterio 4.3: el oráculo se pasa donde va la red y el sampler produce muestras.
+
+    Chequeo barato de contrato para las doce celdas: sin adaptadores, sin envolver el
+    oráculo en un módulo y sin tocar el código de los samplers, ``make_sampler`` acepta
+    el invocable y ``sample`` devuelve ``(n, 2)`` ``float32`` finito.
+    """
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde(nombre_sde)
+    oraculo = diffusion.analytic.MixtureOracle(_mixtura_del_e2e(), sde)
+
+    assert not isinstance(oraculo, torch.nn.Module)
+    sampler = make_sampler(nombre_sampler, sde, oraculo, n_steps=4, t_eps=_T_EPS_E2E)
+    # El sampler guarda EL MISMO objeto: no hay adaptador intermedio (criterio 4.2).
+    assert sampler.score_fn is oraculo
+
+    muestras = sampler.sample(16, generator=torch.Generator().manual_seed(_SEMILLA_E2E))
+    assert muestras.shape == (16, 2)
+    assert muestras.dtype == torch.float32
+    assert bool(torch.all(torch.isfinite(muestras)))
+
+
+@pytest.mark.parametrize("nombre_sampler,nombre_sde", _CELDAS_E2E)
+def test_al_refinar_los_pasos_el_sampleo_se_acerca_a_la_mixtura(
+    nombre_sampler: str, nombre_sde: str
+):
+    """Criterios 4.2, 4.3 y 7.5: con el score exacto, refinar acerca a la mixtura.
+
+    Barrido de ``_PASOS_CRECIENTES`` con la misma semilla, evaluado con
+    ``_fallas_de_la_verificacion``: la direccional (cada refinamiento mejora un 30 % o ya
+    está en el piso) y la de exactitud (la grilla más fina está en el piso).
+    """
+    mixtura = _mixtura_del_e2e()
+    sde = make_sde(nombre_sde)
+    oraculo = diffusion.analytic.MixtureOracle(mixtura, sde)
+
+    ds = _barrido_de_discrepancias(
+        mixtura, sde, nombre_sampler, oraculo, _PASOS_CRECIENTES
+    )
+    fallas = _fallas_de_la_verificacion(ds, _PASOS_CRECIENTES)
+    assert not fallas, (
+        f"{nombre_sampler}/{nombre_sde}: {'; '.join(fallas)}; barrido completo "
+        f"{[float(f'{v:.4g}') for v in ds]}"
+    )
+
+
+# ------------------------------------------- discriminancia del observable (7.5)
+
+
+_PASOS_DISCRIMINANCIA = (3, 60)
+_N_DISCRIMINANCIA = 1000
+# Una celda por sampler, mezclando las tres SDEs: alcanza para mostrar que el observable
+# reacciona, sin pagar las doce celdas de nuevo.
+_CELDAS_DISCRIMINANCIA = [
+    ("euler", "vp"),
+    ("pf_ode", "ve"),
+    ("heun", "vp"),
+    ("pc", "sub_vp"),
+]
+# Cuánto por encima del piso tiene que quedar un score roto para que el test valga algo.
+_MARGEN_DE_DISCRIMINANCIA = 10.0
+
+# Las tres fábricas de score roto comparten la firma ``(oraculo, sde) -> ScoreFn`` para
+# que la parametrización las trate igual; cada una usa solo lo que necesita.
+
+
+def _score_de_signo_invertido(oraculo, sde):
+    """Score exacto con el signo dado vuelta: el reverso empuja *lejos* de los datos."""
+
+    def score(x: "torch.Tensor", t: "torch.Tensor") -> "torch.Tensor":
+        return -oraculo(x, t)
+
+    return score
+
+
+def _score_nulo(oraculo, sde):
+    """Score idénticamente nulo: el reverso integra sin ninguna atracción a los datos."""
+
+    def score(x: "torch.Tensor", t: "torch.Tensor") -> "torch.Tensor":
+        return torch.zeros_like(x)
+
+    return score
+
+
+def _score_de_un_solo_modo(oraculo, sde):
+    """Score exacto pero de la mixtura equivocada: un único modo en el origen.
+
+    Es el roto interesante: la magnitud del score es perfectamente plausible y el
+    sampleo converge sin problemas — a la distribución equivocada. Un observable que
+    solo mirara finitud o escala global no lo notaría.
+    """
+    mixtura = _mixtura_del_e2e()
+    unico = ExactGaussianMixture(
+        weights=[1.0],
+        means=[[0.0, 0.0]],
+        covariances=mixtura.covariances_[:1],
+    )
+    return diffusion.analytic.MixtureOracle(unico, sde)
+
+
+_SCORES_ROTOS = [
+    pytest.param(_score_de_signo_invertido, True, id="signo-invertido"),
+    pytest.param(_score_nulo, True, id="nulo"),
+    pytest.param(_score_de_un_solo_modo, False, id="un-solo-modo"),
+]
+
+
+@pytest.mark.parametrize("fabrica,empeora_al_refinar", _SCORES_ROTOS)
+@pytest.mark.parametrize("nombre_sampler,nombre_sde", _CELDAS_DISCRIMINANCIA)
+def test_un_score_roto_no_recupera_la_mixtura(
+    nombre_sampler: str, nombre_sde: str, fabrica, empeora_al_refinar: bool
+):
+    """El observable discrimina: con el score roto la verificación de 7.5 no pasa.
+
+    Se evalúa el **mismo** ``_fallas_de_la_verificacion`` que usa el test de las doce
+    celdas, y se exige que devuelva al menos un incumplimiento. Además, para que la
+    discriminancia no sea marginal, la discrepancia final tiene que quedar al menos
+    ``_MARGEN_DE_DISCRIMINANCIA`` veces por encima del piso; y donde el error rompe el
+    signo o la magnitud del arrastre (signo invertido, score nulo) refinar la grilla
+    **empeora** el resultado, que es la negación literal del predicado direccional.
+    """
+    mixtura = _mixtura_del_e2e()
+    sde = make_sde(nombre_sde)
+    oraculo = diffusion.analytic.MixtureOracle(mixtura, sde)
+
+    ds = _barrido_de_discrepancias(
+        mixtura,
+        sde,
+        nombre_sampler,
+        fabrica(oraculo, sde),
+        _PASOS_DISCRIMINANCIA,
+        n=_N_DISCRIMINANCIA,
+    )
+    celda = f"{nombre_sampler}/{nombre_sde}"
+    barrido = [float(f"{v:.4g}") for v in ds]
+
+    assert _fallas_de_la_verificacion(ds, _PASOS_DISCRIMINANCIA), (
+        f"{celda}: el score roto pasó la verificación de convergencia; barrido {barrido}"
+    )
+    assert ds[-1] > _MARGEN_DE_DISCRIMINANCIA * _PISO_IRREDUCIBLE, (
+        f"{celda}: con el score roto la discrepancia final es {ds[-1]:.4g}, demasiado "
+        f"cerca del piso {_PISO_IRREDUCIBLE} como para que el test discrimine; "
+        f"barrido {barrido}"
+    )
+    if empeora_al_refinar:
+        assert ds[-1] >= ds[0], (
+            f"{celda}: se esperaba que refinar empeorara el resultado con este score "
+            f"roto, pero la discrepancia bajó de {ds[0]:.4g} a {ds[-1]:.4g}"
+        )
