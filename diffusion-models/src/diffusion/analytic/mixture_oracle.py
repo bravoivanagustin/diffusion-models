@@ -253,6 +253,86 @@ class MixtureOracle:
         """
         return torch.exp(self._log_prob_double(x, t)).to(x.dtype)
 
+    # ------------------------------------------------------------------- score
+
+    def score(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Score exacto ``∇_x log p_t(x)`` de la mixtura ruideada.
+
+        Sale de derivar la log-densidad de la mixtura respecto de ``x``::
+
+            ∇ log p_t(x) = -Σ_k r_k(x, t) · Σ_k(t)^{-1} (x - α_t μ_k)
+
+        donde ``r_k`` son las **responsabilidades posteriores**, es decir con qué probabilidad
+        la componente ``k`` explica el punto ``x`` en el tiempo ``t``. Cada componente empuja
+        hacia su propia media y el score es el promedio de esos empujes ponderado por las
+        responsabilidades: un solo modo cerca del punto lo domina, y en la zona intermedia
+        entre dos modos el score es una mezcla.
+
+        Las responsabilidades se calculan **en el dominio logarítmico** (un ``softmax`` sobre
+        ``log w_k + log N_k``, exactamente los mismos términos que arma :meth:`log_prob`), no
+        dividiendo densidades. Es lo que mantiene la exactitud cuando el desvío del kernel se
+        hace chico: ahí las densidades individuales desbordan a cero y el cociente ingenuo
+        daría ``0/0``, mientras que la resta de logaritmos que hace ``softmax`` da el valor
+        correcto. Compartir esos términos con la log-densidad también garantiza que el score
+        coincida con su gradiente, en lugar de ser dos fórmulas que podrían divergir.
+
+        Note:
+            El valor es **exacto** en todo el rango de tiempos: ``σ_t`` **no** se recorta por
+            un piso mínimo. Es una diferencia deliberada respecto del target de entrenamiento
+            (:meth:`diffusion.sde.ForwardSDE.score_target`), que sí lo recorta para no dividir
+            por cero cuando ``t → 0``. El oráculo es el **patrón de referencia** contra el que
+            se mide el error de la red, no una réplica de lo que la red aprendió: recortarlo
+            escondería justamente el régimen ``t → 0`` que se quiere medir. La magnitud crece
+            como ``1/σ_t²``, pero se mantiene finita porque la concentración de ``p_t`` tiene
+            piso ``α_t² λ_min(Σ_k)`` y no colapsa con el ruido del kernel.
+
+        No necesita gradientes —es forma cerrada— y no muta nada, así que funciona tal cual
+        dentro del ``torch.no_grad()`` con el que los samplers integran el reverso. Tampoco
+        **impone** ``no_grad``: el grafo de ``x`` sigue vivo en la salida, porque la
+        derivabilidad del módulo es parte de su contrato hacia las métricas.
+
+        Args:
+            x: Puntos del plano, de forma ``(B, 2)``, en punto flotante.
+            t: Tiempos, de forma ``(B,)`` o ``(B, 1)``, finitos y no negativos: un tiempo por
+                punto, evaluado punto a punto.
+
+        Returns:
+            Tensor ``(B, 2)`` —la misma forma que ``x``— con el score de cada punto, en el
+            dtype y el device de ``x``. Los pasos intermedios se calculan en doble precisión
+            aunque ``x`` llegue en ``float32``.
+
+        Raises:
+            ValueError: Si ``x`` no es un tensor de punto flotante de forma ``(B, 2)`` con
+                ``B >= 1``, si ``t`` no cumple el contrato de :meth:`marginal_params`, o si
+                ``t`` no trae exactamente un tiempo por punto de ``x``.
+        """
+        log_pesados, empuje = self._component_terms(x, t)
+        # Responsabilidades posteriores: softmax sobre log w_k + log N_k, de forma (B, K).
+        responsabilidades = torch.softmax(log_pesados, dim=1)
+        score = -(responsabilidades.unsqueeze(-1) * empuje).sum(dim=1)
+        return score.to(x.dtype)
+
+    def __call__(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Alias de :meth:`score` que cumple el contrato de score de los samplers.
+
+        Los cuatro samplers del Eje 2 consumen el score como un **invocable puro**
+        ``(x, t) -> score`` (``diffusion.samplers.ScoreFn``), sin exigir un ``nn.Module``: con
+        este alias el oráculo entra donde iría la red entrenada, sin tocar los samplers. Es la
+        forma de sustituir el score aprendido por el verdadero y aislar así el error de
+        estimación del de discretización.
+
+        Args:
+            x: Puntos del plano, de forma ``(B, 2)``. Los samplers pasan el estado actual.
+            t: Tiempos, de forma ``(B,)`` o ``(B, 1)``. Los samplers pasan ``(B, 1)``.
+
+        Returns:
+            Tensor con la forma, el dtype y el device de ``x``.
+
+        Raises:
+            ValueError: Igual que :meth:`score`.
+        """
+        return self.score(x, t)
+
     def total_mass(self, t: float, *, grid: QuadratureGrid | None = None) -> float:
         """Masa integrada de la densidad en un tiempo dado: el autochequeo del oráculo.
 
@@ -304,8 +384,10 @@ class MixtureOracle:
     def _log_prob_double(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Log-densidad en doble precisión, sin degradar al dtype del caller.
 
-        Es el único lugar donde vive la forma cerrada; :meth:`log_prob` y :meth:`prob` solo
-        la exponencian o la degradan, así que no pueden discrepar entre sí.
+        Combina con ``logsumexp`` los mismos términos por componente que consume el score, de
+        modo que las dos cantidades salen de una sola forma cerrada. :meth:`log_prob` y
+        :meth:`prob` solo la exponencian o la degradan, así que ninguna de las tres puede
+        discrepar de las otras.
 
         Args:
             x: Puntos del plano candidatos.
@@ -313,6 +395,37 @@ class MixtureOracle:
 
         Returns:
             Tensor ``(B,)`` ``float64`` en el device de ``x``, conectado al grafo de ``x``.
+
+        Raises:
+            ValueError: Si ``x`` o ``t`` no cumplen su contrato, o si los lotes no coinciden.
+        """
+        log_pesados, _ = self._component_terms(x, t)
+        return torch.logsumexp(log_pesados, dim=1)
+
+    def _component_terms(
+        self, x: torch.Tensor, t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Los dos términos por componente de los que salen la densidad y el score.
+
+        Es el **único** lugar donde vive la forma cerrada de la mixtura ruideada. Devuelve las
+        log-densidades ya ponderadas por los pesos (``log w_k + log N_k``, lo que la densidad
+        combina con ``logsumexp`` y el score con ``softmax``) y el empuje blanqueado de cada
+        componente (``Σ_k(t)^{-1} (x - α_t μ_k)``, lo que el score promedia). Compartirlos es
+        lo que hace que el score sea exactamente el gradiente de la log-densidad y no una
+        segunda fórmula capaz de divergir de ella.
+
+        Todo se calcula en doble precisión —la promoción de ``x`` es derivable, así que el
+        grafo del caller sobrevive— y con los parámetros de la mixtura movidos al device de
+        ``x`` **en cada llamada**: no se cachea ninguna copia por device, así que el oráculo
+        sirve indistintamente en CPU y en GPU.
+
+        Args:
+            x: Puntos del plano candidatos.
+            t: Tiempos candidatos.
+
+        Returns:
+            El par ``(log_pesados, empuje)`` de formas ``(B, K)`` y ``(B, K, 2)``, en
+            ``float64`` y en el device de ``x``.
 
         Raises:
             ValueError: Si ``x`` o ``t`` no cumplen su contrato, o si los lotes no coinciden.
@@ -333,10 +446,12 @@ class MixtureOracle:
         # Medias contraídas por el kernel: alpha_t mu_k, con forma (B, K, 2).
         medias = alpha.reshape(-1, 1, 1) * self._means.to(device=xx.device)
         diferencia = xx.unsqueeze(1) - medias  # (B, K, 2)
+        # Empuje blanqueado Sigma_k(t)^{-1} (x - alpha_t mu_k), de forma (B, K, 2). Es lo que
+        # el score promedia y, contraído contra la diferencia, la forma cuadrática de la
+        # log-densidad: un solo producto sirve a las dos cantidades.
+        empuje = (precisiones @ diferencia.unsqueeze(-1)).squeeze(-1)
         # Forma cuadrática (x - mu_k)^T Sigma_k(t)^{-1} (x - mu_k), de forma (B, K).
-        cuadratica = (
-            diferencia * (precisiones @ diferencia.unsqueeze(-1)).squeeze(-1)
-        ).sum(dim=-1)
+        cuadratica = (diferencia * empuje).sum(dim=-1)
 
         log_componentes = (
             _LOG_NORMALIZACION_2D
@@ -347,7 +462,7 @@ class MixtureOracle:
         # hace falta recortar los pesos (recortarlos haría aportar densidad a una componente
         # que la mixtura declaró inexistente).
         log_pesos = torch.log(self._weights.to(device=xx.device))  # (K,)
-        return torch.logsumexp(log_pesos + log_componentes, dim=1)
+        return log_pesos + log_componentes, empuje
 
     def _validate_scalar_gaussian_family(self) -> None:
         """Verifica estructuralmente que la SDE sea de la familia escalar-gaussiana.

@@ -1582,3 +1582,390 @@ def test_la_masa_integrada_rechaza_un_tiempo_que_no_es_un_numero(malo: object):
     oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
     with pytest.raises(ValueError, match=r"^t debe"):
         oraculo.total_mass(malo)  # type: ignore[arg-type]
+
+
+# ------------------------------------------------- oráculo: score exacto (4.1–4.8)
+
+
+def _score_mixtura_independiente(
+    mixtura: ExactGaussianMixture,
+    medias: "torch.Tensor",
+    covs: "torch.Tensor",
+    puntos: "torch.Tensor",
+) -> "torch.Tensor":
+    """Score de referencia: responsabilidades en el dominio **lineal** y álgebra genérica.
+
+    Segunda implementación del criterio 4.1, escrita para no compartir nada con la
+    producción: invierte con ``torch.linalg.inv`` en lugar de la forma cerrada 2×2, y calcula
+    las responsabilidades **dividiendo densidades** en vez de con un ``softmax`` sobre
+    log-densidades.
+
+    Args:
+        mixtura: Mixtura exacta de la que se leen los pesos verdaderos.
+        medias: Medias ya contraídas ``alpha_t mu_k``, de forma ``(K, 2)``.
+        covs: Covarianzas ya propagadas ``Sigma_k(t)``, de forma ``(K, 2, 2)``.
+        puntos: Puntos de evaluación, de forma ``(B, 2)``.
+
+    Returns:
+        Tensor ``(B, 2)`` con el score de referencia.
+    """
+    pesos = torch.as_tensor(mixtura.weights_, dtype=torch.float64)
+    inversas = torch.linalg.inv(covs)
+    dets = torch.linalg.det(covs)
+    dif = puntos.unsqueeze(1) - medias.unsqueeze(0)  # (B, K, 2)
+    cuadratica = torch.einsum("bki,kij,bkj->bk", dif, inversas, dif)
+    densidades = (
+        pesos / (2.0 * math.pi * torch.sqrt(dets)) * torch.exp(-0.5 * cuadratica)
+    )
+    responsabilidades = densidades / densidades.sum(dim=1, keepdim=True)
+    # Sigma_k(t)^{-1} (x - alpha_t mu_k), de forma (B, K, 2).
+    empuje = torch.einsum("kij,bkj->bki", inversas, dif)
+    return -(responsabilidades.unsqueeze(-1) * empuje).sum(dim=1)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_score_coincide_con_la_formula_independiente(nombre: str):
+    """Criterio 4.1: el score contra una forma cerrada escrita aparte, en las tres SDEs.
+
+    Tolerancia: ``rtol=1e-9`` sobre magnitudes de hasta ~100. Es holgada frente al ruido de la
+    doble precisión y órdenes de magnitud más chica que cualquier error estructural —un signo
+    invertido, usar ``Sigma_k`` en lugar de ``Sigma_k(t)``, olvidar las responsabilidades—,
+    que se apartan en factores enteros.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+
+    for valor in _TIEMPOS:
+        medias, covs = _params_ruideados(nombre, valor, mixtura)
+        esperado = _score_mixtura_independiente(mixtura, medias, covs, _PUNTOS)
+        obtenido = oraculo.score(_PUNTOS, _tiempo(valor, _PUNTOS.shape[0]))
+
+        assert obtenido.shape == _PUNTOS.shape
+        assert torch.allclose(obtenido, esperado, rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_score_coincide_con_el_gradiente_de_su_log_densidad(nombre: str):
+    """Criterio 4.6: el score **es** ``d/dx log p_t``, verificado con autograd.
+
+    Cruza las dos formas cerradas del módulo entre sí, así que un signo invertido o un eje
+    contraído de más en cualquiera de las dos se delata acá.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+
+    for valor in _TIEMPOS:
+        t = _tiempo(valor, _PUNTOS.shape[0])
+        x = _PUNTOS.clone().requires_grad_(True)
+        (gradiente,) = torch.autograd.grad(oraculo.log_prob(x, t).sum(), x)
+        obtenido = oraculo.score(_PUNTOS, t)
+        assert torch.allclose(obtenido, gradiente, rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_con_una_sola_componente_el_score_es_la_forma_cerrada_de_una_gaussiana(
+    nombre: str,
+):
+    """Criterio 7.1 en su versión ``K = 1``: ``score = -Sigma(t)^{-1} (x - alpha mu)``.
+
+    La esperanza se arma con ``math`` y floats de Python a partir de ``alpha_t`` y ``sigma_t``
+    escritos a mano, así que no depende de ninguna pieza de la producción.
+    """
+    oraculo = MixtureOracle(_mixtura_de_una_componente(), make_sde(nombre))
+    x = torch.tensor([[0.5, 0.1], [-1.0, 2.0]], dtype=torch.float64)
+
+    for valor in _TIEMPOS:
+        a, s = _alpha_sigma_cerrados(nombre, valor)
+        v1, v2 = a**2 * 0.25 + s**2, a**2 * 0.04 + s**2
+        esperado = torch.tensor(
+            [[-(px - a * 0.3) / v1, -(py + a * 0.2) / v2] for px, py in x.tolist()],
+            dtype=torch.float64,
+        )
+        obtenido = oraculo.score(x, _tiempo(valor, x.shape[0]))
+        assert torch.allclose(obtenido, esperado, rtol=1e-9, atol=1e-12)
+
+
+def test_el_score_pondera_por_las_responsabilidades_posteriores():
+    """Criterio 4.1: los pesos entran por las responsabilidades, no de forma pareja.
+
+    Dos componentes de la **misma** covarianza y medias simétricas respecto del origen: en el
+    origen las dos densidades valen lo mismo, así que la responsabilidad de cada una es
+    exactamente su peso. Con pesos ``(0.8, 0.2)`` el score vale ``-0.6·alpha/v`` en la primera
+    coordenada; repartir las responsabilidades por igual daría exactamente **cero**, que es lo
+    que le da dientes al test.
+    """
+    simetrica = ExactGaussianMixture(
+        2,
+        weights=[0.8, 0.2],
+        means=[[-1.0, 0.0], [1.0, 0.0]],
+        covariances=[_identidad(0.25).tolist(), _identidad(0.25).tolist()],
+        seed=0,
+    )
+    oraculo = MixtureOracle(simetrica, make_sde("vp"))
+    valor = 0.4
+    a, s = _alpha_sigma_cerrados("vp", valor)
+    v = a**2 * 0.25 + s**2
+
+    obtenido = oraculo.score(torch.zeros(1, 2, dtype=torch.float64), _tiempo(valor, 1))
+
+    esperado = torch.tensor([[-0.6 * a / v, 0.0]], dtype=torch.float64)
+    assert torch.allclose(obtenido, esperado, rtol=1e-9, atol=1e-12)
+    assert float(obtenido[0, 0].abs()) > 0.1
+
+
+def test_el_score_usa_la_covarianza_en_el_tiempo_y_no_la_de_los_datos():
+    """El kernel propaga la covarianza: ``Sigma(t) = alpha_t² Sigma + sigma_t² I``.
+
+    En ``t = 0.5`` el ruido del kernel domina a la covarianza de los datos, así que usar
+    ``Sigma`` en lugar de ``Sigma(t)`` da un score varias veces más grande.
+    """
+    oraculo = MixtureOracle(_mixtura_de_una_componente(), make_sde("vp"))
+    valor = 0.5
+    a, s = _alpha_sigma_cerrados("vp", valor)
+    x = torch.tensor([[0.5, 0.1]], dtype=torch.float64)
+    dif = x - a * torch.tensor([[0.3, -0.2]], dtype=torch.float64)
+
+    obtenido = oraculo.score(x, _tiempo(valor, 1))
+
+    con_ruido = -dif / torch.tensor(
+        [[a**2 * 0.25 + s**2, a**2 * 0.04 + s**2]], dtype=torch.float64
+    )
+    sin_ruido = -dif / torch.tensor([[0.25, 0.04]], dtype=torch.float64)
+    assert torch.allclose(obtenido, con_ruido, rtol=1e-9, atol=1e-12)
+    assert not torch.allclose(obtenido, sin_ruido, rtol=1e-2)
+
+
+def test_el_score_no_recorta_el_desvio_del_kernel_como_el_target_de_entrenamiento():
+    """Criterio 4.8: el oráculo devuelve el valor **exacto**, sin piso para ``sigma_t``.
+
+    La componente es casi puntual (covarianza ``1e-18 I``), así que ``Sigma(t) ≈ sigma_t² I`` y
+    el recorte se ve de lleno. En sub-VP con ``t = 1e-5`` el desvío vale ``~1e-6``, por debajo
+    del piso ``1e-5`` que sí aplica el target de entrenamiento: el valor exacto queda un orden
+    de magnitud por encima del recortado.
+    """
+    casi_puntual = ExactGaussianMixture(
+        2,
+        weights=[1.0],
+        means=[[0.0, 0.0]],
+        covariances=[_identidad(1e-18).tolist()],
+        seed=0,
+    )
+    sde = make_sde("sub_vp")
+    oraculo = MixtureOracle(casi_puntual, sde)
+    valor = 1e-5
+    a, s = _alpha_sigma_cerrados("sub_vp", valor)
+    assert s < 1e-5, "el test necesita un desvío por debajo del piso del target"
+
+    x = torch.tensor([[3e-6, -2e-6]], dtype=torch.float64)
+    t = torch.tensor([[valor]], dtype=torch.float64)
+
+    obtenido = oraculo.score(x, t)
+
+    exacto = -x / (a**2 * 1e-18 + s**2)
+    assert torch.allclose(obtenido, exacto, rtol=1e-9, atol=0.0)
+
+    # El target de entrenamiento sí recorta: con ``x = alpha·0 + s·eps`` devuelve
+    # ``-eps / max(s, 1e-5)``, que acá es diez veces más chico que el score verdadero.
+    recortado, _ = sde.score_target(torch.zeros_like(x), t, x / s)
+    assert float(obtenido.abs().max()) > 5.0 * float(recortado.abs().max())
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+@pytest.mark.parametrize("valor", [1e-5, 1e-4, 1e-3])
+def test_el_score_es_finito_con_el_desvio_del_kernel_diminuto(
+    nombre: str, valor: float
+):
+    """Criterio 4.7: sin desbordes aunque la magnitud del score crezca como ``1/sigma_t²``."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+
+    for dtype in (torch.float32, torch.float64):
+        x = _PUNTOS.to(dtype)
+        salida = oraculo.score(x, _tiempo(valor, x.shape[0]).to(dtype))
+        assert torch.isfinite(salida).all()
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_tiempo_plano_y_en_columna_dan_el_mismo_score(nombre: str):
+    """Criterio 3.5/4.2: ``t`` como ``(B,)`` o ``(B, 1)``; los samplers pasan la columna."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    plano = _tiempo(0.3, _PUNTOS.shape[0])
+
+    assert torch.equal(
+        oraculo.score(_PUNTOS, plano), oraculo.score(_PUNTOS, plano.reshape(-1, 1))
+    )
+
+
+def test_cada_punto_recibe_el_score_de_su_propio_tiempo():
+    """Un tiempo por punto: el lote no se evalúa entero en el primer instante."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("ve"))
+    x = _PUNTOS[:2]
+    tiempos = [0.1, 0.9]
+
+    juntos = oraculo.score(x, torch.tensor(tiempos, dtype=torch.float64))
+
+    for fila, valor in enumerate(tiempos):
+        solo = oraculo.score(x[fila : fila + 1], _tiempo(valor, 1))
+        assert torch.allclose(juntos[fila : fila + 1], solo, rtol=1e-12, atol=1e-14)
+    assert not torch.allclose(juntos, oraculo.score(x, _tiempo(tiempos[0], 2)))
+
+
+@pytest.mark.parametrize("metodo", ["score", "__call__"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_el_score_devuelve_la_forma_el_dtype_y_el_device_del_estado(
+    dtype: "torch.dtype", metodo: str
+):
+    """Criterio 4.1/4.5: la salida tiene la shape, la precisión y el device de ``x``."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    x = _PUNTOS.to(dtype)
+    t = _tiempo(0.3, x.shape[0]).to(dtype)
+
+    salida = getattr(oraculo, metodo)(x, t)
+
+    assert salida.shape == x.shape
+    assert salida.dtype is dtype
+    assert salida.device == x.device
+
+
+def test_el_score_en_simple_precision_coincide_con_el_de_doble():
+    """La degradación es solo de salida: los pasos intermedios corren en doble precisión."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    t = _tiempo(0.3, _PUNTOS.shape[0])
+
+    doble = oraculo.score(_PUNTOS, t)
+    simple = oraculo.score(_PUNTOS.to(torch.float32), t.to(torch.float32))
+
+    assert torch.allclose(simple.to(torch.float64), doble, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requiere CUDA")
+def test_el_score_sale_en_el_device_del_estado_cuando_hay_gpu():  # pragma: no cover
+    """Criterio 4.5 en su mitad de device: los parámetros se promueven en cada llamada."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    x = _PUNTOS.to(device="cuda", dtype=torch.float32)
+
+    salida = oraculo.score(x, _tiempo(0.3, x.shape[0]).to(x.device))
+
+    assert salida.device == x.device
+    assert salida.dtype is torch.float32
+
+
+def test_el_score_no_muta_el_oraculo_ni_cachea_una_copia_por_device():
+    """Criterio 4.4: dos llamadas iguales dan lo mismo y nada del oráculo cambia.
+
+    Se compara el estado completo del objeto antes y después: ningún atributo nuevo (una
+    caché por device rompería el contrato en GPU), las mismas identidades de tensor, los
+    mismos valores y la doble precisión intacta.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    antes = dict(vars(oraculo))
+    copias = {k: v.clone() for k, v in antes.items() if isinstance(v, torch.Tensor)}
+    x = _PUNTOS.to(torch.float32)
+    t = _tiempo(0.3, x.shape[0])
+
+    primera = oraculo.score(x, t)
+    segunda = oraculo.score(x, t)
+
+    assert torch.equal(primera, segunda)
+    assert set(vars(oraculo)) == set(antes)
+    for clave, valor in antes.items():
+        assert vars(oraculo)[clave] is valor
+    for clave, copia in copias.items():
+        assert torch.equal(vars(oraculo)[clave], copia)
+        assert vars(oraculo)[clave].dtype is torch.float64
+
+
+def test_el_score_funciona_dentro_de_no_grad():
+    """El driver de los samplers evalúa el score bajo ``torch.no_grad()``."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+
+    with torch.no_grad():
+        salida = oraculo.score(_PUNTOS, _tiempo(0.3, _PUNTOS.shape[0]))
+
+    assert torch.isfinite(salida).all()
+    assert not salida.requires_grad
+
+
+def test_el_score_no_apaga_el_grafo_del_estado():
+    """No hay ``no_grad`` interno: la derivabilidad del módulo se usa aguas abajo."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    x = _PUNTOS.clone().requires_grad_(True)
+
+    salida = oraculo.score(x, _tiempo(0.3, x.shape[0]))
+
+    assert salida.requires_grad
+
+
+def test_el_invocable_es_el_mismo_score_y_entra_donde_se_espera_uno_inyectable():
+    """Criterio 4.2: ``__call__`` cumple el contrato ``(x, t) -> score`` de los samplers."""
+    from diffusion.samplers import ScoreFn
+
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    t = _tiempo(0.3, _PUNTOS.shape[0]).reshape(-1, 1)
+
+    def consumir(fn: ScoreFn, x: "torch.Tensor", tt: "torch.Tensor") -> "torch.Tensor":
+        """Consume el score como lo hacen los samplers: un invocable y nada más."""
+        return fn(x, tt)
+
+    assert callable(oraculo)
+    assert torch.equal(consumir(oraculo, _PUNTOS, t), oraculo.score(_PUNTOS, t))
+
+
+@pytest.mark.parametrize("metodo", ["score", "__call__"])
+@pytest.mark.parametrize(
+    "malo",
+    [
+        torch.zeros(3, dtype=torch.float64),
+        torch.zeros(3, 3, dtype=torch.float64),
+        torch.zeros(0, 2, dtype=torch.float64),
+    ],
+)
+def test_el_score_rechaza_un_estado_con_forma_invalida(
+    metodo: str, malo: "torch.Tensor"
+):
+    """El estado del laboratorio 2D es ``(B, 2)`` con ``B >= 1``, también para el score."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^x debe"):
+        getattr(oraculo, metodo)(malo, _tiempo(0.3, max(1, malo.shape[0])))
+
+
+@pytest.mark.parametrize("metodo", ["score", "__call__"])
+def test_el_score_rechaza_un_tiempo_que_no_trae_uno_por_punto(metodo: str):
+    """Un tiempo por punto: el broadcast silencioso sería peor que el error."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        getattr(oraculo, metodo)(_PUNTOS, _tiempo(0.3, _PUNTOS.shape[0] - 1))
+
+
+@pytest.mark.parametrize("metodo", ["score", "__call__"])
+def test_el_score_rechaza_un_tiempo_negativo(metodo: str):
+    """Mismo contrato de tiempo que la densidad: el proceso corre en ``[0, T]``."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        getattr(oraculo, metodo)(_PUNTOS, _tiempo(-0.1, _PUNTOS.shape[0]))
+
+
+def test_un_peso_nulo_no_contamina_el_score():
+    """``log 0 = -inf`` entra al ``softmax`` sin producir ``nan``: la componente aporta cero.
+
+    Es la contraparte del mismo chequeo sobre la log-densidad, y discrimina la versión que le
+    pone un piso a los pesos: con un piso, la componente muerta seguiría empujando y el score
+    no coincidiría con el de la mixtura de una sola componente.
+    """
+    media_viva = [[2.0, -1.0]]
+    cov_viva = [_diagonal(0.25, 0.04).tolist()]
+    con_muerta = ExactGaussianMixture(
+        2,
+        weights=[0.0, 1.0],
+        means=[[-1.5, 0.5]] + media_viva,
+        covariances=[_rotada(1.0, 0.09, math.pi / 3).tolist()] + cov_viva,
+        seed=0,
+    )
+    sola = ExactGaussianMixture(
+        2, weights=[1.0], means=media_viva, covariances=cov_viva, seed=0
+    )
+    t = _tiempo(0.2, _PUNTOS.shape[0])
+
+    obtenido = MixtureOracle(con_muerta, make_sde("vp")).score(_PUNTOS, t)
+    esperado = MixtureOracle(sola, make_sde("vp")).score(_PUNTOS, t)
+
+    assert torch.isfinite(obtenido).all()
+    assert torch.allclose(obtenido, esperado, rtol=1e-12, atol=1e-14)
