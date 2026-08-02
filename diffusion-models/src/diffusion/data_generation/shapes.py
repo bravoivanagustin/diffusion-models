@@ -106,6 +106,60 @@ class GaussianMixture(PointDistribution):
         return x
 
 
+def _validate_scale_and_anisotropy(scale: float, anisotropy: float) -> None:
+    """Valida las dos palancas de forma comunes a los constructores de geometría.
+
+    Args:
+        scale: Escala global de una componente; debe ser > 0.
+        anisotropy: Razón entre el autovalor mayor y el menor; debe ser >= 1.
+
+    Raises:
+        ValueError: Si ``scale <= 0`` o si ``anisotropy < 1`` (también con NaN).
+            El mensaje empieza nombrando el parámetro culpable.
+    """
+    if not float(scale) > 0.0:
+        raise ValueError(f"scale debe ser > 0; recibí {scale!r}")
+    if not float(anisotropy) >= 1.0:
+        raise ValueError(
+            f"anisotropy debe ser >= 1: es la razón entre el autovalor mayor y "
+            f"el menor de la componente, así que 1 es el caso isotrópico y "
+            f"valores mayores la estiran; recibí {anisotropy!r}"
+        )
+
+
+def _anisotropic_covariance(
+    scale: float, anisotropy: float, angle: float
+) -> np.ndarray:
+    """Covarianza 2x2 SPD con anisotropía ``anisotropy`` y eje mayor en ``angle``.
+
+    Los autovalores son ``scale² · √κ`` a lo largo de ``angle`` y ``scale² / √κ``
+    en la dirección perpendicular, con ``κ = anisotropy``. Dos consecuencias
+    deliberadas de esa elección:
+
+    - la **razón** entre el autovalor mayor y el menor es exactamente ``κ``, que
+      es la definición de anisotropía que usan los constructores de geometría;
+    - la **media geométrica** de los autovalores queda igual a ``scale²`` para
+      cualquier ``κ``, así que subir la anisotropía estira la componente **sin**
+      cambiar su tamaño global (el determinante —el área de la elipse de
+      covarianza— se conserva). Si en cambio se escalara solo el autovalor
+      mayor, mover ``κ`` cambiaría en silencio la dispersión total y el barrido
+      dejaría de aislar la anisotropía.
+
+    Args:
+        scale: Escala global de la componente (> 0).
+        anisotropy: Razón mayor/menor de autovalores (>= 1); 1 es isotrópica.
+        angle: Ángulo en radianes del eje mayor.
+
+    Returns:
+        Matriz ``(2, 2)`` float64, simétrica y definida positiva.
+    """
+    root = np.sqrt(float(anisotropy))
+    var = float(scale) ** 2
+    major = np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+    minor = np.array([-np.sin(angle), np.cos(angle)], dtype=np.float64)
+    return var * root * np.outer(major, major) + (var / root) * np.outer(minor, minor)
+
+
 class ExactGaussianMixture(PointDistribution):
     """Mixtura de gaussianas 2D con parámetros exactos y consultables.
 
@@ -252,6 +306,160 @@ class ExactGaussianMixture(PointDistribution):
         """Covarianzas verdaderas ``(K, 2, 2)`` float64 (copia)."""
         return self._covariances.copy()
 
+    # ------------------------------------------- geometrías del estudio (1.7)
+
+    @classmethod
+    def two_modes(
+        cls,
+        *,
+        separation: float,
+        weights: tuple[float, float] = (0.5, 0.5),
+        anisotropy: float = 1.0,
+        scale: float = 0.3,
+        angle: float = 0.0,
+        seed: int | None = None,
+    ) -> "ExactGaussianMixture":
+        """Mixtura de dos modos, parametrizada por las palancas del estudio.
+
+        Es el atajo para la geometría de dos modos del barrido: separación,
+        desbalance de pesos y anisotropía se piden **por nombre** y quedan
+        publicadas en los accesores, sin que el llamador arme matrices de
+        covarianza a mano.
+
+        Geometría: las dos medias quedan **simétricas respecto del origen**,
+        a distancia ``separation`` entre sí, sobre la dirección rotada por
+        ``angle`` (``means[0] = -½·separation·u``, ``means[1] = +½·separation·u``
+        con ``u = (cos angle, sin angle)``). La elongación se aplica **a lo largo
+        de la dirección de separación**: es la orientación que hace significativo
+        el barrido de soporte casi degenerado, porque los modos se estiran uno
+        hacia el otro. Ambas componentes comparten la misma covarianza.
+
+        Args:
+            separation: Distancia entre las dos medias (>= 0). ``0`` es el límite
+                degenerado, con los dos modos superpuestos en el origen.
+            weights: Pesos ``(w0, w1)``, no negativos y que suman uno. Acá vive
+                la palanca de desbalance (p. ej. ``(0.99, 0.01)``).
+            anisotropy: Razón entre el autovalor mayor y el menor de cada
+                componente (>= 1); ``1`` es isotrópica. La media geométrica de
+                los autovalores se mantiene en ``scale**2``, así que estirar no
+                cambia el tamaño global de la componente (ver
+                :func:`_anisotropic_covariance`).
+            scale: Escala global de cada componente (> 0). Con ``anisotropy=1``
+                la covarianza es ``scale**2 · I``.
+            angle: Ángulo en radianes de la dirección de separación (y, por lo
+                tanto, del eje mayor de las componentes).
+            seed: Semilla del muestreo.
+
+        Returns:
+            La mixtura construida, con sus parámetros ya validados.
+
+        Raises:
+            ValueError: Si ``separation < 0``, si ``weights`` no tiene
+                exactamente dos pesos, si ``scale <= 0`` o si
+                ``anisotropy < 1``; y los mismos rechazos del constructor
+                general para pesos negativos o que no suman uno. El mensaje
+                empieza nombrando el parámetro culpable.
+        """
+        if not float(separation) >= 0.0:
+            raise ValueError(
+                f"separation debe ser >= 0 (es la distancia entre las dos "
+                f"medias); recibí {separation!r}"
+            )
+        w = np.array(weights, dtype=np.float64)
+        if w.shape != (2,):
+            raise ValueError(
+                f"weights debe tener exactamente 2 pesos, uno por modo; recibí "
+                f"shape {w.shape}"
+            )
+        _validate_scale_and_anisotropy(scale, anisotropy)
+
+        direction = np.array(
+            [np.cos(float(angle)), np.sin(float(angle))], dtype=np.float64
+        )
+        half = 0.5 * float(separation)
+        means = np.stack([-half * direction, half * direction])
+        cov = _anisotropic_covariance(scale, anisotropy, float(angle))
+        covariances = np.stack([cov, cov])
+        return cls(2, weights=w, means=means, covariances=covariances, seed=seed)
+
+    @classmethod
+    def ring(
+        cls,
+        *,
+        n_components: int = 8,
+        radius: float = 5.0,
+        scale: float = 0.3,
+        weights: Sequence[float] | None = None,
+        anisotropy: float = 1.0,
+        seed: int | None = None,
+    ) -> "ExactGaussianMixture":
+        """Mixtura en anillo, parametrizada por las palancas del estudio.
+
+        Es el atajo para la geometría de anillo del barrido (el clásico "8
+        gaussianas", acá con pesos y anisotropía controlables): las medias van
+        equiespaciadas en un círculo de radio ``radius`` **empezando en ángulo
+        0**, ``radius · (cos 2πk/K, sin 2πk/K)``, que es la misma convención
+        angular de :class:`GaussianMixture` en 2D, así que las geometrías del
+        estudio quedan comparables con el trabajo anterior.
+
+        La anisotropía estira cada componente **en su dirección radial** (la de
+        su propio centro): es la orientación que hace significativo el barrido de
+        soporte casi degenerado sobre un anillo, porque los modos se alargan
+        hacia el centro y hacia afuera en lugar de tangencialmente. La dirección
+        se toma del **ángulo** de la componente y no del vector de su media, así
+        que sigue estando definida incluso con ``radius = 0``, donde todas las
+        medias caen en el origen.
+
+        Args:
+            n_components: Cantidad de componentes ``K`` (>= 1).
+            radius: Radio del anillo (>= 0). ``0`` apila todas las medias en el
+                origen (límite degenerado).
+            scale: Escala global de cada componente (> 0). Con ``anisotropy=1``
+                la covarianza es ``scale**2 · I``.
+            weights: Pesos ``(K,)`` no negativos que suman uno; ``None`` da el
+                anillo parejo de ``1/K``. Acá vive la palanca de desbalance.
+            anisotropy: Razón entre el autovalor mayor y el menor de cada
+                componente (>= 1); ``1`` es isotrópica. La media geométrica de
+                los autovalores se mantiene en ``scale**2`` (ver
+                :func:`_anisotropic_covariance`).
+            seed: Semilla del muestreo.
+
+        Returns:
+            La mixtura construida, con sus parámetros ya validados.
+
+        Raises:
+            ValueError: Si ``n_components < 1``, si ``radius < 0``, si
+                ``scale <= 0``, si ``anisotropy < 1`` o si ``weights`` no tiene
+                un peso por componente; y los mismos rechazos del constructor
+                general para pesos negativos o que no suman uno. El mensaje
+                empieza nombrando el parámetro culpable.
+        """
+        k = int(n_components)
+        if k < 1:
+            raise ValueError(f"n_components debe ser >= 1; recibí {n_components!r}")
+        if not float(radius) >= 0.0:
+            raise ValueError(
+                f"radius debe ser >= 0 (es el radio del anillo); recibí {radius!r}"
+            )
+        _validate_scale_and_anisotropy(scale, anisotropy)
+
+        if weights is None:
+            w = np.full(k, 1.0 / k, dtype=np.float64)
+        else:
+            w = np.array(weights, dtype=np.float64)
+            if w.shape != (k,):
+                raise ValueError(
+                    f"weights debe tener un peso por componente, es decir shape "
+                    f"({k},) para n_components={k}; recibí shape {w.shape}"
+                )
+
+        angles = np.linspace(0.0, 2.0 * np.pi, k, endpoint=False)
+        means = float(radius) * np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        covariances = np.stack(
+            [_anisotropic_covariance(scale, anisotropy, a) for a in angles]
+        )
+        return cls(2, weights=w, means=means, covariances=covariances, seed=seed)
+
     # ------------------------------------------------------------- muestreo
 
     def _sample_raw(self, n: int, rng: np.random.Generator) -> np.ndarray:
@@ -264,9 +472,13 @@ class ExactGaussianMixture(PointDistribution):
         1, …), sin permutación final.
 
         Note:
-            El contrato de muestreo (composición contra los pesos declarados,
-            reproducibilidad por semilla, dtype y shape) queda fijado por los
-            tests de la tarea 2.2.
+            El contrato de muestreo —composición exacta contra los pesos
+            declarados, agrupamiento por componente, reproducibilidad por
+            semilla, dtype y shape— queda fijado en
+            ``tests/test_data_generation.py`` por
+            ``test_exact_mixture_composition_*``,
+            ``test_exact_mixture_samples_are_grouped_by_component`` y
+            ``test_exact_mixture_same_seed_gives_identical_samples``.
         """
         counts = _largest_remainder_counts(self._weights, n)
         points, labels = [], []

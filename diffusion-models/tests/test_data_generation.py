@@ -496,6 +496,378 @@ def test_exact_mixture_sampling_does_not_touch_the_true_parameters():
     assert mix.mean_ is None and mix.std_ is None
 
 
+# --------------------------------------------------------------------------
+# ExactGaussianMixture: constructores de geometría del estudio (1.7).
+#
+# `two_modes` y `ring` son las palancas para armar las geometrías del barrido
+# —separación entre modos, desbalance de pesos y anisotropía— sin que el
+# llamador escriba matrices de covarianza a mano. Todo se verifica por la API
+# pública (`weights_`, `means_`, `covariances_`): lo pedido tiene que ser
+# exactamente lo que queda declarado.
+#
+# Convención de anisotropía fijada acá: `anisotropy` (κ) es la **razón entre el
+# autovalor mayor y el menor** de una componente (κ=1 => isotrópica), y la
+# **media geométrica** de los autovalores se mantiene en `scale**2`, así que
+# estirar una componente no cambia su tamaño global (el determinante —el área de
+# la elipse de covarianza— se conserva para cualquier κ).
+# --------------------------------------------------------------------------
+
+
+def _eigen_ratio(cov):
+    """Razón entre el autovalor mayor y el menor de una covarianza 2x2."""
+    eigvals = np.linalg.eigvalsh(np.asarray(cov, dtype=np.float64))
+    return float(eigvals[-1] / eigvals[0])
+
+
+def _major_axis_alignment(cov, direction):
+    """|cos| entre el eje mayor de ``cov`` y ``direction`` (1.0 => alineados).
+
+    Se usa el valor absoluto porque un autovector define un eje, no un sentido:
+    ``v`` y ``-v`` describen la misma elongación.
+    """
+    eigvals, eigvecs = np.linalg.eigh(np.asarray(cov, dtype=np.float64))
+    major = eigvecs[:, int(np.argmax(eigvals))]
+    d = np.asarray(direction, dtype=np.float64)
+    return abs(float(major @ (d / np.linalg.norm(d))))
+
+
+def _unit(angle):
+    """Versor de dirección ``angle`` (radianes)."""
+    return np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+
+
+# ------------------------------------------------------------------ two_modes
+
+
+def test_two_modes_reports_the_requested_separation():
+    # 1.7: la palanca de separación se lee de vuelta en las medias declaradas,
+    # que quedan simétricas respecto del origen.
+    mix = ExactGaussianMixture.two_modes(separation=4.0, seed=0)
+    assert isinstance(mix, ExactGaussianMixture)
+    assert mix.dim == 2
+    assert mix.means_.shape == (2, 2)
+    assert float(np.linalg.norm(mix.means_[1] - mix.means_[0])) == pytest.approx(4.0)
+    assert np.allclose(mix.means_.sum(axis=0), 0.0)
+
+
+def test_two_modes_is_balanced_by_default():
+    # 1.7: sin pedir desbalance, los dos modos pesan igual.
+    mix = ExactGaussianMixture.two_modes(separation=3.0, seed=0)
+    assert np.allclose(mix.weights_, [0.5, 0.5])
+
+
+def test_two_modes_reports_the_requested_weight_imbalance():
+    # 1.7: el desbalance es la segunda palanca del barrido y se declara tal cual.
+    mix = ExactGaussianMixture.two_modes(separation=3.0, weights=(0.99, 0.01), seed=0)
+    assert np.allclose(mix.weights_, [0.99, 0.01])
+    assert float(mix.weights_.sum()) == pytest.approx(1.0)
+
+
+def test_two_modes_separation_follows_the_requested_angle():
+    # 1.7: la dirección de separación la fija `angle` (radianes); con angle=0 los
+    # modos quedan sobre el eje x.
+    horizontal = ExactGaussianMixture.two_modes(separation=2.0, seed=0)
+    assert np.allclose(horizontal.means_, [[-1.0, 0.0], [1.0, 0.0]])
+
+    angle = np.pi / 3.0
+    oblique = ExactGaussianMixture.two_modes(separation=6.0, angle=angle, seed=0)
+    delta = oblique.means_[1] - oblique.means_[0]
+    assert np.allclose(delta / np.linalg.norm(delta), _unit(angle))
+    assert np.allclose(oblique.means_, [-3.0 * _unit(angle), 3.0 * _unit(angle)])
+
+
+def test_two_modes_is_isotropic_by_default():
+    # 1.7: κ=1 (default) => covarianza esférica de escala `scale`, sin que el
+    # llamador arme la matriz.
+    mix = ExactGaussianMixture.two_modes(separation=4.0, scale=0.5, seed=0)
+    for cov in mix.covariances_:
+        assert np.allclose(cov, np.eye(2) * 0.25)
+        assert _eigen_ratio(cov) == pytest.approx(1.0)
+
+
+def test_two_modes_anisotropy_is_the_eigenvalue_ratio():
+    # 1.7: κ es exactamente la razón entre el autovalor mayor y el menor, para
+    # las dos componentes.
+    mix = ExactGaussianMixture.two_modes(separation=4.0, anisotropy=9.0, seed=0)
+    assert mix.covariances_.shape == (2, 2, 2)
+    for cov in mix.covariances_:
+        assert _eigen_ratio(cov) == pytest.approx(9.0)
+
+
+def test_two_modes_anisotropy_preserves_the_overall_scale():
+    # 1.7: la media geométrica de los autovalores se mantiene en scale**2, así
+    # que subir κ estira la componente sin cambiar su tamaño global. El
+    # determinante (= producto de autovalores = scale**4) es el mismo que en el
+    # caso isotrópico: una convención que escalara solo el autovalor mayor lo
+    # multiplicaría por κ y no pasaría este test.
+    scale = 0.3
+    iso = ExactGaussianMixture.two_modes(separation=4.0, scale=scale, seed=0)
+    aniso = ExactGaussianMixture.two_modes(
+        separation=4.0, scale=scale, anisotropy=16.0, seed=0
+    )
+    for cov in aniso.covariances_:
+        eigvals = np.linalg.eigvalsh(cov)
+        assert float(np.sqrt(eigvals.prod())) == pytest.approx(scale**2)
+        assert float(np.linalg.det(cov)) == pytest.approx(
+            float(np.linalg.det(iso.covariances_[0]))
+        )
+
+
+def test_two_modes_elongates_along_the_separation_direction():
+    # 1.7: la elongación se aplica **a lo largo de la dirección de separación**,
+    # que es la orientación que hace significativo el barrido de soporte casi
+    # degenerado (los modos se estiran uno hacia el otro).
+    angle = 0.4
+    mix = ExactGaussianMixture.two_modes(
+        separation=4.0, angle=angle, anisotropy=25.0, seed=0
+    )
+    for cov in mix.covariances_:
+        assert _major_axis_alignment(cov, _unit(angle)) == pytest.approx(1.0)
+        # Y el eje menor queda perpendicular: la varianza en la dirección normal
+        # es la más chica.
+        normal = _unit(angle + np.pi / 2.0)
+        var_major = float(_unit(angle) @ cov @ _unit(angle))
+        var_minor = float(normal @ cov @ normal)
+        assert var_major / var_minor == pytest.approx(25.0)
+
+
+def test_two_modes_covariance_is_rotated_for_an_oblique_angle():
+    # 1.7, 1.3: con κ>1 y un ángulo oblicuo la covarianza deja de ser diagonal,
+    # es decir la palanca produce componentes *rotadas* y no solo estiradas
+    # sobre los ejes.
+    mix = ExactGaussianMixture.two_modes(
+        separation=4.0, angle=np.pi / 4.0, anisotropy=4.0, seed=0
+    )
+    for cov in mix.covariances_:
+        assert not np.isclose(cov[0, 1], 0.0)
+        assert np.allclose(cov, cov.T)
+        assert np.all(np.linalg.eigvalsh(cov) > 0.0)
+
+
+def test_two_modes_accepts_zero_separation():
+    # 1.7: separation=0 es el límite degenerado (los dos modos superpuestos) y se
+    # acepta; solo se rechaza una separación negativa.
+    mix = ExactGaussianMixture.two_modes(separation=0.0, seed=0)
+    assert np.allclose(mix.means_, 0.0)
+
+
+def test_two_modes_produces_a_sampleable_mixture():
+    # 1.7 con 1.4/1.5: la geometría que arma el constructor pasa la validación
+    # del constructor general y se puede muestrear; la composición respeta el
+    # desbalance pedido y los momentos por componente reproducen lo declarado.
+    mix = ExactGaussianMixture.two_modes(
+        separation=6.0, weights=(0.75, 0.25), anisotropy=4.0, scale=0.4, seed=3
+    )
+    x = mix.sample(8000)
+    assert x.shape == (8000, 2)
+    assert x.dtype == np.float32
+    assert np.bincount(mix.color_, minlength=2).tolist() == [6000, 2000]
+    for i in range(2):
+        mean_emp, cov_emp = _empirical_moments(x, mix.color_, i)
+        assert np.allclose(mean_emp, mix.means_[i], atol=0.1), i
+        assert np.allclose(cov_emp, mix.covariances_[i], atol=0.1), i
+    # La semilla se propaga: dos construcciones iguales dan la misma muestra.
+    other = ExactGaussianMixture.two_modes(
+        separation=6.0, weights=(0.75, 0.25), anisotropy=4.0, scale=0.4, seed=3
+    )
+    assert np.array_equal(x, other.sample(8000))
+
+
+@pytest.mark.parametrize(
+    "overrides,culprit",
+    [
+        # Separación negativa: no es una distancia.
+        ({"separation": -1.0}, "separation"),
+        # κ < 1 invertiría el significado de la razón mayor/menor.
+        ({"anisotropy": 0.5}, "anisotropy"),
+        ({"anisotropy": 0.0}, "anisotropy"),
+        # Escala no positiva: la covarianza no sería definida positiva.
+        ({"scale": 0.0}, "scale"),
+        ({"scale": -0.3}, "scale"),
+        # `two_modes` son exactamente dos modos: los pesos tienen que ser dos.
+        ({"weights": (0.5, 0.3, 0.2)}, "weights"),
+        ({"weights": (1.0,)}, "weights"),
+        # Pesos inválidos por sí mismos (delegado a la validación general, que
+        # también nombra a weights).
+        ({"weights": (0.6, 0.6)}, "weights"),
+        ({"weights": (-0.1, 1.1)}, "weights"),
+    ],
+)
+def test_two_modes_rejects_invalid_inputs(overrides, culprit):
+    # 1.6, 1.7: cada entrada inválida nombra su parámetro culpable. El patrón va
+    # anclado al principio del mensaje porque varios mensajes mencionan más de un
+    # parámetro de pasada.
+    kwargs = {"separation": 4.0, "seed": 0}
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=f"^{culprit}"):
+        ExactGaussianMixture.two_modes(**kwargs)
+
+
+# ----------------------------------------------------------------------- ring
+
+
+def test_ring_matches_the_legacy_angular_convention():
+    # 1.7: las medias van equiespaciadas en un círculo de radio `radius`,
+    # arrancando en ángulo 0, igual que la convención de la mixtura legacy
+    # (radius * (cos 2πk/K, sin 2πk/K)); así las geometrías del estudio son
+    # comparables con el trabajo anterior.
+    k, radius = 8, 5.0
+    mix = ExactGaussianMixture.ring(n_components=k, radius=radius, seed=0)
+    ang = np.linspace(0.0, 2.0 * np.pi, k, endpoint=False)
+    expected = radius * np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    assert mix.means_.shape == (k, 2)
+    assert np.allclose(mix.means_, expected)
+    assert np.allclose(mix.means_[0], [radius, 0.0])
+    assert np.allclose(np.linalg.norm(mix.means_, axis=1), radius)
+
+
+def test_ring_defaults_to_uniform_weights():
+    # 1.7: sin pesos explícitos el anillo es parejo, 1/K por componente.
+    mix = ExactGaussianMixture.ring(n_components=5, seed=0)
+    assert np.allclose(mix.weights_, 1.0 / 5.0)
+    assert float(mix.weights_.sum()) == pytest.approx(1.0)
+
+
+def test_ring_reports_explicit_weights_verbatim():
+    # 1.7: el desbalance también es palanca en el anillo.
+    weights = [0.4, 0.3, 0.2, 0.1]
+    mix = ExactGaussianMixture.ring(n_components=4, weights=weights, seed=0)
+    assert np.allclose(mix.weights_, weights)
+
+
+def test_ring_is_isotropic_by_default():
+    # 1.7: κ=1 (default) => todas las componentes esféricas de escala `scale`.
+    mix = ExactGaussianMixture.ring(n_components=6, scale=0.3, seed=0)
+    for cov in mix.covariances_:
+        assert np.allclose(cov, np.eye(2) * 0.09)
+        assert _eigen_ratio(cov) == pytest.approx(1.0)
+
+
+def test_ring_anisotropy_is_the_eigenvalue_ratio_of_every_component():
+    # 1.7: κ es la razón mayor/menor en **cada** componente, y la media
+    # geométrica de los autovalores sigue siendo scale**2.
+    scale, kappa = 0.3, 9.0
+    mix = ExactGaussianMixture.ring(
+        n_components=8, scale=scale, anisotropy=kappa, seed=0
+    )
+    assert mix.covariances_.shape == (8, 2, 2)
+    for cov in mix.covariances_:
+        assert _eigen_ratio(cov) == pytest.approx(kappa)
+        assert float(np.sqrt(np.linalg.eigvalsh(cov).prod())) == pytest.approx(scale**2)
+
+
+def test_ring_elongates_each_component_along_its_radial_direction():
+    # 1.7 — decisión de orientación: cada componente se estira **en su dirección
+    # radial** (alineada con su propio centro), que es la orientación que hace
+    # significativo el barrido de soporte casi degenerado sobre un anillo (los
+    # modos se estiran hacia el centro y hacia afuera, no de forma tangencial).
+    k, kappa = 8, 16.0
+    mix = ExactGaussianMixture.ring(n_components=k, anisotropy=kappa, seed=0)
+    for i, cov in enumerate(mix.covariances_):
+        radial = mix.means_[i] / np.linalg.norm(mix.means_[i])
+        tangential = np.array([-radial[1], radial[0]])
+        assert _major_axis_alignment(cov, radial) == pytest.approx(1.0), i
+        var_radial = float(radial @ cov @ radial)
+        var_tangential = float(tangential @ cov @ tangential)
+        assert var_radial / var_tangential == pytest.approx(kappa), i
+
+
+def test_ring_radial_orientation_comes_from_the_angle_not_from_the_mean():
+    # 1.7: con radius=0 todas las medias caen en el origen y la dirección radial
+    # del centro no está definida; la orientación se toma del ángulo de la
+    # componente, así que sigue siendo la del anillo.
+    k, kappa = 4, 9.0
+    mix = ExactGaussianMixture.ring(
+        n_components=k, radius=0.0, anisotropy=kappa, seed=0
+    )
+    assert np.allclose(mix.means_, 0.0)
+    ang = np.linspace(0.0, 2.0 * np.pi, k, endpoint=False)
+    for i, cov in enumerate(mix.covariances_):
+        assert _major_axis_alignment(cov, _unit(ang[i])) == pytest.approx(1.0), i
+
+
+def test_ring_with_a_single_component_is_a_lone_anisotropic_gaussian():
+    # 1.7: K=1 es el borde del anillo: una sola componente en (radius, 0),
+    # estirada sobre el eje x (su dirección radial).
+    mix = ExactGaussianMixture.ring(
+        n_components=1, radius=2.0, scale=0.5, anisotropy=4.0, seed=0
+    )
+    assert np.allclose(mix.weights_, [1.0])
+    assert np.allclose(mix.means_, [[2.0, 0.0]])
+    cov = mix.covariances_[0]
+    assert np.allclose(cov, np.diag([0.25 * 2.0, 0.25 / 2.0]))
+
+
+def test_ring_produces_a_sampleable_mixture():
+    # 1.7 con 1.4/1.5: la geometría del anillo pasa la validación general y se
+    # puede muestrear; la composición sigue los pesos y los momentos por
+    # componente reproducen lo declarado (incluida la rotación de cada una).
+    mix = ExactGaussianMixture.ring(
+        n_components=4, radius=5.0, scale=0.4, anisotropy=4.0, seed=5
+    )
+    x = mix.sample(8000)
+    assert x.shape == (8000, 2)
+    assert x.dtype == np.float32
+    assert np.bincount(mix.color_, minlength=4).tolist() == [2000] * 4
+    for i in range(4):
+        mean_emp, cov_emp = _empirical_moments(x, mix.color_, i)
+        assert np.allclose(mean_emp, mix.means_[i], atol=0.1), i
+        assert np.allclose(cov_emp, mix.covariances_[i], atol=0.1), i
+    other = ExactGaussianMixture.ring(
+        n_components=4, radius=5.0, scale=0.4, anisotropy=4.0, seed=5
+    )
+    assert np.array_equal(x, other.sample(8000))
+
+
+@pytest.mark.parametrize(
+    "overrides,culprit",
+    [
+        # Un anillo necesita al menos una componente.
+        ({"n_components": 0}, "n_components"),
+        ({"n_components": -3}, "n_components"),
+        # Radio negativo: no es una distancia.
+        ({"radius": -1.0}, "radius"),
+        # Escala no positiva y κ < 1, igual que en two_modes.
+        ({"scale": 0.0}, "scale"),
+        ({"anisotropy": 0.5}, "anisotropy"),
+        # Un peso por componente: la longitud tiene que coincidir con K. Sin
+        # validación propia, el error lo tiraría `means` (que es quien queda mal
+        # dimensionado frente al K que declaran los pesos) y culparía al
+        # parámetro equivocado.
+        ({"weights": [0.5, 0.5]}, "weights"),
+        # Pesos inválidos por sí mismos (delegado a la validación general).
+        ({"n_components": 2, "weights": [0.5, 0.4]}, "weights"),
+        ({"n_components": 2, "weights": [-0.1, 1.1]}, "weights"),
+    ],
+)
+def test_ring_rejects_invalid_inputs(overrides, culprit):
+    # 1.6, 1.7: cada entrada inválida nombra su parámetro culpable, con el patrón
+    # anclado al principio del mensaje.
+    kwargs = {"n_components": 8, "seed": 0}
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=f"^{culprit}"):
+        ExactGaussianMixture.ring(**kwargs)
+
+
+def test_geometry_constructors_do_not_need_hand_written_matrices():
+    # 1.7: el objetivo de la palanca es que las tres cantidades del barrido
+    # —separación, desbalance y anisotropía— se pidan por nombre y se lean de
+    # vuelta por los accesores, sin que el llamador toque una matriz.
+    two = ExactGaussianMixture.two_modes(
+        separation=7.0, weights=(0.9, 0.1), anisotropy=6.0, seed=0
+    )
+    assert float(np.linalg.norm(two.means_[1] - two.means_[0])) == pytest.approx(7.0)
+    assert float(two.weights_.max() / two.weights_.min()) == pytest.approx(9.0)
+    assert _eigen_ratio(two.covariances_[0]) == pytest.approx(6.0)
+
+    ring = ExactGaussianMixture.ring(
+        n_components=3, radius=4.0, weights=[0.6, 0.3, 0.1], anisotropy=2.0, seed=0
+    )
+    assert np.allclose(np.linalg.norm(ring.means_, axis=1), 4.0)
+    assert float(ring.weights_.max() / ring.weights_.min()) == pytest.approx(6.0)
+    assert _eigen_ratio(ring.covariances_[2]) == pytest.approx(2.0)
+
+
 def test_cli_smoke(tmp_path):
     out = tmp_path / "d.npz"
     png = tmp_path / "d.png"
