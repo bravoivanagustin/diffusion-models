@@ -12,13 +12,15 @@ import pytest
 import itertools
 
 from diffusion.data_generation import (
+    REGISTRY,
+    ExactGaussianMixture,
     Gaussian,
+    GaussianMixture,
     TwoMoons,
     available_shapes,
     infinite_bare,
     make_distribution,
 )
-from diffusion.data_generation.shapes import ExactGaussianMixture
 
 ALL_SHAPES = ["gaussian", "mixture", "two_moons", "spiral", "swiss_roll"]
 DEFAULT_DIM = {
@@ -126,10 +128,9 @@ def test_infinite_bare_yields_bare_tensor():
 
 # --------------------------------------------------------------------------
 # ExactGaussianMixture: parámetros exactos, validación y accesores (1.1, 1.2,
-# 1.3, 1.6, 5.1). El contrato de muestreo (composición, reproducibilidad,
-# dtype/shape) lo fija la tarea 2.2; acá solo se prueba la construcción.
-# La clase todavía no se exporta desde la API pública del módulo (tarea 2.4),
-# así que se importa del submódulo donde vive.
+# 1.3, 1.6, 5.1). Acá solo se prueba la **construcción**; el contrato de
+# muestreo (composición, reproducibilidad, dtype/shape) lo fijan los tests de
+# la sección "contrato de muestreo" más abajo.
 # --------------------------------------------------------------------------
 
 EXACT_WEIGHTS = [0.6, 0.4]
@@ -866,6 +867,172 @@ def test_geometry_constructors_do_not_need_hand_written_matrices():
     assert np.allclose(np.linalg.norm(ring.means_, axis=1), 4.0)
     assert float(ring.weights_.max() / ring.weights_.min()) == pytest.approx(6.0)
     assert _eigen_ratio(ring.covariances_[2]) == pytest.approx(2.0)
+
+
+# --------------------------------------------------------------------------
+# API pública del módulo de datos: la mixtura exacta se **exporta pero no se
+# registra** (2.2, 2.4) y la mixtura **legacy** queda fijada contra valores de
+# referencia (2.1, 2.3, 2.5).
+#
+# La forma exacta no entra al registry a propósito: sus parámetros
+# (`weights`, `means`, `covariances`) son obligatorios y son matrices, y
+# `make_distribution` **filtra** los kwargs que no matchean la firma en lugar de
+# completarlos, así que por esa vía la clase no es construible. Se importa
+# directamente desde la API pública, que es su único camino de uso.
+# --------------------------------------------------------------------------
+
+# Valores de referencia de la mixtura legacy con la configuración de la que
+# dependen los notebooks y el checkpoint 2D: 8 componentes, cluster_std 0.3,
+# radio 5.0 y seed=1. Se registraron desde la implementación vigente y sirven de
+# ancla: cualquier cambio en el muestreo legacy (centros, escala de cluster,
+# consumo del rng, estandarización) los mueve y hace fallar el test.
+LEGACY_N = 1000
+LEGACY_SEED = 1
+
+# Tolerancia: las muestras son float32, así que el último dígito de los valores
+# transcritos (6 decimales) no es representable exactamente; 1e-5 absoluto cubre
+# ese redondeo y sigue siendo dos órdenes de magnitud más chico que cualquier
+# cambio real de geometría.
+LEGACY_ATOL = 1e-5
+
+LEGACY_GOLDEN = {
+    # standardize=True: la configuración exacta con la que se entrenó
+    # `models/phase_1/vp_mixture.pt` y la que usan los notebooks.
+    True: {
+        "head": [
+            [0.977878, -0.904543],
+            [-0.006189, -1.402111],
+            [-0.890129, 1.108003],
+            [1.302082, -0.060786],
+            [-0.080772, -1.281309],
+            [0.907611, 1.028924],
+        ],
+        "tail": [0.951770, 1.012636],
+        "abs_mean": 0.868430,
+        "cube_mean": -0.001915,
+        "norm_mean": 1.411808,
+        "col_std": [1.000000, 1.000000],
+    },
+    # standardize=False: la geometría cruda, sin la transformación empírica, para
+    # que el golden cubra también el anillo de radio 5 tal como sale.
+    False: {
+        "head": [
+            [3.475602, -3.215929],
+            [-0.017238, -4.985749],
+            [-3.154688, 3.942581],
+            [4.626329, -0.214732],
+            [-0.281962, -4.556066],
+            [3.226198, 3.661304],
+        ],
+        "tail": [3.382935, 3.603365],
+        "abs_mean": 3.085660,
+        "cube_mean": 0.031635,
+        "norm_mean": 5.016388,
+        "col_std": [3.549392, 3.556943],
+    },
+}
+
+# Etiqueta de componente: el reparto de sklearn es parejo (125 puntos por
+# componente con n=1000 y K=8) y el prefijo fija además el *orden* en que salen.
+LEGACY_LABELS_HEAD = [7, 6, 3, 0, 6, 1, 2, 4, 7, 4, 2, 7]
+LEGACY_LABEL_COUNTS = [125] * 8
+
+
+def _legacy_mixture(*, standardize):
+    """Mixtura legacy con la configuración de la que dependen notebooks y checkpoints."""
+    return make_distribution(
+        "mixture", 2, n_components=8, standardize=standardize, seed=LEGACY_SEED
+    )
+
+
+def test_exact_mixture_is_exported_from_the_public_api():
+    # 2.4: la clase se importa por su nombre público desde el módulo de datos
+    # (el import del encabezado ya lo ejerce) y figura en `__all__`, que es el
+    # contrato de exportación del paquete.
+    import diffusion.data_generation as data_generation
+
+    assert "ExactGaussianMixture" in data_generation.__all__
+    assert data_generation.ExactGaussianMixture is ExactGaussianMixture
+    # Y lo exportado es usable, no un alias vacío.
+    mix = ExactGaussianMixture(
+        weights=[1.0], means=[[0.0, 0.0]], covariances=[np.eye(2)], seed=0
+    )
+    assert mix.sample(8).shape == (8, 2)
+
+
+def test_exact_mixture_is_exported_but_not_registered():
+    # 2.2, 2.4: exportada sí, registrada no. Con parámetros obligatorios que son
+    # matrices, la factory (que filtra kwargs en vez de completarlos) no podría
+    # construirla, y los tests genéricos parametrizados sobre el registry la
+    # llamarían con `(name, dim, seed=...)` y nada más.
+    assert ExactGaussianMixture.name == "mixture_exact"
+    assert ExactGaussianMixture.name not in REGISTRY
+    assert ExactGaussianMixture not in REGISTRY.values()
+    assert ExactGaussianMixture.name not in available_shapes()
+    with pytest.raises(ValueError, match="mixture_exact"):
+        make_distribution("mixture_exact", 2)
+
+
+def test_registry_keeps_exactly_the_historical_shapes():
+    # 2.4: el conjunto de formas disponibles no cambia con esta feature. Se fija
+    # la lista ordenada completa (no solo el conjunto) y que cada entrada siga
+    # apuntando a la clase que declara ese nombre.
+    assert available_shapes() == sorted(ALL_SHAPES)
+    assert len(REGISTRY) == len(ALL_SHAPES)
+    for name, cls in REGISTRY.items():
+        assert cls.name == name
+
+
+def test_legacy_mixture_is_still_constructible_by_name_with_its_defaults():
+    # 2.2: la mixtura legacy sigue llegando por nombre desde el registro, con los
+    # mismos parámetros y los mismos valores por defecto que antes de la feature.
+    dist = make_distribution("mixture", 2)
+    assert isinstance(dist, GaussianMixture)
+    assert dist.name == "mixture"
+    assert dist.dim == 2
+    assert dist.n_components == 8
+    assert dist.cluster_std == pytest.approx(0.3)
+    assert dist.radius == pytest.approx(5.0)
+    assert dist.standardize is False
+
+
+def test_legacy_mixture_still_publishes_the_component_label():
+    # 2.3: la etiqueta por punto que usan las previsualizaciones se sigue
+    # publicando, con una etiqueta por punto y un índice de componente válido.
+    dist = _legacy_mixture(standardize=True)
+    x = dist.sample(LEGACY_N)
+    assert dist.color_ is not None
+    assert dist.color_.shape == (len(x),)
+    assert dist.color_.dtype.kind in "iu"
+    assert set(dist.color_.tolist()) == set(range(8))
+    assert dist.color_[: len(LEGACY_LABELS_HEAD)].tolist() == LEGACY_LABELS_HEAD
+    assert np.bincount(dist.color_, minlength=8).tolist() == LEGACY_LABEL_COUNTS
+
+
+@pytest.mark.parametrize("standardize", [True, False])
+def test_legacy_mixture_samples_match_the_recorded_golden_values(standardize):
+    # 2.1, 2.5: las muestras de la configuración usada hasta ahora son
+    # exactamente las de siempre. El golden combina muestras individuales (las
+    # primeras filas y la última, que detectan cualquier corrimiento del sorteo)
+    # con agregados de toda la muestra (momento absoluto, tercer momento, norma
+    # media y desvío por eje), que detectan cambios que no toquen el prefijo.
+    golden = LEGACY_GOLDEN[standardize]
+    dist = _legacy_mixture(standardize=standardize)
+    x = dist.sample(LEGACY_N)
+    assert x.shape == (LEGACY_N, 2)
+    assert x.dtype == np.float32
+
+    head = np.asarray(golden["head"], dtype=np.float64)
+    assert np.allclose(x[: len(head)], head, rtol=0.0, atol=LEGACY_ATOL)
+    assert np.allclose(x[-1], golden["tail"], rtol=0.0, atol=LEGACY_ATOL)
+
+    xd = x.astype(np.float64)
+    assert float(np.abs(xd).mean()) == pytest.approx(golden["abs_mean"], abs=LEGACY_ATOL)
+    assert float((xd**3).mean()) == pytest.approx(golden["cube_mean"], abs=LEGACY_ATOL)
+    assert float(np.linalg.norm(xd, axis=1).mean()) == pytest.approx(
+        golden["norm_mean"], abs=LEGACY_ATOL
+    )
+    assert np.allclose(xd.std(axis=0), golden["col_std"], rtol=0.0, atol=LEGACY_ATOL)
 
 
 def test_cli_smoke(tmp_path):

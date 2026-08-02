@@ -15,8 +15,20 @@ import inspect
 from .base import PointDistribution
 from .images import count_images, finite_batches, infinite_batches, report_small_images
 from .iterators import infinite_bare
-from .shapes import Gaussian, GaussianMixture, Spiral, SwissRoll, TwoMoons
+from .shapes import (
+    ExactGaussianMixture,
+    Gaussian,
+    GaussianMixture,
+    Spiral,
+    SwissRoll,
+    TwoMoons,
+)
 
+#: Formas construibles por nombre. ``ExactGaussianMixture`` **no** está acá a
+#: propósito: sus parámetros (pesos, medias, covarianzas) son obligatorios y son
+#: matrices, así que no viajan por CLI ni por YAML, y :func:`make_distribution`
+#: filtra los kwargs que no matchean la firma en lugar de completarlos. Se
+#: exporta para importarla directamente, que es su único camino de uso.
 REGISTRY: dict[str, type[PointDistribution]] = {
     cls.name: cls
     for cls in (Gaussian, GaussianMixture, TwoMoons, Spiral, SwissRoll)
@@ -58,6 +70,7 @@ __all__ = [
     "report_small_images",
     "Gaussian",
     "GaussianMixture",
+    "ExactGaussianMixture",
     "TwoMoons",
     "Spiral",
     "SwissRoll",
