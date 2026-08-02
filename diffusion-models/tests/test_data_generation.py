@@ -151,6 +151,12 @@ def _exact_mixture(**overrides):
     return ExactGaussianMixture(**kwargs)
 
 
+def _empirical_moments(x, labels, k):
+    """Media y covarianza empíricas de los puntos etiquetados como componente ``k``."""
+    pts = np.asarray(x, dtype=np.float64)[np.asarray(labels) == k]
+    return pts.mean(axis=0), np.cov(pts, rowvar=False)
+
+
 def test_exact_mixture_exposes_parameters_before_sampling():
     # 1.1, 1.2: los tres accesores están disponibles sin haber muestreado.
     mix = _exact_mixture(seed=0)
@@ -203,10 +209,16 @@ def test_exact_mixture_copies_constructor_arrays():
     assert float(mix.weights_.sum()) == pytest.approx(1.0)
     for cov in mix.covariances_:
         assert np.all(np.linalg.eigvalsh(cov) > 0.0)
-    # Y lo que reportan los accesores sigue siendo lo que usa el muestreo: la
-    # Cholesky guardada reconstruye exactamente las covarianzas publicadas.
-    chols = mix._chols
-    assert np.allclose(chols @ np.swapaxes(chols, -1, -2), mix.covariances_)
+    # Y lo que reportan los accesores sigue siendo lo que usa el muestreo: los
+    # momentos empíricos de cada componente reproducen los parámetros
+    # publicados. Es el chequeo por la puerta pública del mismo invariante (si
+    # los arrays se aliasaran, `covariances_` reportaría la varianza inflada de
+    # 100 mientras el muestreo seguiría usando la factorización original).
+    x = mix.sample(8000)
+    for i in range(2):
+        mean_emp, cov_emp = _empirical_moments(x, mix.color_, i)
+        assert np.allclose(mean_emp, mix.means_[i], atol=0.2)
+        assert np.allclose(cov_emp, mix.covariances_[i], atol=0.2)
 
 
 def test_exact_mixture_accepts_full_spd_covariance():
@@ -250,8 +262,11 @@ def test_exact_mixture_accepts_full_spd_covariance():
     ],
 )
 def test_exact_mixture_rejects_invalid_parameters(overrides, culprit):
-    # 1.6: cada entrada inválida nombra el parámetro culpable.
-    with pytest.raises(ValueError, match=culprit):
+    # 1.6: cada entrada inválida nombra el parámetro culpable. El patrón va
+    # anclado al principio del mensaje: los errores de K inconsistente
+    # mencionan a `weights` de pasada (es quien declara el K de referencia), así
+    # que sin el ancla el test no discriminaría a quién se está culpando.
+    with pytest.raises(ValueError, match=f"^{culprit}"):
         _exact_mixture(**overrides)
 
 
@@ -273,6 +288,212 @@ def test_exact_mixture_accepts_standardize_false_explicitly():
     # 5.1: el parámetro existe solo para poder rechazar el caso peligroso.
     mix = _exact_mixture(standardize=False)
     assert mix.standardize is False
+
+
+# --------------------------------------------------------------------------
+# ExactGaussianMixture: contrato de muestreo (1.4, 1.5).
+#
+# El muestreo es determinístico en dos sentidos independientes que se prueban
+# por separado: (a) la *composición* —cuántos puntos toca a cada componente— no
+# se sortea, se reparte por mayor residuo, así que es exacta y no aproximada; y
+# (b) la *geometría* de cada punto sí se sortea, pero de un rng sembrado, así
+# que es reproducible.
+# --------------------------------------------------------------------------
+
+
+def _ring_mixture(weights, *, scale=0.25, seed=0):
+    """Mixtura exacta con los pesos dados, medias en un anillo y covarianzas iguales.
+
+    Sirve para los tests de composición, donde lo que importa son los pesos y no
+    la geometría: las medias van bien separadas solo para que las etiquetas sean
+    verificables sin ambigüedad.
+    """
+    weights = np.asarray(weights, dtype=np.float64)
+    k = weights.size
+    ang = np.linspace(0.0, 2.0 * np.pi, k, endpoint=False)
+    means = 5.0 * np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    covs = np.broadcast_to(np.eye(2) * scale**2, (k, 2, 2))
+    return ExactGaussianMixture(
+        weights=weights, means=means, covariances=covs, seed=seed
+    )
+
+
+def test_exact_mixture_sample_returns_two_columns_float32():
+    # 1.4: shape (n, 2) y precisión simple, como el resto de las formas.
+    x = _exact_mixture(seed=0).sample(257)
+    assert x.shape == (257, 2)
+    assert x.dtype == np.float32
+    assert np.all(np.isfinite(x))
+
+
+def test_exact_mixture_composition_matches_weights_exactly():
+    # 1.4: con w_k * n entero la composición es *exacta*, no aproximada: 600/400
+    # y no "600 ± ruido binomial". Sortear la componente de cada punto no
+    # pasaría este test.
+    mix = _exact_mixture(seed=0)  # weights = [0.6, 0.4]
+    x = mix.sample(1000)
+    counts = np.bincount(mix.color_, minlength=2)
+    assert x.shape == (1000, 2)
+    assert counts.tolist() == [600, 400]
+
+
+def test_exact_mixture_composition_uses_largest_remainder():
+    # 1.4: con w_k * n NO entero hay un resto que repartir. Pesos [0.7, 0.2,
+    # 0.1] y n=13 dan w*n = [9.1, 2.6, 1.3] => parte entera [9, 2, 1] (suma 12)
+    # y el punto que falta va al **mayor residuo** (0.6, la componente 1).
+    # Discrimina las alternativas: un reparto parejo daría [5, 4, 4] y darle el
+    # sobrante al peso más grande daría [10, 2, 1].
+    mix = _ring_mixture([0.7, 0.2, 0.1], seed=3)
+    mix.sample(13)
+    assert np.bincount(mix.color_, minlength=3).tolist() == [9, 3, 1]
+
+
+def test_exact_mixture_composition_ties_break_by_component_index():
+    # 1.4: con residuos empatados el desempate es estable por índice, así que el
+    # reparto es reproducible y no depende del orden interno del sort. Pesos
+    # iguales de a tercios con n=10 dan parte entera [3, 3, 3] y el punto
+    # restante va a la componente 0.
+    mix = _ring_mixture([1 / 3, 1 / 3, 1 / 3], seed=4)
+    mix.sample(10)
+    assert np.bincount(mix.color_, minlength=3).tolist() == [4, 3, 3]
+
+
+def test_exact_mixture_composition_with_fewer_points_than_components():
+    # 1.4: con n < K casi toda la parte entera es cero y el reparto lo decide el
+    # residuo: los 3 puntos van a las 3 componentes de mayor peso, sin perder
+    # ninguno. Los pesos van en orden creciente para que el resultado esperado
+    # ([0, 1, 1, 1]) no coincida con el de un reparto parejo ([1, 1, 1, 0]).
+    mix = _ring_mixture([0.1, 0.2, 0.3, 0.4], seed=5)
+    x = mix.sample(3)
+    counts = np.bincount(mix.color_, minlength=4)
+    assert x.shape == (3, 2)
+    assert int(counts.sum()) == 3
+    assert counts.tolist() == [0, 1, 1, 1]
+
+
+def test_exact_mixture_zero_weight_component_gets_no_points():
+    # 1.4: un peso nulo es un peso válido (no negativo) y su componente no
+    # aporta ni un punto; la etiqueta correspondiente no aparece.
+    mix = _ring_mixture([0.0, 0.5, 0.5], seed=6)
+    mix.sample(100)
+    assert np.bincount(mix.color_, minlength=3).tolist() == [0, 50, 50]
+    assert 0 not in set(mix.color_.tolist())
+
+
+def test_exact_mixture_same_seed_gives_identical_samples():
+    # 1.5: dos instancias con la misma semilla dan exactamente las mismas
+    # muestras (igualdad bit a bit, no "cerca").
+    a = _exact_mixture(seed=7).sample(256)
+    b = _exact_mixture(seed=7).sample(256)
+    assert np.array_equal(a, b)
+
+
+def test_exact_mixture_repeated_calls_with_same_seed_are_identical():
+    # 1.5: "las mismas muestras que en la llamada anterior" también dentro de la
+    # misma instancia: sample() resiembra el rng en cada llamada, así que no
+    # arrastra estado del sorteo previo.
+    mix = _exact_mixture(seed=7)
+    a = mix.sample(256)
+    labels_a = mix.color_.copy()
+    b = mix.sample(256)
+    assert np.array_equal(a, b)
+    assert np.array_equal(labels_a, mix.color_)
+
+
+def test_exact_mixture_different_seed_gives_different_samples():
+    # 1.5: la reproducibilidad no es un muestreo degenerado; con otra semilla la
+    # geometría cambia (la composición, en cambio, es la misma a propósito).
+    a = _exact_mixture(seed=7).sample(256)
+    c = _exact_mixture(seed=8).sample(256)
+    assert not np.array_equal(a, c)
+
+
+def test_exact_mixture_publishes_label_per_point():
+    # 1.4: la etiqueta de componente se publica por punto, como la legacy, y
+    # cada etiqueta es un índice de componente válido.
+    mix = _exact_mixture(seed=0)
+    x = mix.sample(64)
+    assert mix.color_.shape == (len(x),)
+    assert mix.color_.dtype.kind in "iu"
+    assert set(mix.color_.tolist()) <= {0, 1}
+
+
+def test_exact_mixture_color_reflects_only_the_current_sample():
+    # 1.4: convención heredada de PointDistribution.sample(), que resetea
+    # `color_` al inicio de cada muestreo: la etiqueta describe la muestra que
+    # se acaba de devolver y nunca acumula ni arrastra la anterior.
+    mix = _exact_mixture(seed=0)
+    assert mix.color_ is None
+    mix.sample(120)
+    assert mix.color_.shape == (120,)
+    mix.sample(30)
+    assert mix.color_.shape == (30,)
+
+
+def test_exact_mixture_label_matches_the_nearest_declared_mean():
+    # 1.4: la etiqueta no es decorativa; identifica de qué componente salió cada
+    # punto. Con modos bien separados (radio 5, escala 0.25) la componente más
+    # cercana es la verdadera con probabilidad abrumadora.
+    mix = _ring_mixture([0.5, 0.5], seed=9)
+    x = mix.sample(400).astype(np.float64)
+    dist = np.linalg.norm(x[:, None, :] - mix.means_[None, :, :], axis=-1)
+    assert np.array_equal(dist.argmin(axis=1), mix.color_)
+
+
+def test_exact_mixture_samples_are_grouped_by_component():
+    # 1.4 — decisión de contrato: las muestras salen **agrupadas por
+    # componente** (todos los puntos de la 0, después los de la 1, …), sin
+    # permutación final, a diferencia de la legacy `mixture` (sklearn baraja) y
+    # de `Spiral` (permuta explícitamente).
+    #
+    # Es aceptable acá y se fija a propósito: (a) la clase no entra al registry,
+    # así que no puede llegar por YAML a una corrida con `shuffle: false`, que
+    # es el único caso donde el orden se filtraría a los batches; (b) el consumo
+    # natural es por `dataloader(..., shuffle=True)`, que reordena de todos
+    # modos; (c) el oráculo analítico lee los parámetros, no el orden; y (d)
+    # agrupado permite indexar los puntos de una componente sin filtrar,
+    # justamente lo que necesitan las verificaciones por componente. Permutar
+    # costaría un sorteo extra del rng —cambiando el mapa semilla → muestra— sin
+    # agregar información.
+    mix = _ring_mixture([0.5, 0.3, 0.2], seed=10)
+    mix.sample(200)
+    labels = mix.color_
+    assert np.array_equal(labels, np.sort(labels))
+    assert labels.tolist() == [0] * 100 + [1] * 60 + [2] * 40
+
+
+def test_exact_mixture_per_component_moments_match_parameters():
+    # 1.4: cada componente sale de aplicar la factorización de su covarianza a
+    # ruido normal estándar, así que sus momentos empíricos reproducen la media
+    # y la covarianza declaradas —incluida la correlación de la componente
+    # rotada, que una escala solo diagonal perdería—. Tolerancia de Monte Carlo:
+    # el reparto deja 7200 y 4800 puntos por componente, y el error estándar de
+    # una entrada de la covarianza es ~sigma^2 * sqrt(2/n) <= 0.04 para las
+    # varianzas de orden 1-2 de este caso, así que atol=0.2 son varios errores
+    # estándar y además la semilla está fija.
+    mix = _exact_mixture(seed=11)
+    x = mix.sample(12_000)
+    for i in range(2):
+        mean_emp, cov_emp = _empirical_moments(x, mix.color_, i)
+        assert np.allclose(mean_emp, mix.means_[i], atol=0.2), i
+        assert np.allclose(cov_emp, mix.covariances_[i], atol=0.2), i
+    # La segunda componente es la correlacionada: el test no pasaría si el
+    # muestreo ignorara los términos fuera de la diagonal.
+    assert mix.covariances_[1][0, 1] == pytest.approx(0.5)
+
+
+def test_exact_mixture_sampling_does_not_touch_the_true_parameters():
+    # 1.2, 1.4: el estado es inmutable tras la construcción — muestrear no
+    # re-ajusta los parámetros (a diferencia de la estandarización empírica de
+    # la clase base, que recalcula media y desvío en cada sample()).
+    mix = _exact_mixture(seed=0)
+    before = (mix.weights_, mix.means_, mix.covariances_)
+    mix.sample(500)
+    mix.sample(37)
+    assert np.array_equal(mix.weights_, before[0])
+    assert np.array_equal(mix.means_, before[1])
+    assert np.array_equal(mix.covariances_, before[2])
+    assert mix.mean_ is None and mix.std_ is None
 
 
 def test_cli_smoke(tmp_path):
