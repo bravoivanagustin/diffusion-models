@@ -45,12 +45,36 @@ Precisión: los parámetros de la mixtura se guardan en **doble** precisión y l
 intermedios (el armado de ``Σ_k(t)``, su inversa, las responsabilidades) se calculan ahí,
 con independencia de que el caller trabaje en ``float32``. La degradación al dtype del
 caller ocurre recién en la salida de las cantidades que consumen los samplers.
+
+Sesgo de inicialización: una cota, no un número "analítico"
+-----------------------------------------------------------
+
+La divergencia ``KL(p_T ‖ q)`` entre la mixtura ruideada y la distribución de la que el
+sampler efectivamente parte **no admite forma cerrada**. Descomponiéndola como
+``KL = −H(p_T) − E_{p_T}[log q]``, el término cruzado sí sale de los momentos de la
+mixtura, pero la **entropía diferencial de una mixtura de gaussianas no tiene expresión
+cerrada** — es un resultado conocido, y por eso la literatura trabaja con cotas y
+aproximaciones. Solo el caso ``K = 1`` es la excepción: ahí la KL es la gaussiana-gaussiana
+de toda la vida.
+
+Lo que este módulo calcula sin integrar nada es la **cota superior por convexidad de la
+KL**::
+
+    KL( Σ_k w_k N_k ‖ q )  ≤  Σ_k w_k · KL( N_k ‖ q )
+
+con cada término gaussiano-gaussiano de forma cerrada. Es una cota **rigurosa** pero
+**floja**: en la mixtura de prueba de la spec quedó del orden de 2.5 veces el valor real
+(VP ``5.9e-5`` contra ``2.3e-5``; VE ``5.2e-2`` contra ``2.0e-2``; sub-VP ``1.2e-4`` contra
+``8.4e-5``). Hay que leerla como lo que es —un techo— y no como una estimación del sesgo. El
+valor numérico de referencia con su tolerancia, que es la otra mitad del reporte, se calcula
+por cuadratura y llega con el trabajo de referencia numérica.
 """
 
 from __future__ import annotations
 
 import math
 import numbers
+from dataclasses import dataclass
 
 import torch
 
@@ -74,6 +98,89 @@ _PROBE_FRACTIONS: tuple[float, ...] = (0.25, 0.75)
 #: respecto del ruido de la doble precisión, pero órdenes de magnitud por debajo de
 #: cualquier escala por coordenada que valga la pena rechazar.
 _PROPORTIONALITY_TOL: float = 1e-10
+
+#: Dimensión del laboratorio analítico. Aparece explícito en la KL gaussiana (el término
+#: ``-d`` y el ``d·log σ_q²``) para que la fórmula se lea igual que en el papel.
+_DIM: int = 2
+
+#: Cuántos desvíos del estimador cubre la tolerancia que devuelve
+#: :meth:`MixtureOracle.estimate_prior_variance`. El error relativo del estimador escala
+#: como ``sqrt(2/n)`` —la varianza de ``x²`` para ``x ~ N(0, v)`` es ``2v²``—, así que cuatro
+#: desvíos dejan una probabilidad de excederla del orden de ``1e-4``: la tolerancia sirve
+#: como cota utilizable en lugar de como un intervalo que se viola una vez de cada tres.
+_TOLERANCE_SIGMAS: float = 4.0
+
+
+@dataclass(frozen=True, kw_only=True)
+class BiasReport:
+    """Sesgo de inicialización de una SDE: cuánto se aparta ``p_T`` del ruido de partida.
+
+    Reporta **dos cantidades complementarias** en lugar de un único número, porque la KL
+    entre una mixtura y una gaussiana no tiene forma cerrada (ver el docstring del módulo):
+    una cota superior rigurosa que se calcula sin integrar nada, y un valor numérico de
+    referencia con su tolerancia declarada. Que la cota domine al valor las valida
+    mutuamente.
+
+    Es un valor inmutable y se construye por palabra clave, así que ningún campo puede
+    confundirse con otro al leerlo.
+
+    Attributes:
+        bound: Cota superior de forma cerrada, por convexidad de la KL. No negativa. Es un
+            **techo**, no una estimación: en la mixtura de prueba de la spec quedó del orden
+            de 2.5 veces el valor real.
+        value: Valor numérico de referencia de la misma divergencia, o ``None`` cuando
+            todavía no se calculó. Se obtiene por cuadratura sobre la log-densidad exacta y
+            llega con el trabajo de referencia numérica.
+        tolerance: Cota del error de ``value``, derivada de observables de la propia
+            cuadratura. ``None`` mientras ``value`` lo sea.
+        mass: Masa integrada de la densidad, el autochequeo de que la malla alcanzó.
+            ``None`` mientras no se integre.
+        prior_variance: Varianza de la distribución de partida con la que se calculó, tal
+            como la declaró el caller. Queda publicada porque es un dato **suyo**: no se
+            deriva de la SDE.
+        horizon: Instante en el que se evaluó el sesgo.
+    """
+
+    bound: float
+    value: float | None = None
+    tolerance: float | None = None
+    mass: float | None = None
+    prior_variance: float
+    horizon: float
+
+    def __post_init__(self) -> None:
+        """Valida que el reporte describa cantidades admisibles.
+
+        Raises:
+            ValueError: Si ``bound`` no es finito y no negativo, si ``prior_variance`` no es
+                finita y positiva, si ``horizon`` no es finito y no negativo, o si alguna de
+                las cantidades numéricas presentes no es finita y no negativa.
+        """
+        if not math.isfinite(self.bound) or self.bound < 0.0:
+            raise ValueError(
+                "bound debe ser finito y no negativo: es una divergencia acotada por "
+                f"convexidad y cada término es una KL; recibí {self.bound!r}."
+            )
+        if not math.isfinite(self.prior_variance) or self.prior_variance <= 0.0:
+            raise ValueError(
+                "prior_variance debe ser finita y estrictamente positiva; recibí "
+                f"{self.prior_variance!r}."
+            )
+        if not math.isfinite(self.horizon) or self.horizon < 0.0:
+            raise ValueError(
+                "horizon debe ser finito y no negativo: el proceso corre en [0, T]; recibí "
+                f"{self.horizon!r}."
+            )
+        for nombre, valor in (
+            ("value", self.value),
+            ("tolerance", self.tolerance),
+            ("mass", self.mass),
+        ):
+            if valor is not None and (not math.isfinite(valor) or valor < 0.0):
+                raise ValueError(
+                    f"{nombre} debe ser finito y no negativo cuando se informa; recibí "
+                    f"{valor!r}."
+                )
 
 
 class MixtureOracle:
@@ -357,10 +464,7 @@ class MixtureOracle:
             ValueError: Si ``t`` no es un número real finito y no negativo.
         """
         instante = _normalize_scalar_time(t)
-        tt = torch.tensor([[instante]], dtype=torch.float64)
-        alpha, sigma = self.marginal_params(tt)
-        covarianzas = _perturbed_covariances(self._covariances, alpha, sigma)[0]
-        medias = (alpha.reshape(-1, 1, 1) * self._means)[0]
+        medias, covarianzas = self._propagated_components(instante)
         malla = (
             grid
             if grid is not None
@@ -379,7 +483,147 @@ class MixtureOracle:
 
         return integrate(densidad, malla)
 
+    # ------------------------------------------------- sesgo de inicialización
+
+    def initialization_bias(
+        self, prior_variance: float, *, t: float | None = None
+    ) -> BiasReport:
+        """Sesgo de inicialización: cuánto se aparta ``p_t`` del ruido del que arranca el sampler.
+
+        Devuelve la **cota superior de forma cerrada** de ``KL(p_t ‖ N(0, σ_q² I))``, obtenida
+        por convexidad de la KL::
+
+            KL( Σ_k w_k N_k ‖ q )  ≤  Σ_k w_k · KL( N_k ‖ q )
+
+        y con cada término gaussiano-gaussiano escrito en dos dimensiones como::
+
+            KL( N(m, S) ‖ N(0, σ_q² I) ) = ½[ tr(S)/σ_q² + mᵀm/σ_q² − 2 − log det S
+                                              + 2 log σ_q² ]
+
+        sobre ``m = α_t μ_k`` y ``S = Σ_k(t) = α_t² Σ_k + σ_t² I``. **No se integra nada**: es
+        aritmética sobre los parámetros. La KL de la mixtura en sí no tiene forma cerrada (ver
+        el docstring del módulo), así que esto es un **techo** y no una estimación; con una
+        sola componente la desigualdad se satura y la cota **es** la divergencia exacta.
+
+        El valor numérico de referencia y su tolerancia —los campos ``value``, ``tolerance`` y
+        ``mass`` del reporte— se calculan por cuadratura y llegan con el trabajo de referencia
+        numérica; hasta entonces viajan en ``None`` en lugar de con un placeholder que los
+        haría pasar por medidos.
+
+        Args:
+            prior_variance: Varianza de la distribución de la que parte el sampler.
+                **Obligatoria**: no existe forma exacta ni genérica de leerla de la SDE
+                (``prior_sampling`` solo muestrea y no publica su escala, derivarla por
+                variante rompería el único camino de código, y agregarle un accesor a
+                :mod:`diffusion.sde` está fuera de la frontera de este módulo). Los valores
+                de las variantes registradas son ``1.0`` para VP y sub-VP y ``σ_max²`` para
+                VE, es decir ``25.0`` con el ``σ_max = 5.0`` por defecto. Si hace falta
+                averiguarla, :meth:`estimate_prior_variance` la estima de forma explícita y
+                con su tolerancia a la vista; acá no hay caída automática a la estimación,
+                porque entonces la "cota de forma cerrada" dejaría de serlo en silencio.
+            t: Instante en el que se evalúa el sesgo. Si se omite, el horizonte ``T`` de la
+                SDE, que es de donde el sampler realmente arranca.
+
+        Returns:
+            El :class:`BiasReport` con la cota, la varianza de partida usada y el horizonte.
+
+        Raises:
+            TypeError: Si se omite ``prior_variance``. Es un error de llamada de la propia
+                firma, deliberadamente no un valor por defecto.
+            ValueError: Si ``prior_variance`` no es un número real finito y estrictamente
+                positivo, o si ``t`` no es un número real finito y no negativo.
+
+        Note:
+            No se usa ``σ_t`` como sustituto de la varianza de partida aunque esté a mano: en
+            VP da ``0.99998`` contra un prior de varianza ``1.0``, y esa diferencia diminuta
+            *es parte del sesgo que se quiere medir*, así que lo enmascararía.
+        """
+        varianza = _normalize_prior_variance(prior_variance)
+        horizonte = float(self._sde.T) if t is None else _normalize_scalar_time(t)
+
+        medias, covarianzas = self._propagated_components(horizonte)
+        por_componente = _kl_against_isotropic(medias, covarianzas, varianza)
+        cota = float((self._weights * por_componente).sum())
+
+        return BiasReport(bound=cota, prior_variance=varianza, horizon=horizonte)
+
+    def estimate_prior_variance(
+        self, *, n: int = 1_000_000, seed: int = 0
+    ) -> tuple[float, float]:
+        """Estima la varianza de la distribución de partida muestreándola. **Opt-in**.
+
+        Existe como respaldo para cuando el caller no conoce la escala del prior, y devuelve
+        su tolerancia junto con el número justamente para dejar constancia de que el resultado
+        **ya no es de forma cerrada**. Por eso es un método aparte y no el valor por defecto
+        de :meth:`initialization_bias`: si la estimación entrara sola, la cota de forma cerrada
+        dejaría de serlo sin que nadie lo note.
+
+        Estima el **segundo momento por coordenada**, ``E[x²]``, que coincide con la varianza
+        porque los priors de la familia están centrados en el origen —que es además lo que la
+        cota supone al comparar contra ``N(0, σ_q² I)``—. La tolerancia es
+        ``_TOLERANCE_SIGMAS · sqrt(2/n)``: la varianza de ``x²`` para ``x ~ N(0, v)`` es
+        ``2v²``, así que el error relativo del promedio escala como ``sqrt(2/n)``. Se cuenta
+        con los ``n`` puntos y no con los ``2n`` escalares que se promedian, lo que deja la
+        tolerancia del lado conservador.
+
+        Determinístico: siembra su propio generador, así que no depende ni contamina el estado
+        global de torch.
+
+        Args:
+            n: Cantidad de puntos a muestrear. Cuantos más, más fina la tolerancia.
+            seed: Semilla del generador propio.
+
+        Returns:
+            El par ``(varianza, tolerancia_relativa)``.
+
+        Raises:
+            ValueError: Si ``n`` no es un entero de al menos 2, o si ``seed`` no es entero.
+        """
+        if not isinstance(n, numbers.Integral) or int(n) < 2:
+            raise ValueError(
+                "n debe ser un entero de al menos 2 (es una cantidad de puntos a "
+                f"muestrear); recibí {n!r}."
+            )
+        if not isinstance(seed, numbers.Integral):
+            raise ValueError(
+                "seed debe ser un entero para sembrar el generador; recibí un objeto de "
+                f"tipo {type(seed).__name__}."
+            )
+
+        cantidad = int(n)
+        generador = torch.Generator().manual_seed(int(seed))
+        muestra = self._sde.prior_sampling(
+            (cantidad, _DIM), generator=generador, dtype=torch.float64
+        )
+        varianza = float((muestra.to(torch.float64) ** 2).mean())
+        tolerancia = _TOLERANCE_SIGMAS * math.sqrt(2.0 / cantidad)
+        return varianza, tolerancia
+
     # ------------------------------------------------------------------ internos
+
+    def _propagated_components(
+        self, instante: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Medias y covarianzas de la mixtura ya propagadas a un instante **escalar**.
+
+        Es la misma propagación de la que sale todo el módulo —``α_t μ_k`` y
+        ``Σ_k(t) = α_t² Σ_k + σ_t² I``— pero para un único tiempo, que es la forma en la que
+        la necesitan las cantidades escalares: la masa integrada y el sesgo de inicialización.
+        Vive en un solo lugar para que la malla de la cuadratura y la cota cerrada se
+        construyan sobre exactamente los mismos parámetros y no puedan divergir.
+
+        Args:
+            instante: Tiempo escalar, ya validado por :func:`_normalize_scalar_time`.
+
+        Returns:
+            El par ``(medias, covarianzas)`` de formas ``(K, 2)`` y ``(K, 2, 2)``, en
+            ``float64``.
+        """
+        tt = torch.tensor([[instante]], dtype=torch.float64)
+        alpha, sigma = self.marginal_params(tt)
+        covarianzas = _perturbed_covariances(self._covariances, alpha, sigma)[0]
+        medias = (alpha.reshape(-1, 1, 1) * self._means)[0]
+        return medias, covarianzas
 
     def _log_prob_double(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Log-densidad en doble precisión, sin degradar al dtype del caller.
@@ -589,6 +833,83 @@ def _normalize_scalar_time(t: float) -> float:
             f"rango el schedule de la SDE no está definido; recibí {instante!r}."
         )
     return instante
+
+
+def _normalize_prior_variance(prior_variance: float) -> float:
+    """Valida la varianza de la distribución de partida y la devuelve como ``float``.
+
+    Se valida **por tipo** y no intentando una conversión, por la misma razón que el tiempo
+    escalar: ``float()`` acepta cadenas como ``"1.0"``, y colar la escala del prior escrita
+    como texto es exactamente la clase de error que conviene que falle fuerte. Un tensor
+    tampoco pasa: acá la varianza es un escalar declarado por el caller.
+
+    Args:
+        prior_variance: Varianza candidata.
+
+    Returns:
+        La varianza como ``float``.
+
+    Raises:
+        ValueError: Si no es un número real, o si no es finita y estrictamente positiva.
+    """
+    if not isinstance(prior_variance, numbers.Real):
+        raise ValueError(
+            "prior_variance debe ser un número real con la varianza de la distribución de "
+            "la que arranca el sampler (1.0 para VP y sub-VP, sigma_max**2 para VE); recibí "
+            f"un objeto de tipo {type(prior_variance).__name__}."
+        )
+    valor = float(prior_variance)
+    if not math.isfinite(valor) or valor <= 0.0:
+        raise ValueError(
+            "prior_variance debe ser finita y estrictamente positiva: una gaussiana de "
+            f"varianza nula o negativa no describe ninguna distribución de partida; recibí "
+            f"{valor!r}."
+        )
+    return valor
+
+
+def _kl_against_isotropic(
+    means: torch.Tensor, covariances: torch.Tensor, prior_variance: float
+) -> torch.Tensor:
+    """``KL(N(m_k, S_k) ‖ N(0, σ_q² I))`` de cada componente, en forma cerrada.
+
+    En dos dimensiones es::
+
+        ½[ tr(S)/σ_q² + mᵀm/σ_q² − d − log det S + d·log σ_q² ]
+
+    donde el ``d·log σ_q²`` es ``log det(σ_q² I)``, es decir el determinante del prior. Sin
+    solvers ni cuadratura: traza, norma y determinante salen de los propios parámetros.
+
+    El determinante se toma de :func:`_inverse_and_det_2x2`, que es la misma forma cerrada
+    ``2×2`` que usan la densidad y el score y que además exige determinante positivo, así que
+    una covarianza inadmisible avisa acá en lugar de producir un ``nan`` en el logaritmo.
+
+    Cada término se recorta a cero por abajo: la desigualdad de Gibbs garantiza que una KL no
+    es negativa, y el recorte absorbe únicamente el ruido de redondeo del caso degenerado en
+    que la componente **coincide** con la distribución de partida, donde la forma cerrada es
+    una cancelación exacta entre términos de magnitud comparable.
+
+    Args:
+        means: Medias ya contraídas por el kernel, de forma ``(K, 2)``.
+        covariances: Covarianzas ya propagadas al tiempo de interés, de forma ``(K, 2, 2)``.
+        prior_variance: Varianza de la distribución de partida, positiva.
+
+    Returns:
+        Tensor ``(K,)`` no negativo con la divergencia de cada componente.
+
+    Raises:
+        ValueError: Si alguna covarianza no tiene determinante finito y positivo.
+    """
+    _, determinantes = _inverse_and_det_2x2(covariances)
+    trazas = covariances.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    normas2 = (means * means).sum(dim=-1)
+    divergencias = 0.5 * (
+        (trazas + normas2) / prior_variance
+        - float(_DIM)
+        - torch.log(determinantes)
+        + _DIM * math.log(prior_variance)
+    )
+    return divergencias.clamp_min(0.0)
 
 
 def _normalize_state(x: torch.Tensor) -> torch.Tensor:

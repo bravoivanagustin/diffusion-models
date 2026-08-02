@@ -12,7 +12,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 import diffusion.analytic
-from diffusion.analytic.mixture_oracle import MixtureOracle
+from diffusion.analytic.mixture_oracle import BiasReport, MixtureOracle
 from diffusion.analytic.quadrature import QuadratureGrid, auto_grid, integrate
 from diffusion.data_generation import ExactGaussianMixture, GaussianMixture
 from diffusion.sde import ForwardSDE, make_sde
@@ -1969,3 +1969,507 @@ def test_un_peso_nulo_no_contamina_el_score():
 
     assert torch.isfinite(obtenido).all()
     assert torch.allclose(obtenido, esperado, rtol=1e-12, atol=1e-14)
+
+
+# ------------------------------- oráculo: sesgo de inicialización, cota cerrada (6.1, 6.5)
+
+
+#: Varianza de la distribución de partida de cada variante registrada. **No** se lee de la
+#: SDE: ``prior_sampling`` solo muestrea y no publica su escala, así que el número entra como
+#: dato del caller. VP y sub-VP arrancan de ``N(0, I)``; VE de ``N(0, sigma_max² I)`` con el
+#: ``sigma_max = 5.0`` por defecto del paquete.
+_VARIANZA_DEL_PRIOR = {"vp": 1.0, "ve": 25.0, "sub_vp": 1.0}
+
+#: Tiempos en los que se evalúa el sesgo: dos intermedios y el horizonte.
+_TIEMPOS_SESGO = [0.05, 0.5, 1.0]
+
+
+def _kl_gaussiana_contra_isotropica(
+    media: tuple[float, float],
+    cov: tuple[tuple[float, float], tuple[float, float]],
+    varianza_prior: float,
+) -> float:
+    """``KL(N(m, S) ‖ N(0, v I))`` en dos dimensiones, escrita con floats de Python.
+
+    Fuente independiente de la cota: ``½[tr(S)/v + mᵀm/v − 2 − log det S + 2 log v]``,
+    calculada con ``math`` y sin una sola operación de torch, de modo que no sea una
+    tautología contra la producción.
+    """
+    (a, b), (c, d) = cov[0], cov[1]
+    det = a * d - b * c
+    traza = a + d
+    norma2 = media[0] ** 2 + media[1] ** 2
+    return 0.5 * (
+        traza / varianza_prior
+        + norma2 / varianza_prior
+        - 2.0
+        - math.log(det)
+        + 2.0 * math.log(varianza_prior)
+    )
+
+
+def _componentes_ruideadas_a_mano(
+    nombre: str, t: float, mixtura: ExactGaussianMixture, *, contraer: bool = True
+) -> list[
+    tuple[float, tuple[float, float], tuple[tuple[float, float], tuple[float, float]]]
+]:
+    """``(w_k, alpha_t mu_k, Sigma_k(t))`` de cada componente, en floats de Python.
+
+    Args:
+        nombre: Variante cuya forma cerrada de ``(alpha_t, sigma_t)`` escribe el test.
+        t: Instante en el que se propaga la mixtura.
+        mixtura: Mixtura de parámetros exactos.
+        contraer: Si es ``False`` deja las medias **sin** el factor ``alpha_t``, para poder
+            construir a propósito la variante equivocada contra la que discriminar.
+    """
+    a, s = _alpha_sigma_cerrados(nombre, t)
+    factor = a if contraer else 1.0
+    salida = []
+    for w, mu, cov in zip(
+        mixtura.weights_.tolist(),
+        mixtura.means_.tolist(),
+        mixtura.covariances_.tolist(),
+    ):
+        media = (factor * mu[0], factor * mu[1])
+        propagada = (
+            (a * a * cov[0][0] + s * s, a * a * cov[0][1]),
+            (a * a * cov[1][0], a * a * cov[1][1] + s * s),
+        )
+        salida.append((w, media, propagada))
+    return salida
+
+
+def _cota_convexa_a_mano(
+    nombre: str,
+    t: float,
+    mixtura: ExactGaussianMixture,
+    varianza_prior: float,
+    *,
+    contraer: bool = True,
+) -> float:
+    """``Σ_k w_k KL(N_k(t) ‖ N(0, v I))``: la combinación convexa, sumada a mano."""
+    return sum(
+        w * _kl_gaussiana_contra_isotropica(media, cov, varianza_prior)
+        for w, media, cov in _componentes_ruideadas_a_mano(
+            nombre, t, mixtura, contraer=contraer
+        )
+    )
+
+
+def _explota(*args: object, **kwargs: object) -> None:
+    """Reemplazo que falla si alguien lo invoca: marca un camino que no debería recorrerse."""
+    raise AssertionError(
+        "la cota de forma cerrada no debe integrar ni estimar nada; el reemplazo fue invocado."
+    )
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+@pytest.mark.parametrize("valor", _TIEMPOS_SESGO)
+def test_la_cota_es_la_combinacion_convexa_de_las_kl_por_componente(
+    nombre: str, valor: float
+):
+    """Criterio 6.1: la cota es ``Σ_k w_k KL(N_k(t) ‖ prior)``, en las tres SDEs.
+
+    La KL de una mixtura contra una gaussiana **no** tiene forma cerrada —la entropía
+    diferencial de una mixtura no la tiene—, así que lo que sí se puede calcular exactamente
+    es la cota por convexidad de la KL, con cada término gaussiano-gaussiano cerrado. El valor
+    esperado se escribe aparte con ``math`` y con la forma cerrada de ``(alpha, sigma)`` del
+    propio test, así que discrimina cualquier reescritura de la fórmula.
+
+    Tolerancia: ``rtol=1e-12``, el ruido de la doble precisión sobre una suma de unos pocos
+    términos.
+    """
+    mixtura = _mixtura_exacta()
+    varianza = _VARIANZA_DEL_PRIOR[nombre]
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+
+    reporte = oraculo.initialization_bias(varianza, t=valor)
+
+    assert reporte.bound == pytest.approx(
+        _cota_convexa_a_mano(nombre, valor, mixtura, varianza), rel=1e-12
+    )
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+@pytest.mark.parametrize("valor", [1e-4, *_TIEMPOS_SESGO])
+def test_la_cota_es_no_negativa(nombre: str, valor: float):
+    """Criterio 6.6: cada término es una KL, así que la combinación convexa no es negativa."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    reporte = oraculo.initialization_bias(_VARIANZA_DEL_PRIOR[nombre], t=valor)
+    assert reporte.bound >= 0.0
+    assert math.isfinite(reporte.bound)
+
+
+def test_la_cota_se_obtiene_sin_integrar_nada(monkeypatch: pytest.MonkeyPatch):
+    """Criterio 6.1: es **forma cerrada**, no una cuadratura disfrazada.
+
+    Se le saca el integrador al módulo: si la cota lo usara —aunque fuera para dimensionar
+    una malla— este test fallaría con el mensaje del reemplazo en lugar de pasar.
+    """
+    monkeypatch.setattr("diffusion.analytic.mixture_oracle.integrate", _explota)
+    monkeypatch.setattr("diffusion.analytic.mixture_oracle.auto_grid", _explota)
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+
+    reporte = oraculo.initialization_bias(1.0)
+
+    assert reporte.bound > 0.0
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_con_una_sola_componente_la_cota_es_la_kl_exacta(nombre: str):
+    """Criterio 6.4: con ``K = 1`` la cota **es** la KL, porque ahí sí hay forma cerrada.
+
+    La desigualdad de convexidad se satura cuando la mixtura tiene una sola componente: no
+    queda entropía de mezcla que acotar. El valor se compara contra la KL gaussiana-gaussiana
+    escrita a mano, que en ese caso es la divergencia exacta y no una cota.
+    """
+    mixtura = _mixtura_de_una_componente()
+    varianza = _VARIANZA_DEL_PRIOR[nombre]
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+    ((peso, media, cov),) = _componentes_ruideadas_a_mano(nombre, 1.0, mixtura)
+    assert peso == pytest.approx(1.0)
+
+    reporte = oraculo.initialization_bias(varianza, t=1.0)
+
+    assert reporte.bound == pytest.approx(
+        _kl_gaussiana_contra_isotropica(media, cov, varianza), rel=1e-12
+    )
+
+
+def test_la_cota_pondera_cada_componente_por_su_peso():
+    """La combinación es **convexa**: sin los pesos, la cota sería el promedio simple.
+
+    La geometría está elegida para separar las dos candidatas por más de un orden de
+    magnitud: una componente que casi coincide con el prior se lleva el ``0.99`` del peso y
+    una componente lejanísima, cuya KL es del orden de ``10³``, se lleva el ``0.01``. Ponderar
+    da ``~10``; promediar a ciegas da ``~600``. La versión que olvida los pesos no puede
+    satisfacer los dos asserts a la vez.
+    """
+    mixtura = ExactGaussianMixture(
+        2,
+        weights=[0.99, 0.01],
+        means=[[0.0, 0.0], [50.0, 0.0]],
+        covariances=[_identidad(1.0).tolist(), _diagonal(0.04, 0.04).tolist()],
+        seed=0,
+    )
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    componentes = _componentes_ruideadas_a_mano("vp", 0.05, mixtura)
+    por_componente = [
+        _kl_gaussiana_contra_isotropica(media, cov, 1.0)
+        for _, media, cov in componentes
+    ]
+    ponderada = sum(w * kl for (w, _, _), kl in zip(componentes, por_componente))
+    promedio_simple = sum(por_componente) / len(por_componente)
+
+    reporte = oraculo.initialization_bias(1.0, t=0.05)
+
+    assert ponderada < 0.05 * promedio_simple
+    assert reporte.bound == pytest.approx(ponderada, rel=1e-12)
+
+
+def test_la_cota_usa_la_covarianza_en_el_tiempo_y_no_la_de_los_datos():
+    """La covarianza de cada término es ``Sigma_k(t) = alpha_t² Sigma_k + sigma_t² I``.
+
+    Con VE en el horizonte el ruido del kernel aporta ``sigma_T² = 25``, que domina por dos
+    órdenes de magnitud a las covarianzas de los datos: usar ``Sigma_k`` sin propagar da una
+    cota decenas de veces más grande.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("ve"))
+    propagada = _cota_convexa_a_mano("ve", 1.0, mixtura, 25.0)
+    sin_propagar = sum(
+        w
+        * _kl_gaussiana_contra_isotropica(
+            (mu[0], mu[1]),
+            ((cov[0][0], cov[0][1]), (cov[1][0], cov[1][1])),
+            25.0,
+        )
+        for w, mu, cov in zip(
+            mixtura.weights_.tolist(),
+            mixtura.means_.tolist(),
+            mixtura.covariances_.tolist(),
+        )
+    )
+
+    reporte = oraculo.initialization_bias(25.0, t=1.0)
+
+    assert sin_propagar > 10.0 * propagada
+    assert reporte.bound == pytest.approx(propagada, rel=1e-12)
+
+
+def test_la_cota_contrae_las_medias_por_el_factor_del_kernel():
+    """Las medias de cada término son ``alpha_t mu_k``, no las de los datos.
+
+    Con los modos a ``±3000`` y VP en el horizonte el factor vale ``6.6e-3``: la cota
+    correcta queda del orden de ``10²``, mientras que olvidar la contracción da ``10⁶``.
+    """
+    cov = _diagonal(0.25, 0.04).tolist()
+    lejana = ExactGaussianMixture(
+        2,
+        weights=[0.4, 0.6],
+        means=[[-3000.0, 0.0], [3000.0, 1.0]],
+        covariances=[cov, cov],
+        seed=0,
+    )
+    oraculo = MixtureOracle(lejana, make_sde("vp"))
+    contraida = _cota_convexa_a_mano("vp", 1.0, lejana, 1.0)
+    sin_contraer = _cota_convexa_a_mano("vp", 1.0, lejana, 1.0, contraer=False)
+
+    reporte = oraculo.initialization_bias(1.0, t=1.0)
+
+    assert sin_contraer > 1000.0 * contraida
+    assert reporte.bound == pytest.approx(contraida, rel=1e-12)
+
+
+def test_la_cota_resta_el_logaritmo_del_determinante():
+    """El término ``− log det Sigma_k(t)`` entra con su signo.
+
+    Con una componente muy anisotrópica el determinante propagado es bastante menor que uno,
+    así que ``− log det`` aporta un término positivo grande; invertirle el signo cambia la
+    cota en ``2 log det``, que acá son varias unidades.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    componentes = _componentes_ruideadas_a_mano("vp", 0.05, mixtura)
+    correcta = sum(
+        w * _kl_gaussiana_contra_isotropica(media, cov, 1.0)
+        for w, media, cov in componentes
+    )
+    signo_invertido = sum(
+        w
+        * (
+            _kl_gaussiana_contra_isotropica(media, cov, 1.0)
+            + math.log(cov[0][0] * cov[1][1] - cov[0][1] * cov[1][0])
+        )
+        for w, media, cov in componentes
+    )
+
+    reporte = oraculo.initialization_bias(1.0, t=0.05)
+
+    assert abs(correcta - signo_invertido) > 1.0
+    assert reporte.bound == pytest.approx(correcta, rel=1e-12)
+
+
+def test_la_cota_usa_la_varianza_de_partida_y_no_su_desvio():
+    """El parámetro es la **varianza** del prior, no su desvío.
+
+    Para VE el prior es ``N(0, sigma_max² I)`` con ``sigma_max = 5``: pasar ``25`` y pasar
+    ``5`` dan cotas que se separan por más de un orden de magnitud, así que una fórmula que
+    le tomara raíz o cuadrado al argumento no podría coincidir con la referencia.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("ve"))
+    con_varianza = _cota_convexa_a_mano("ve", 1.0, mixtura, 25.0)
+    con_desvio = _cota_convexa_a_mano("ve", 1.0, mixtura, 5.0)
+
+    reporte = oraculo.initialization_bias(25.0, t=1.0)
+
+    assert abs(con_desvio - con_varianza) > 10.0 * con_varianza
+    assert reporte.bound == pytest.approx(con_varianza, rel=1e-12)
+
+
+def test_la_cota_es_cero_cuando_la_componente_coincide_con_la_partida():
+    """Criterio 6.6: la cota se anula cuando ``p_T`` **es** la distribución de partida.
+
+    Se construye el caso degenerado a propósito: una sola componente centrada en el origen y
+    una varianza de partida igual a ``sigma_T² + 0.01``, que es justo la varianza propagada.
+    Fija además que el resultado no se vaya del lado negativo por redondeo.
+    """
+    centrada = ExactGaussianMixture(
+        2,
+        weights=[1.0],
+        means=[[0.0, 0.0]],
+        covariances=[_identidad(0.01).tolist()],
+        seed=0,
+    )
+    oraculo = MixtureOracle(centrada, make_sde("ve"))
+    _, sigma = oraculo.marginal_params(torch.tensor([1.0], dtype=torch.float64))
+    varianza = float(sigma[0, 0]) ** 2 + 0.01
+
+    reporte = oraculo.initialization_bias(varianza, t=1.0)
+
+    assert reporte.bound >= 0.0
+    assert reporte.bound < 1e-12
+
+
+def test_omitir_la_varianza_de_partida_es_un_error_de_llamada():
+    """Criterio 6.5: la varianza de partida es obligatoria, nunca se estima en silencio.
+
+    No hay forma exacta ni genérica de leerla de la SDE (``prior_sampling`` solo muestrea),
+    así que si se pudiera omitir el camino por defecto sería una estimación y la cota dejaría
+    de ser de forma cerrada sin que el caller lo note. Omitirla es un ``TypeError`` de la
+    propia firma.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(TypeError):
+        oraculo.initialization_bias()  # type: ignore[call-arg]
+
+
+def test_la_cota_no_cae_en_la_estimacion_de_la_varianza_de_partida(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """El camino de la cota no toca el estimador: la varianza que usa es la que le pasaron."""
+    monkeypatch.setattr(MixtureOracle, "estimate_prior_variance", _explota)
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+
+    reporte = oraculo.initialization_bias(1.0)
+
+    assert reporte.prior_variance == 1.0
+
+
+@pytest.mark.parametrize("valor", [0.0, -1.0, float("nan"), float("inf")])
+def test_rechaza_una_varianza_de_partida_fuera_de_rango(valor: float):
+    """Una varianza nula, negativa o no finita no describe ninguna distribución de partida."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^prior_variance debe"):
+        oraculo.initialization_bias(valor)
+
+
+@pytest.mark.parametrize(
+    "malo", ["1.0", None, torch.tensor([1.0], dtype=torch.float64)]
+)
+def test_rechaza_una_varianza_de_partida_que_no_es_un_numero(malo: object):
+    """La varianza es un escalar; la cadena ``"1.0"`` es el caso con dientes.
+
+    ``float("1.0")`` la convierte sin chistar, así que validar por conversión en lugar de por
+    tipo la aceptaría en silencio.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^prior_variance debe"):
+        oraculo.initialization_bias(malo)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_horizonte_por_defecto_es_el_de_la_sde(nombre: str):
+    """Sin ``t`` explícito el sesgo se evalúa en el horizonte que declara la SDE."""
+    sde = make_sde(nombre)
+    oraculo = MixtureOracle(_mixtura_exacta(), sde)
+
+    reporte = oraculo.initialization_bias(_VARIANZA_DEL_PRIOR[nombre])
+
+    assert reporte.horizon == pytest.approx(float(sde.T))
+    explicito = oraculo.initialization_bias(
+        _VARIANZA_DEL_PRIOR[nombre], t=float(sde.T)
+    )
+    assert reporte.bound == pytest.approx(explicito.bound, rel=1e-15)
+
+
+def test_el_reporte_publica_la_varianza_de_partida_y_el_horizonte():
+    """Criterio 6.5: el reporte deja a la vista con qué prior y en qué tiempo se calculó."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("ve"))
+    reporte = oraculo.initialization_bias(25.0, t=0.5)
+    assert isinstance(reporte, BiasReport)
+    assert reporte.prior_variance == pytest.approx(25.0)
+    assert reporte.horizon == pytest.approx(0.5)
+
+
+def test_el_reporte_deja_en_none_las_cantidades_que_dependen_de_la_cuadratura():
+    """El valor numérico de referencia no es forma cerrada: viaja explícitamente vacío.
+
+    Publicar un cero o un placeholder haría pasar por medido algo que todavía no se calcula.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    reporte = oraculo.initialization_bias(1.0)
+    assert reporte.value is None
+    assert reporte.tolerance is None
+    assert reporte.mass is None
+
+
+def test_el_reporte_es_inmutable():
+    """El reporte es un valor: no se le puede reescribir la cota después de calculada."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    reporte = oraculo.initialization_bias(1.0)
+    with pytest.raises(Exception):
+        reporte.bound = 0.0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("valor", [-1e-3, float("nan"), float("inf")])
+def test_la_cota_rechaza_un_tiempo_invalido(valor: float):
+    """Mismo contrato de tiempo escalar que la masa integrada."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        oraculo.initialization_bias(1.0, t=valor)
+
+
+def test_la_cota_rechaza_un_tiempo_que_no_es_un_numero():
+    """La cadena ``"0.5"`` no es un instante del proceso."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^t debe"):
+        oraculo.initialization_bias(1.0, t="0.5")  # type: ignore[arg-type]
+
+
+def test_la_cota_repetida_da_el_mismo_numero_y_no_muta_el_oraculo():
+    """Determinístico y sin estado: dos llamadas idénticas dan el mismo valor."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("sub_vp"))
+    primera = oraculo.initialization_bias(1.0, t=0.5)
+    intermedia = oraculo.initialization_bias(25.0, t=0.1)
+    segunda = oraculo.initialization_bias(1.0, t=0.5)
+    assert primera == segunda
+    assert intermedia.bound != primera.bound
+
+
+# --------------------- oráculo: estimación opt-in de la varianza de partida (6.5)
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_la_estimacion_se_acerca_a_la_varianza_conocida_de_cada_prior(nombre: str):
+    """El estimador de respaldo cae dentro de la tolerancia que él mismo declara.
+
+    Las varianzas conocidas son ``1.0`` para VP y sub-VP y ``sigma_max² = 25`` para VE. El
+    error relativo del estimador escala como ``sqrt(2/n)``, así que la tolerancia devuelta
+    tiene que contener la desviación observada — es lo que la vuelve utilizable como cota y no
+    como decorado.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+    conocida = _VARIANZA_DEL_PRIOR[nombre]
+
+    varianza, tolerancia = oraculo.estimate_prior_variance(n=100_000, seed=0)
+
+    assert tolerancia > 0.0
+    assert abs(varianza - conocida) / conocida <= tolerancia
+
+
+def test_la_estimacion_es_determinista_para_una_semilla_fija():
+    """Misma semilla, mismo número: el estimador no arrastra el estado global de torch."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("ve"))
+    torch.manual_seed(1234)
+    primera = oraculo.estimate_prior_variance(n=5_000, seed=7)
+    torch.manual_seed(4321)
+    segunda = oraculo.estimate_prior_variance(n=5_000, seed=7)
+    otra = oraculo.estimate_prior_variance(n=5_000, seed=8)
+
+    assert primera == segunda
+    assert primera[0] != otra[0]
+
+
+def test_la_tolerancia_de_la_estimacion_se_afina_al_crecer_la_muestra():
+    """La tolerancia es un número computado a partir de ``n``, no una constante."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    _, tolerancia_chica = oraculo.estimate_prior_variance(n=1_000, seed=0)
+    _, tolerancia_grande = oraculo.estimate_prior_variance(n=100_000, seed=0)
+    assert tolerancia_grande < tolerancia_chica
+    assert tolerancia_grande == pytest.approx(tolerancia_chica / 10.0, rel=1e-12)
+
+
+@pytest.mark.parametrize("valor", [1, 0, -5])
+def test_la_estimacion_rechaza_un_tamano_de_muestra_invalido(valor: int):
+    """Con menos de dos puntos no hay estimación posible."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^n debe"):
+        oraculo.estimate_prior_variance(n=valor)
+
+
+@pytest.mark.parametrize("malo", [2.5, "10", None])
+def test_la_estimacion_rechaza_un_tamano_de_muestra_que_no_es_entero(malo: object):
+    """El tamaño de muestra es una cantidad de puntos: un flotante no lo describe."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^n debe"):
+        oraculo.estimate_prior_variance(n=malo)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("malo", [1.5, "7", None])
+def test_la_estimacion_rechaza_una_semilla_que_no_es_entera(malo: object):
+    """La semilla es entera: cualquier otra cosa es un error del caller."""
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    with pytest.raises(ValueError, match=r"^seed debe"):
+        oraculo.estimate_prior_variance(seed=malo)  # type: ignore[arg-type]
