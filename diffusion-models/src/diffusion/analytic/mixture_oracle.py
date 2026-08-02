@@ -65,9 +65,25 @@ KL**::
 con cada término gaussiano-gaussiano de forma cerrada. Es una cota **rigurosa** pero
 **floja**: en la mixtura de prueba de la spec quedó del orden de 2.5 veces el valor real
 (VP ``5.9e-5`` contra ``2.3e-5``; VE ``5.2e-2`` contra ``2.0e-2``; sub-VP ``1.2e-4`` contra
-``8.4e-5``). Hay que leerla como lo que es —un techo— y no como una estimación del sesgo. El
-valor numérico de referencia con su tolerancia, que es la otra mitad del reporte, se calcula
-por cuadratura y llega con el trabajo de referencia numérica.
+``8.4e-5``). Hay que leerla como lo que es —un techo— y no como una estimación del sesgo.
+
+La otra mitad del reporte es el **valor numérico de referencia**, que sí es la divergencia en
+sí y se obtiene por **cuadratura 2D** sobre la log-densidad exacta::
+
+    KL(p_t ‖ q) = ∫ p_t(x) · [ log p_t(x) − log q(x) ] dx
+
+integrada sobre la misma clase de malla que la masa —dimensionada por los parámetros ya
+propagados a ``t`` y ampliada para cubrir también la distribución de partida—. En dos
+dimensiones la exactitud es barata: la suma de Riemann sobre integrandos gaussianos converge
+espectralmente, y en la mixtura de prueba cuadruplicar la resolución mueve el valor en
+``3e-18``. Que las dos cantidades se sandwicheen (``bound ≥ value ≥ 0``) las valida
+mutuamente: salen de dos caminos de cálculo sin nada en común.
+
+El valor viaja con su **tolerancia** y con la **masa integrada**, que es el autochequeo de que
+la malla alcanzó (ver :func:`_quadrature_tolerance`). Cuando la masa se aparta de uno más allá
+de esa tolerancia el cálculo **falla** en lugar de devolver el número: un valor de referencia
+calculado sobre una malla insuficiente es peor que ninguno, porque viaja con la misma pinta que
+uno bueno.
 """
 
 from __future__ import annotations
@@ -128,13 +144,15 @@ class BiasReport:
         bound: Cota superior de forma cerrada, por convexidad de la KL. No negativa. Es un
             **techo**, no una estimación: en la mixtura de prueba de la spec quedó del orden
             de 2.5 veces el valor real.
-        value: Valor numérico de referencia de la misma divergencia, o ``None`` cuando
-            todavía no se calculó. Se obtiene por cuadratura sobre la log-densidad exacta y
-            llega con el trabajo de referencia numérica.
-        tolerance: Cota del error de ``value``, derivada de observables de la propia
-            cuadratura. ``None`` mientras ``value`` lo sea.
-        mass: Masa integrada de la densidad, el autochequeo de que la malla alcanzó.
-            ``None`` mientras no se integre.
+        value: Valor numérico de referencia de la misma divergencia, obtenido por cuadratura
+            sobre la log-densidad exacta. No negativo, y no mayor que ``bound`` salvo en el caso
+            degenerado en que las dos son cero a nivel de redondeo (ahí ambas quedan del orden
+            de ``1e-17`` y el orden entre ellas es ruido, no información).
+        tolerance: Cota del error de ``value``, derivada de dos observables de la propia
+            cuadratura: la desviación de ``mass`` respecto de uno y el paso de la malla (ver
+            :func:`_quadrature_tolerance`). Es un número **computado**, no una constante.
+        mass: Masa integrada de la densidad sobre **la misma malla** con la que se calculó
+            ``value``: el autochequeo de que la malla alcanzó. Vale uno salvo redondeo.
         prior_variance: Varianza de la distribución de partida con la que se calculó, tal
             como la declaró el caller. Queda publicada porque es un dato **suyo**: no se
             deriva de la SDE.
@@ -142,9 +160,9 @@ class BiasReport:
     """
 
     bound: float
-    value: float | None = None
-    tolerance: float | None = None
-    mass: float | None = None
+    value: float
+    tolerance: float
+    mass: float
     prior_variance: float
     horizon: float
 
@@ -154,7 +172,7 @@ class BiasReport:
         Raises:
             ValueError: Si ``bound`` no es finito y no negativo, si ``prior_variance`` no es
                 finita y positiva, si ``horizon`` no es finito y no negativo, o si alguna de
-                las cantidades numéricas presentes no es finita y no negativa.
+                las cantidades que salen de la cuadratura no es finita y no negativa.
         """
         if not math.isfinite(self.bound) or self.bound < 0.0:
             raise ValueError(
@@ -176,10 +194,10 @@ class BiasReport:
             ("tolerance", self.tolerance),
             ("mass", self.mass),
         ):
-            if valor is not None and (not math.isfinite(valor) or valor < 0.0):
+            if not math.isfinite(valor) or valor < 0.0:
                 raise ValueError(
-                    f"{nombre} debe ser finito y no negativo cuando se informa; recibí "
-                    f"{valor!r}."
+                    f"{nombre} debe ser finito y no negativo: sale de una cuadratura sobre "
+                    f"una densidad no negativa; recibí {valor!r}."
                 )
 
 
@@ -486,12 +504,21 @@ class MixtureOracle:
     # ------------------------------------------------- sesgo de inicialización
 
     def initialization_bias(
-        self, prior_variance: float, *, t: float | None = None
+        self,
+        prior_variance: float,
+        *,
+        t: float | None = None,
+        grid: QuadratureGrid | None = None,
     ) -> BiasReport:
         """Sesgo de inicialización: cuánto se aparta ``p_t`` del ruido del que arranca el sampler.
 
-        Devuelve la **cota superior de forma cerrada** de ``KL(p_t ‖ N(0, σ_q² I))``, obtenida
-        por convexidad de la KL::
+        Devuelve **dos cantidades complementarias** de ``KL(p_t ‖ N(0, σ_q² I))``, porque la
+        divergencia entre una mixtura y una gaussiana no tiene forma cerrada (ver el docstring
+        del módulo): una **cota superior** que es pura aritmética sobre los parámetros y un
+        **valor numérico de referencia** que se integra. Que se sandwicheen
+        (``bound ≥ value ≥ 0``) las valida mutuamente.
+
+        La cota sale de la convexidad de la KL::
 
             KL( Σ_k w_k N_k ‖ q )  ≤  Σ_k w_k · KL( N_k ‖ q )
 
@@ -500,15 +527,29 @@ class MixtureOracle:
             KL( N(m, S) ‖ N(0, σ_q² I) ) = ½[ tr(S)/σ_q² + mᵀm/σ_q² − 2 − log det S
                                               + 2 log σ_q² ]
 
-        sobre ``m = α_t μ_k`` y ``S = Σ_k(t) = α_t² Σ_k + σ_t² I``. **No se integra nada**: es
-        aritmética sobre los parámetros. La KL de la mixtura en sí no tiene forma cerrada (ver
-        el docstring del módulo), así que esto es un **techo** y no una estimación; con una
-        sola componente la desigualdad se satura y la cota **es** la divergencia exacta.
+        sobre ``m = α_t μ_k`` y ``S = Σ_k(t) = α_t² Σ_k + σ_t² I``. Para la cota **no se integra
+        nada**: es aritmética sobre los parámetros, y por eso no depende de la malla. Es un
+        **techo** y no una estimación; con una sola componente la desigualdad se satura y la
+        cota **es** la divergencia exacta.
 
-        El valor numérico de referencia y su tolerancia —los campos ``value``, ``tolerance`` y
-        ``mass`` del reporte— se calculan por cuadratura y llegan con el trabajo de referencia
-        numérica; hasta entonces viajan en ``None`` en lugar de con un placeholder que los
-        haría pasar por medidos.
+        El valor de referencia sí se integra, sobre la log-densidad exacta del propio módulo::
+
+            value = ∫ p_t(x) · [ log p_t(x) − log N(x; 0, σ_q² I) ] dx
+
+        La malla por defecto la dimensiona ``auto_grid`` a partir de las covarianzas **ya
+        evaluadas en** ``t`` y de las medias contraídas ``α_t μ_k`` —la escala real de la
+        densidad que se integra— y se amplía con ``prior_std = sqrt(prior_variance)``, porque el
+        integrando compara contra la distribución de partida y esta puede ser mucho más ancha
+        que los datos (para VE lo es: desvío ``5`` contra datos de escala ``1``). Sobre esa misma
+        malla se integra la masa, que viaja en el reporte como autochequeo, y de ella y del paso
+        sale la ``tolerance`` (ver :func:`_quadrature_tolerance`).
+
+        El valor se recorta a cero por abajo: la desigualdad de Gibbs garantiza que una KL no es
+        negativa, y el recorte absorbe únicamente el ruido de redondeo del caso degenerado en que
+        ``p_t`` **es** la distribución de partida. Ahí el integrando es una cancelación entre dos
+        log-densidades escritas con fórmulas distintas, así que la cuadratura devuelve del orden
+        de ``1e-16`` con signo arbitrario y sin el recorte el reporte podría publicar una
+        divergencia negativa.
 
         Args:
             prior_variance: Varianza de la distribución de la que parte el sampler.
@@ -523,15 +564,22 @@ class MixtureOracle:
                 porque entonces la "cota de forma cerrada" dejaría de serlo en silencio.
             t: Instante en el que se evalúa el sesgo. Si se omite, el horizonte ``T`` de la
                 SDE, que es de donde el sampler realmente arranca.
+            grid: Malla explícita para la cuadratura. Si se omite, se dimensiona
+                automáticamente. Misma convención que :meth:`total_mass`. Solo afecta al valor
+                numérico: la cota es la misma con cualquier malla.
 
         Returns:
-            El :class:`BiasReport` con la cota, la varianza de partida usada y el horizonte.
+            El :class:`BiasReport` con las dos cantidades, la masa integrada, la tolerancia, la
+            varianza de partida usada y el horizonte.
 
         Raises:
             TypeError: Si se omite ``prior_variance``. Es un error de llamada de la propia
                 firma, deliberadamente no un valor por defecto.
             ValueError: Si ``prior_variance`` no es un número real finito y estrictamente
-                positivo, o si ``t`` no es un número real finito y no negativo.
+                positivo, si ``t`` no es un número real finito y no negativo, o si la masa
+                integrada se aparta de uno más allá de la tolerancia declarada — en ese caso la
+                malla no alcanzó, y devolver el número sería peor que fallar, porque viajaría
+                con la misma pinta que uno bueno.
 
         Note:
             No se usa ``σ_t`` como sustituto de la varianza de partida aunque esté a mano: en
@@ -545,7 +593,60 @@ class MixtureOracle:
         por_componente = _kl_against_isotropic(medias, covarianzas, varianza)
         cota = float((self._weights * por_componente).sum())
 
-        return BiasReport(bound=cota, prior_variance=varianza, horizon=horizonte)
+        malla = (
+            grid
+            if grid is not None
+            else auto_grid(
+                means=medias,
+                covariances=covarianzas,
+                prior_std=math.sqrt(varianza),
+            )
+        )
+        # La masa se integra **antes** del valor y sobre la misma malla: si la malla no alcanza,
+        # se avisa sin pagar la segunda pasada.
+        masa = self.total_mass(horizonte, grid=malla)
+        desviacion = abs(masa - 1.0)
+        tolerancia = _quadrature_tolerance(malla, masa)
+        if desviacion > tolerancia:
+            raise ValueError(
+                f"la masa integrada dio {masa!r} y se aparta de uno en {desviacion!r}, más que "
+                f"la tolerancia {tolerancia!r} que una malla de {malla.n_points} nodos por eje "
+                f"sobre [-{malla.half_width}, {malla.half_width}] admite: la malla no alcanza "
+                "para esta densidad. El valor de referencia calculado sobre ella no sería "
+                "confiable, así que no se devuelve. Ampliá el dominio o refiná el paso (o dejá "
+                "que se dimensione automáticamente omitiendo grid)."
+            )
+
+        def divergencia_puntual(puntos: torch.Tensor) -> torch.Tensor:
+            """Integrando ``p_t (log p_t − log q)`` en los nodos de un bloque de la malla."""
+            tiempos = torch.full(
+                (puntos.shape[0],),
+                horizonte,
+                dtype=puntos.dtype,
+                device=puntos.device,
+            )
+            log_p = self._log_prob_double(puntos, tiempos)
+            log_q = _log_isotropic_gaussian(puntos.to(torch.float64), varianza)
+            densidad = torch.exp(log_p)
+            # Donde la densidad desborda a cero el integrando vale cero: es el límite correcto
+            # de ``p log p`` y evita el ``0 · (-inf)`` que daría ``nan`` si el caller pidiera una
+            # malla tan ancha que la forma cuadrática desbordara.
+            return torch.where(
+                densidad > 0.0,
+                densidad * (log_p - log_q),
+                torch.zeros_like(densidad),
+            )
+
+        valor = max(integrate(divergencia_puntual, malla), 0.0)
+
+        return BiasReport(
+            bound=cota,
+            value=valor,
+            tolerance=tolerancia,
+            mass=masa,
+            prior_variance=varianza,
+            horizon=horizonte,
+        )
 
     def estimate_prior_variance(
         self, *, n: int = 1_000_000, seed: int = 0
@@ -910,6 +1011,64 @@ def _kl_against_isotropic(
         + _DIM * math.log(prior_variance)
     )
     return divergencias.clamp_min(0.0)
+
+
+def _log_isotropic_gaussian(x: torch.Tensor, variance: float) -> torch.Tensor:
+    """``log N(x; 0, σ_q² I)`` en dos dimensiones: la log-densidad de la distribución de partida.
+
+    Se escribe acá, en vez de reusar la maquinaria de la mixtura, porque es el **otro** lado de
+    la comparación: la referencia contra la que se mide ``p_t``. Una gaussiana isotrópica
+    centrada en el origen no necesita ni inversas ni determinantes —la forma cuadrática es
+    ``‖x‖²/σ_q²`` y el logaritmo del determinante es ``d log σ_q²``—, así que la fórmula queda a
+    la vista y no comparte código con lo que se está midiendo.
+
+    Args:
+        x: Puntos del plano, de forma ``(N, 2)``, en doble precisión.
+        variance: Varianza de la distribución de partida, positiva.
+
+    Returns:
+        Tensor ``(N,)`` con la log-densidad de cada punto.
+    """
+    return (
+        _LOG_NORMALIZACION_2D
+        - 0.5 * _DIM * math.log(variance)
+        - (x * x).sum(dim=-1) / (2.0 * variance)
+    )
+
+
+def _quadrature_tolerance(grid: QuadratureGrid, mass: float) -> float:
+    """Cota del error de la cuadratura, derivada de dos observables de la propia malla.
+
+    Los dos observables son el **paso relativo** —el paso de la malla medido en unidades del
+    dominio que cubre, ``spacing / (2 half_width)``, que es la inversa de la resolución— y la
+    **desviación de la masa integrada respecto de uno**::
+
+        tolerance = paso_relativo · ( paso_relativo + |mass − 1| )
+
+    - El término ``paso_relativo²`` es el error de **discretización**: una suma de Riemann cuyas
+      colas se anulan es de segundo orden en el paso. Sobre integrandos gaussianos la
+      convergencia es de hecho espectral, así que el término es conservador por varios órdenes
+      de magnitud (medido: cuadruplicar la resolución mueve el valor en ``3e-18`` mientras la
+      tolerancia cae de ``1e-4`` a ``6e-6``).
+    - El término ``paso_relativo · |mass − 1|`` es la parte atribuible a lo que el **dominio** no
+      cubre, amortiguada por el mismo factor. El amortiguamiento es lo que vuelve *exigible* el
+      autochequeo: comparar ``|mass − 1|`` contra esta tolerancia pide una masa tanto más cercana
+      a uno cuanto más fina sea la malla. Si la masa entrara con coeficiente uno, la comparación
+      se cumpliría siempre y el chequeo no diría nada.
+
+    Es **adimensional** a propósito: no depende de las unidades de ``x``, así que la misma
+    fórmula sirve para una mixtura de escala ``1`` y para una de escala ``1000``. Y no hay
+    ninguna constante elegida a mano: los dos números salen de la malla y de la integral.
+
+    Args:
+        grid: Malla sobre la que se integró.
+        mass: Masa integrada de la densidad sobre esa misma malla.
+
+    Returns:
+        La tolerancia como ``float`` positivo.
+    """
+    paso_relativo = grid.spacing / (2.0 * grid.half_width)
+    return paso_relativo * (paso_relativo + abs(mass - 1.0))
 
 
 def _normalize_state(x: torch.Tensor) -> torch.Tensor:

@@ -2059,7 +2059,7 @@ def _cota_convexa_a_mano(
 def _explota(*args: object, **kwargs: object) -> None:
     """Reemplazo que falla si alguien lo invoca: marca un camino que no debería recorrerse."""
     raise AssertionError(
-        "la cota de forma cerrada no debe integrar ni estimar nada; el reemplazo fue invocado."
+        "el sesgo no debe estimar la varianza de partida; el reemplazo fue invocado."
     )
 
 
@@ -2100,19 +2100,27 @@ def test_la_cota_es_no_negativa(nombre: str, valor: float):
     assert math.isfinite(reporte.bound)
 
 
-def test_la_cota_se_obtiene_sin_integrar_nada(monkeypatch: pytest.MonkeyPatch):
-    """Criterio 6.1: es **forma cerrada**, no una cuadratura disfrazada.
+def test_la_cota_no_depende_de_la_malla_de_la_cuadratura():
+    """Criterio 6.1: la cota es **forma cerrada**, no una cuadratura disfrazada.
 
-    Se le saca el integrador al módulo: si la cota lo usara —aunque fuera para dimensionar
-    una malla— este test fallaría con el mensaje del reemplazo en lugar de pasar.
+    El reporte trae las dos mitades y una de ellas sí se integra, así que la forma de exigir que
+    la cota no lo haga es que sea **idéntica bit a bit** con dos mallas de resoluciones muy
+    distintas, mientras la tolerancia del valor —que sí depende de la malla— cambia. Una cota
+    calculada por cuadratura, o corregida por la masa, no podría coincidir exactamente.
     """
-    monkeypatch.setattr("diffusion.analytic.mixture_oracle.integrate", _explota)
-    monkeypatch.setattr("diffusion.analytic.mixture_oracle.auto_grid", _explota)
-    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    automatica = _malla_del_sesgo(oraculo, mixtura, 1.0, 1.0)
+    fina = QuadratureGrid(
+        half_width=1.25 * automatica.half_width, n_points=3 * automatica.n_points
+    )
 
-    reporte = oraculo.initialization_bias(1.0)
+    por_defecto = oraculo.initialization_bias(1.0)
+    con_malla_fina = oraculo.initialization_bias(1.0, grid=fina)
 
-    assert reporte.bound > 0.0
+    assert por_defecto.bound > 0.0
+    assert con_malla_fina.bound == por_defecto.bound
+    assert con_malla_fina.tolerance < por_defecto.tolerance
 
 
 @pytest.mark.parametrize("nombre", _SDES_ESCALARES)
@@ -2363,18 +2371,6 @@ def test_el_reporte_publica_la_varianza_de_partida_y_el_horizonte():
     assert reporte.horizon == pytest.approx(0.5)
 
 
-def test_el_reporte_deja_en_none_las_cantidades_que_dependen_de_la_cuadratura():
-    """El valor numérico de referencia no es forma cerrada: viaja explícitamente vacío.
-
-    Publicar un cero o un placeholder haría pasar por medido algo que todavía no se calcula.
-    """
-    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
-    reporte = oraculo.initialization_bias(1.0)
-    assert reporte.value is None
-    assert reporte.tolerance is None
-    assert reporte.mass is None
-
-
 def test_el_reporte_es_inmutable():
     """El reporte es un valor: no se le puede reescribir la cota después de calculada."""
     oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
@@ -2473,3 +2469,394 @@ def test_la_estimacion_rechaza_una_semilla_que_no_es_entera(malo: object):
     oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
     with pytest.raises(ValueError, match=r"^seed debe"):
         oraculo.estimate_prior_variance(seed=malo)  # type: ignore[arg-type]
+
+
+# ------------- oráculo: sesgo de inicialización, valor por cuadratura (6.2, 6.3, 6.6)
+
+
+#: Medio ancho y nodos de las mallas que los tests construyen por su cuenta para integrar la
+#: divergencia sin pedirle la malla al módulo. Cubren de sobra los ocho desvíos de la mixtura
+#: de prueba (y los cuarenta de VE) con un paso bastante más fino que el mínimo necesario.
+_MALLA_PROPIA = {"vp": (12.0, 601), "ve": (45.0, 601), "sub_vp": (12.0, 601)}
+
+
+def _malla_de_puntos(medio_ancho: float, nodos: int) -> "torch.Tensor":
+    """Nodos ``(N, 2)`` de una malla cuadrada centrada en el origen, armada acá.
+
+    No usa ``QuadratureGrid`` ni ``integrate``: es la malla del test, para que la cuadratura de
+    referencia no comparta una sola línea con la de producción.
+    """
+    eje = torch.linspace(-medio_ancho, medio_ancho, nodos, dtype=torch.float64)
+    fila, columna = torch.meshgrid(eje, eje, indexing="ij")
+    return torch.stack((columna, fila), dim=-1).reshape(-1, 2)
+
+
+def _log_gaussiana_isotropica(
+    puntos: "torch.Tensor", varianza_prior: float
+) -> "torch.Tensor":
+    """``log N(x; 0, v I)`` en dos dimensiones, escrita aparte con ``math``."""
+    return -math.log(2.0 * math.pi * varianza_prior) - (puntos * puntos).sum(dim=-1) / (
+        2.0 * varianza_prior
+    )
+
+
+def _kl_por_cuadratura_independiente(
+    nombre: str,
+    t: float,
+    mixtura: ExactGaussianMixture,
+    varianza_prior: float,
+    *,
+    con_termino_del_prior: bool = True,
+) -> float:
+    """``∫ p_t (log p_t − log q)`` integrada con la malla y la mixtura del propio test.
+
+    Segunda implementación de punta a punta: los parámetros ruideados salen de la forma cerrada
+    de ``(alpha_t, sigma_t)`` escrita en el test, la densidad se suma en el dominio **lineal**
+    con el álgebra lineal genérica de torch, la malla la arma el test y la suma de Riemann se
+    escribe acá. No comparte código con la producción, así que no es una tautología.
+
+    Args:
+        nombre: Variante cuya forma cerrada usa el test.
+        t: Instante en el que se evalúa la divergencia.
+        mixtura: Mixtura de parámetros exactos.
+        varianza_prior: Varianza de la distribución de partida.
+        con_termino_del_prior: Si es ``False`` integra solo ``∫ p log p`` —es decir menos la
+            entropía—, que es la variante equivocada contra la que se discrimina.
+    """
+    medio_ancho, nodos = _MALLA_PROPIA[nombre]
+    puntos = _malla_de_puntos(medio_ancho, nodos)
+    medias, covs = _params_ruideados(nombre, t, mixtura)
+    densidad = _mixtura(mixtura.weights_.tolist(), medias, covs)(puntos)
+    integrando = torch.log(densidad)
+    if con_termino_del_prior:
+        integrando = integrando - _log_gaussiana_isotropica(puntos, varianza_prior)
+    paso = 2.0 * medio_ancho / (nodos - 1)
+    return float((densidad * integrando).sum() * paso * paso)
+
+
+def _tolerancia_esperada(grid: QuadratureGrid, masa: float) -> float:
+    """La fórmula de la tolerancia, reescrita acá a partir de los observables de la malla.
+
+    ``paso_relativo · (paso_relativo + |masa − 1|)`` con
+    ``paso_relativo = spacing / (2 half_width)``. Se escribe en el test para que una tolerancia
+    elegida a mano —una constante, o cualquier cosa que no dependa de la malla y de la masa— no
+    pueda pasar.
+    """
+    paso_relativo = grid.spacing / (2.0 * grid.half_width)
+    return paso_relativo * (paso_relativo + abs(masa - 1.0))
+
+
+def _medias_contraidas(
+    oraculo: MixtureOracle, mixtura: ExactGaussianMixture, t: float
+) -> "torch.Tensor":
+    """``alpha_t mu_k`` reconstruidas desde los accesores públicos del oráculo."""
+    tt = torch.tensor([t], dtype=torch.float64)
+    alpha, _ = oraculo.marginal_params(tt)
+    return float(alpha[0, 0]) * torch.as_tensor(mixtura.means_, dtype=torch.float64)
+
+
+def _malla_del_sesgo(
+    oraculo: MixtureOracle,
+    mixtura: ExactGaussianMixture,
+    t: float,
+    varianza_prior: float,
+) -> QuadratureGrid:
+    """La malla que el sesgo debe usar: covarianzas **en** ``t`` y ``prior_std = sqrt(v)``."""
+    tt = torch.tensor([t], dtype=torch.float64)
+    return auto_grid(
+        means=_medias_contraidas(oraculo, mixtura, t),
+        covariances=oraculo.component_covariances(tt)[0],
+        prior_std=math.sqrt(varianza_prior),
+    )
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_el_valor_de_referencia_coincide_con_una_cuadratura_independiente(nombre: str):
+    """Criterio 6.2: el valor es ``∫ p_T (log p_T − log q)``, contra una cuadratura aparte.
+
+    La referencia usa su propia malla (más ancha y más fina que la automática), su propia suma
+    de Riemann y la mixtura sumada en el dominio lineal, así que coincidir a ``rel=1e-9`` es una
+    verificación cruzada y no una tautología. La tolerancia del test es holgada respecto del
+    acuerdo observado (``5e-12`` en el peor caso) y órdenes de magnitud más fina que cualquier
+    error estructural: olvidar el término del prior, no contraer las medias o no propagar las
+    covarianzas cambia el número por completo.
+    """
+    mixtura = _mixtura_exacta()
+    varianza = _VARIANZA_DEL_PRIOR[nombre]
+    oraculo = MixtureOracle(mixtura, make_sde(nombre))
+
+    reporte = oraculo.initialization_bias(varianza, t=1.0)
+
+    assert reporte.value == pytest.approx(
+        _kl_por_cuadratura_independiente(nombre, 1.0, mixtura, varianza), rel=1e-9
+    )
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+@pytest.mark.parametrize("valor", [0.5, 1.0])
+def test_la_cota_domina_al_valor_de_referencia_y_ambos_son_no_negativos(
+    nombre: str, valor: float
+):
+    """Criterios 6.3 y 6.6: ``bound >= value >= 0`` en las tres SDEs.
+
+    Es la validación mutua de las dos mitades del reporte: la cota por convexidad sale de la
+    aritmética de los parámetros y el valor de una cuadratura, así que dominar es una propiedad
+    matemática que ninguna de las dos implementaciones puede fingir. En la mixtura de prueba la
+    cota queda entre ``1.2`` y ``3.6`` veces el valor, así que la desigualdad tiene margen y no
+    se apoya en el redondeo.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde(nombre))
+
+    reporte = oraculo.initialization_bias(_VARIANZA_DEL_PRIOR[nombre], t=valor)
+
+    assert reporte.value >= 0.0
+    assert math.isfinite(reporte.value)
+    assert reporte.bound >= reporte.value
+
+
+@pytest.mark.parametrize("nombre", _SDES_ESCALARES)
+def test_con_una_sola_componente_la_cota_y_el_valor_coinciden(nombre: str):
+    """Criterio 6.4: con ``K = 1`` la desigualdad de convexidad se satura.
+
+    Chequeo barato de consistencia entre las dos mitades del reporte —la tendencia completa
+    frente al horizonte es otro trabajo—: sin entropía de mezcla que acotar, la cota **es** la
+    divergencia, así que la diferencia entre las dos debe caber en la tolerancia que el propio
+    reporte declara (medida: ``5e-18``, contra una tolerancia del orden de ``1e-4``).
+    """
+    oraculo = MixtureOracle(_mixtura_de_una_componente(), make_sde(nombre))
+
+    reporte = oraculo.initialization_bias(_VARIANZA_DEL_PRIOR[nombre], t=1.0)
+
+    assert abs(reporte.bound - reporte.value) <= reporte.tolerance
+
+
+def test_el_valor_de_referencia_incluye_el_termino_de_la_distribucion_de_partida():
+    """El integrando es ``p (log p − log q)``, no ``p log p``.
+
+    Sin el término del prior lo que se integra es **menos la entropía**, que para esta mixtura
+    da ``-2.84`` frente a una divergencia de ``2.6e-5``: no solo cambia de escala, cambia de
+    signo. El test fija las dos caras, así que la versión que se olvida de ``log q`` no puede
+    satisfacer los dos asserts a la vez.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    con_prior = _kl_por_cuadratura_independiente("vp", 1.0, mixtura, 1.0)
+    sin_prior = _kl_por_cuadratura_independiente(
+        "vp", 1.0, mixtura, 1.0, con_termino_del_prior=False
+    )
+
+    reporte = oraculo.initialization_bias(1.0, t=1.0)
+
+    assert sin_prior < 0.0 < con_prior
+    assert reporte.value == pytest.approx(con_prior, rel=1e-9)
+
+
+def test_la_malla_del_valor_cubre_tambien_la_distribucion_de_partida():
+    """El dominio se amplía con ``prior_std = sqrt(prior_variance)``, no con la varianza.
+
+    Con una varianza de partida de ``100`` el desvío es ``10``: la malla correcta cubre
+    ``±80`` con 960 nodos, mientras que pasarle la varianza sin raíz pediría ``±800`` y se
+    chocaría contra el tope de puntos. Las dos mallas dejan tolerancias que se separan por un
+    factor de casi cuatro, así que el reporte delata cuál se usó.
+    """
+    varianza = 100.0
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    tt = torch.tensor([1.0], dtype=torch.float64)
+    medias = _medias_contraidas(oraculo, mixtura, 1.0)
+    covarianzas = oraculo.component_covariances(tt)[0]
+    con_raiz = auto_grid(
+        means=medias, covariances=covarianzas, prior_std=math.sqrt(varianza)
+    )
+    sin_raiz = auto_grid(means=medias, covariances=covarianzas, prior_std=varianza)
+
+    reporte = oraculo.initialization_bias(varianza, t=1.0)
+
+    assert not con_raiz.truncated
+    assert sin_raiz.truncated
+    assert reporte.tolerance == pytest.approx(
+        _tolerancia_esperada(con_raiz, reporte.mass), rel=1e-12
+    )
+    assert reporte.tolerance != pytest.approx(
+        _tolerancia_esperada(sin_raiz, reporte.mass), rel=1e-3
+    )
+
+
+def test_la_malla_del_valor_se_dimensiona_con_las_covarianzas_en_el_tiempo():
+    """La malla sale de ``Sigma_k(t)``, no de las covarianzas de los datos.
+
+    Con VE en el horizonte el ruido del kernel aporta ``sigma_T² = 25``: la malla correcta se
+    resuelve con 103 nodos, mientras que dimensionarla con las covarianzas sin propagar pediría
+    2401. La tolerancia reportada distingue los dos casos por más de un orden de magnitud.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("ve"))
+    tt = torch.tensor([1.0], dtype=torch.float64)
+    medias = _medias_contraidas(oraculo, mixtura, 1.0)
+    en_el_tiempo = auto_grid(
+        means=medias,
+        covariances=oraculo.component_covariances(tt)[0],
+        prior_std=5.0,
+    )
+    sin_propagar = auto_grid(
+        means=medias,
+        covariances=torch.as_tensor(mixtura.covariances_, dtype=torch.float64),
+        prior_std=5.0,
+    )
+
+    reporte = oraculo.initialization_bias(25.0, t=1.0)
+
+    assert sin_propagar.n_points > 10 * en_el_tiempo.n_points
+    assert reporte.tolerance == pytest.approx(
+        _tolerancia_esperada(en_el_tiempo, reporte.mass), rel=1e-12
+    )
+
+
+def test_el_reporte_trae_las_seis_cantidades_con_numeros_reales():
+    """Criterio 6.2: el reporte publica cota, valor, tolerancia, masa, prior y horizonte.
+
+    Ninguna viaja vacía: el valor de referencia ya no es una promesa, y la masa integrada y la
+    tolerancia son el diagnóstico que lo hace utilizable.
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("ve"))
+
+    reporte = oraculo.initialization_bias(25.0, t=1.0)
+
+    assert isinstance(reporte, BiasReport)
+    for nombre_campo in ("bound", "value", "tolerance", "mass", "prior_variance", "horizon"):
+        medida = getattr(reporte, nombre_campo)
+        assert isinstance(medida, float)
+        assert math.isfinite(medida)
+    assert reporte.mass == pytest.approx(1.0, abs=1e-8)
+    assert reporte.tolerance > 0.0
+    assert reporte.prior_variance == pytest.approx(25.0)
+    assert reporte.horizon == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("nombre", "escala"), [("vp", 0.25), ("ve", 1.0), ("sub_vp", 4.0)]
+)
+def test_el_valor_de_referencia_es_cero_cuando_las_distribuciones_coinciden(
+    nombre: str, escala: float
+):
+    """Criterio 6.6: el valor se anula —sin irse a negativo— cuando ``p_T`` **es** el prior.
+
+    El caso degenerado se construye a propósito: una sola componente centrada en el origen y
+    una varianza de partida igual a la propagada ``alpha_T² escala + sigma_T²``, de modo que
+    ``p_T`` y la distribución de partida sean **la misma** gaussiana y la divergencia sea
+    exactamente cero. Ahí el integrando es una cancelación entre dos log-densidades escritas con
+    fórmulas distintas, así que la cuadratura devuelve ruido de redondeo con signo arbitrario: en
+    estas tres combinaciones sale **negativo** (del orden de ``-1e-16``), y publicarlo sería
+    reportar una divergencia imposible que además el propio reporte rechazaría.
+    """
+    centrada = ExactGaussianMixture(
+        2,
+        weights=[1.0],
+        means=[[0.0, 0.0]],
+        covariances=[_identidad(escala).tolist()],
+        seed=0,
+    )
+    oraculo = MixtureOracle(centrada, make_sde(nombre))
+    tt = torch.tensor([1.0], dtype=torch.float64)
+    alpha, sigma = oraculo.marginal_params(tt)
+    varianza = float(alpha[0, 0]) ** 2 * escala + float(sigma[0, 0]) ** 2
+
+    reporte = oraculo.initialization_bias(varianza, t=1.0)
+
+    assert reporte.value >= 0.0
+    assert reporte.value < 1e-12
+
+
+def test_el_valor_de_referencia_honra_la_malla_explicita():
+    """La malla explícita se usa tal cual, con la misma convención que la masa integrada.
+
+    Se le pasa una malla más fina que la automática: el valor tiene que coincidir con el
+    automático (las dos mallas alcanzan, y la suma de Riemann sobre gaussianas converge
+    espectralmente) pero la tolerancia declarada tiene que **bajar**, que es lo que delata que
+    el argumento se usó y no se ignoró.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    automatica = _malla_del_sesgo(oraculo, mixtura, 1.0, 1.0)
+    fina = QuadratureGrid(
+        half_width=automatica.half_width, n_points=4 * automatica.n_points
+    )
+
+    por_defecto = oraculo.initialization_bias(1.0, t=1.0)
+    explicita = oraculo.initialization_bias(1.0, t=1.0, grid=fina)
+
+    assert explicita.value == pytest.approx(por_defecto.value, rel=1e-9)
+    assert explicita.tolerance < por_defecto.tolerance / 10.0
+    assert explicita.tolerance == pytest.approx(
+        _tolerancia_esperada(fina, explicita.mass), rel=1e-12
+    )
+
+
+def test_la_tolerancia_del_valor_se_afina_al_refinar_la_malla():
+    """La tolerancia es un número **computado** sobre la malla, no una constante elegida a mano.
+
+    Al duplicar la resolución cae por un factor de cuatro —es de segundo orden en el paso—, así
+    que una constante no puede reproducir la secuencia. Se compara además contra la fórmula
+    reescrita en el test a partir del paso y de la masa reportada.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("vp"))
+    automatica = _malla_del_sesgo(oraculo, mixtura, 1.0, 1.0)
+    tolerancias = []
+    for factor in (1, 2, 4):
+        malla = QuadratureGrid(
+            half_width=automatica.half_width,
+            n_points=factor * (automatica.n_points - 1) + 1,
+        )
+        reporte = oraculo.initialization_bias(1.0, t=1.0, grid=malla)
+        assert reporte.tolerance == pytest.approx(
+            _tolerancia_esperada(malla, reporte.mass), rel=1e-12
+        )
+        tolerancias.append(reporte.tolerance)
+
+    assert tolerancias[1] == pytest.approx(tolerancias[0] / 4.0, rel=1e-6)
+    assert tolerancias[2] == pytest.approx(tolerancias[0] / 16.0, rel=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("medio_ancho", "nodos"), [(0.5, 8), (2.0, 32), (20.0, 64)]
+)
+def test_una_malla_insuficiente_falla_en_lugar_de_devolver_un_numero(
+    medio_ancho: float, nodos: int
+):
+    """La masa es el autochequeo: si se aparta de uno más allá de la tolerancia, se levanta.
+
+    Un valor de referencia calculado sobre una malla que no cubre la densidad es peor que
+    ninguno, porque viaja con la misma pinta que uno bueno. Los tres casos cubren el rango: un
+    dominio diminuto (masa ``0.004``), uno que corta la mixtura por la mitad (masa ``0.68``) y
+    uno amplio pero demasiado grueso (masa ``1.0015``, que ya excede lo que una malla de esa
+    resolución debería producir).
+    """
+    oraculo = MixtureOracle(_mixtura_exacta(), make_sde("vp"))
+    malla = QuadratureGrid(half_width=medio_ancho, n_points=nodos)
+
+    with pytest.raises(ValueError, match=r"^la masa integrada"):
+        oraculo.initialization_bias(1.0, t=0.1, grid=malla)
+
+
+def test_la_masa_reportada_es_la_de_la_misma_malla_que_el_valor():
+    """La masa publicada es el autochequeo **de esa** cuadratura, no de otra malla.
+
+    Se compara contra ``total_mass`` sobre la misma malla explícita, y **bit a bit**: la
+    cuadratura es determinística, así que la misma malla tiene que dar el mismo número exacto.
+    La comparación exacta es lo que le da dientes al test — dos mallas suficientes dan masa uno
+    dentro del redondeo (acá ``0.9999999999999987`` contra ``1.0000000000000004``), así que
+    cualquier tolerancia razonable dejaría pasar un reporte que integrara la masa en la malla
+    automática mientras el valor sale de la explícita.
+    """
+    mixtura = _mixtura_exacta()
+    oraculo = MixtureOracle(mixtura, make_sde("sub_vp"))
+    automatica = _malla_del_sesgo(oraculo, mixtura, 1.0, 1.0)
+    fina = QuadratureGrid(
+        half_width=1.5 * automatica.half_width, n_points=2 * automatica.n_points
+    )
+
+    reporte = oraculo.initialization_bias(1.0, t=1.0, grid=fina)
+
+    assert oraculo.total_mass(1.0, grid=automatica) != oraculo.total_mass(1.0, grid=fina)
+    assert reporte.mass == oraculo.total_mass(1.0, grid=fina)
