@@ -1641,3 +1641,64 @@ def test_sample_pasa_t_en_el_device_de_x():
     make_sampler("euler", sde, spy, n_steps=5).sample(B, generator=torch.Generator().manual_seed(0))
 
     assert vistos and all(xd == td for xd, td in vistos)
+
+
+# --------------------------------------------------------------- denoise final (Tweedie)
+
+
+def test_sample_denoise_true_is_default_and_matches_tweedie():
+    """`denoise=True` (default) aplica el paso final de Tweedie ``E[x_0|x_{t_eps}]``;
+    `denoise=False` devuelve el estado crudo en ``t_eps``. Verifica la fórmula exacta."""
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=2)
+    n = 64
+    init = torch.randn(n, 2, generator=torch.Generator().manual_seed(0))
+    s = make_sampler("pf_ode", sde, _linear_score, n_steps=50)  # determinístico dado init
+
+    raw = s.sample(n, init=init, denoise=False)
+    default = s.sample(n, init=init)  # denoise=True por default
+    den = s.sample(n, init=init, denoise=True)
+
+    assert raw.shape == den.shape == (n, 2)
+    assert torch.all(torch.isfinite(den))
+    assert torch.equal(default, den)  # el default ES denoise=True
+    assert not torch.equal(raw, den)  # el denoise cambió la salida (quitó el último ruido)
+
+    # Fórmula exacta de Tweedie contra el estado crudo en t_eps: (x + σ_t² s) / α_t.
+    t_eps_b = torch.full((n, 1), s.t_eps)
+    alpha, std = sde.marginal_prob(torch.ones(n, 2), t_eps_b)
+    expected = (raw + std ** 2 * _linear_score(raw, t_eps_b)) / alpha
+    assert torch.allclose(den, expected, atol=1e-6)
+
+
+def test_sample_denoise_keeps_trajectory_last_equals_x0():
+    """Con `return_trajectory`, la última capa sigue siendo el ``x_0`` devuelto (post-denoise)."""
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=2)
+    n, n_steps = 8, 20
+    s = make_sampler("euler", sde, _zero_score, n_steps=n_steps)
+    gen = torch.Generator().manual_seed(0)
+    x0, traj = s.sample(n, generator=gen, return_trajectory=True)
+
+    assert traj.shape == (n_steps + 1, n, 2)  # el denoise no agrega una capa extra
+    assert torch.equal(traj[-1], x0)           # invariante preservado bajo denoise
+
+
+def test_sample_denoise_ve_uses_unit_alpha():
+    """Para VE (``α_t = 1``) el denoise es ``x + σ_t² s`` (sin dividir)."""
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("ve", data_dim=2)
+    n = 32
+    init = torch.randn(n, 2, generator=torch.Generator().manual_seed(0))
+    s = make_sampler("pf_ode", sde, _linear_score, n_steps=50)
+
+    raw = s.sample(n, init=init, denoise=False)
+    den = s.sample(n, init=init, denoise=True)
+
+    t_eps_b = torch.full((n, 1), s.t_eps)
+    _, std = sde.marginal_prob(torch.ones(n, 2), t_eps_b)
+    expected = raw + std ** 2 * _linear_score(raw, t_eps_b)  # α_t = 1 en VE
+    assert torch.allclose(den, expected, atol=1e-6)

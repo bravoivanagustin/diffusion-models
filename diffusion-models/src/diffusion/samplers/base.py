@@ -119,6 +119,7 @@ class ReverseSampler(abc.ABC):
         generator: torch.Generator | None = None,
         device: torch.device | str | None = None,
         return_trajectory: bool = False,
+        denoise: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Integra el proceso reverso de ``T`` a ``t_eps`` y devuelve las muestras ``x_0``.
 
@@ -147,12 +148,18 @@ class ReverseSampler(abc.ABC):
                 grilla temporal y el score se computan en el device de ``x``, así que con la red en
                 GPU el sampleo corre en GPU. ``None`` (default) = CPU, camino idéntico al previo.
             return_trajectory: Si es ``True``, devuelve además la trayectoria completa.
+            denoise: Si es ``True`` (default), aplica un paso final de *denoising* de Tweedie
+                en ``t_eps`` —``E[x_0 | x_{t_eps}] = (x + σ_t² s) / α_t``— que quita el último
+                ruido residual ``σ_{t_eps}`` y devuelve la estimación limpia del dato en vez
+                del estado crudo en ``t_eps``. Con ``False`` devuelve el estado crudo.
 
         Returns:
-            El estado final ``x_0`` de shape ``(n_samples, *sde.data_shape)`` en ``float32``.
-            Si ``return_trajectory`` es ``True``, una tupla ``(x_0, trayectoria)`` donde la
-            trayectoria tiene shape ``(n_steps + 1, n_samples, *sde.data_shape)`` e incluye el
-            estado inicial ``x_T`` (capa ``0``) y cada estado intermedio.
+            El estado final ``x_0`` de shape ``(n_samples, *sde.data_shape)`` en ``float32``
+            (con ``denoise=True``, la estimación de Tweedie del dato; con ``False``, el estado
+            crudo en ``t_eps``). Si ``return_trajectory`` es ``True``, una tupla
+            ``(x_0, trayectoria)`` donde la trayectoria tiene shape
+            ``(n_steps + 1, n_samples, *sde.data_shape)`` e incluye el estado inicial ``x_T``
+            (capa ``0``) y cada estado intermedio; su última capa coincide con ``x_0``.
         """
         if init is None:
             x = self.sde.prior_sampling(
@@ -178,6 +185,14 @@ class ReverseSampler(abc.ABC):
             x = self.step(x, t_batch, dt, generator=generator)
             if return_trajectory:
                 trajectory.append(x.clone())
+
+        # Paso final de denoising (Tweedie) en t_eps: estima E[x_0 | x_{t_eps}] y quita el
+        # último ruido residual σ_{t_eps}. La última capa de la trayectoria queda en esta
+        # estimación limpia, preservando el invariante trajectory[-1] == x_0.
+        if denoise:
+            x = self._denoise(x, grid[-1].expand(n_samples, 1))
+            if return_trajectory:
+                trajectory[-1] = x.clone()
 
         if return_trajectory:
             return x, torch.stack(trajectory, dim=0)
@@ -225,6 +240,31 @@ class ReverseSampler(abc.ABC):
         f, g = self.sde.sde(x, t)
         s = self.score_fn(x, t)
         return f - 0.5 * (g ** 2) * s
+
+    def _denoise(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Paso final de *denoising* de Tweedie: estima ``E[x_0 | x_t]`` en ``t_eps``.
+
+        Para el kernel escalar-gaussiano ``x_t = α_t x_0 + σ_t ε`` con ``s ≈ ∇_x log p_t``,
+        el estimador de la media posterior del dato es
+
+            ``E[x_0 | x_t] = (x_t + σ_t² · s) / α_t``,
+
+        que quita el último ruido residual ``σ_{t_eps}`` (VP/sub-VP dividen por ``α_t``; VE
+        tiene ``α_t = 1``, así que solo suma ``σ_t² s``). Los coeficientes ``(α_t, σ_t)`` salen
+        de :meth:`ForwardSDE.marginal_prob` evaluada en ``x_0 = 1``; el denominador se acota
+        por debajo (``_std_eps``) por robustez, aunque en ``t_eps`` ``α_t ≈ 1``.
+
+        Args:
+            x: Estado ``x_{t_eps}`` de shape ``(B, *E)``.
+            t: Tiempo ``t_eps`` de shape ``(B,)`` o ``(B, 1)``.
+
+        Returns:
+            La estimación limpia del dato ``x_0`` de shape ``(B, *E)``.
+        """
+        t = self._expand_t(t)
+        mean_coef, std = self.sde.marginal_prob(torch.ones_like(x), t)  # α_t, σ_t
+        s = self.score_fn(x, t)
+        return (x + std ** 2 * s) / mean_coef.clamp_min(self.sde._std_eps)
 
     # ----------------------------------------------------------------- internos
 
