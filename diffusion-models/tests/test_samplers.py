@@ -1702,3 +1702,208 @@ def test_sample_denoise_ve_uses_unit_alpha():
     _, std = sde.marginal_prob(torch.ones(n, 2), t_eps_b)
     expected = raw + std ** 2 * _linear_score(raw, t_eps_b)  # α_t = 1 en VE
     assert torch.allclose(den, expected, atol=1e-6)
+
+
+# --------------------------------------------------- grilla temporal configurable (time_grid)
+#
+# La distribución de los tiempos de integración es una elección numérica del Eje 2 (no
+# reentrena). El default `uniform` debe quedar byte-idéntico a la fórmula previa, y `logsnr`
+# se valida contra la forma cerrada de VP: λ(t) = -log(expm1(B(t))) con
+# B(t) = β_min t + ½(β_max - β_min) t², invertida analíticamente.
+
+from diffusion.samplers import available_time_grids, make_time_grid
+
+
+def _vp_logsnr_grid_closed_form(n_steps, t_min, t_max, b_min=0.1, b_max=20.0):
+    """Grilla λ-uniforme de VP por forma cerrada (referencia independiente del código)."""
+    import numpy as np
+
+    b_int = lambda t: b_min * t + 0.5 * (b_max - b_min) * t ** 2
+    lam = lambda t: -np.log(np.expm1(b_int(t)))
+    t_of = lambda l: (
+        -b_min + np.sqrt(b_min ** 2 + 2 * (b_max - b_min) * np.logaddexp(0.0, -l))
+    ) / (b_max - b_min)
+    lams = np.linspace(lam(t_max), lam(t_min), n_steps + 1)
+    return torch.from_numpy(t_of(lams)).float()
+
+
+def test_available_time_grids_lists_registered_names():
+    assert available_time_grids() == ["logsnr", "uniform"]
+
+
+@pytest.mark.parametrize("n_steps", [1, 7, 500])
+def test_uniform_grid_is_byte_identical_to_linspace(n_steps):
+    """Retrocompatibilidad: el default reproduce exactamente la grilla previa al cambio."""
+    sde = make_sde("vp")
+    s = _NoOpSampler(sde, _zero_score, n_steps=n_steps, t_eps=1e-3)
+    previous = torch.linspace(sde.T, 1e-3, n_steps + 1, dtype=torch.float32)
+    assert torch.equal(s._time_grid(), previous)
+
+
+def test_uniform_is_the_default_time_grid():
+    sde = make_sde("vp")
+    default = _NoOpSampler(sde, _zero_score, n_steps=16)
+    explicit = _NoOpSampler(sde, _zero_score, n_steps=16, time_grid="uniform")
+    assert torch.equal(default._time_grid(), explicit._time_grid())
+
+
+@pytest.mark.parametrize("n_steps", [10, 100])
+def test_logsnr_grid_matches_vp_closed_form(n_steps):
+    """`logsnr` (bisección sobre marginal_prob) == la inversa analítica de λ en VP."""
+    sde = make_sde("vp")
+    s = _NoOpSampler(sde, _zero_score, n_steps=n_steps, t_eps=1e-3, time_grid="logsnr")
+    expected = _vp_logsnr_grid_closed_form(n_steps, 1e-3, sde.T)
+    assert torch.allclose(s._time_grid(), expected, atol=1e-4)
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "ve", "sub_vp"])
+def test_logsnr_grid_contract_per_sde(sde_name):
+    """Extremos exactos, largo y monotonía estricta para las 3 SDEs del Eje 1."""
+    sde = make_sde(sde_name)
+    n_steps, t_eps = 32, 1e-3
+    grid = _NoOpSampler(
+        sde, _zero_score, n_steps=n_steps, t_eps=t_eps, time_grid="logsnr"
+    )._time_grid()
+    assert grid.shape == (n_steps + 1,)
+    assert grid.dtype == torch.float32
+    assert float(grid[0]) == pytest.approx(sde.T)
+    assert float(grid[-1]) == pytest.approx(t_eps)
+    assert bool((grid[1:] < grid[:-1]).all())
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "ve", "sub_vp"])
+def test_logsnr_grid_is_equispaced_in_log_snr(sde_name):
+    """El invariante que define la grilla: λ queda equiespaciado."""
+    sde = make_sde(sde_name)
+    tg = make_time_grid("logsnr", sde, 1e-3)
+    lam = tg._log_snr(tg.grid(50))
+    deltas = lam[1:] - lam[:-1]
+    # Coeficiente de variación ~0: todos los saltos de λ son iguales (límite float32).
+    assert float(deltas.std() / deltas.mean().abs()) < 1e-2
+
+
+def test_logsnr_equals_uniform_for_ve():
+    """En VE, σ_t geométrico ⟹ λ lineal en t ⟹ λ-uniforme coincide con t-uniforme."""
+    sde = make_sde("ve")
+    n_steps = 40
+    logsnr = _NoOpSampler(
+        sde, _zero_score, n_steps=n_steps, t_eps=1e-3, time_grid="logsnr"
+    )._time_grid()
+    uniform = _NoOpSampler(
+        sde, _zero_score, n_steps=n_steps, t_eps=1e-3, time_grid="uniform"
+    )._time_grid()
+    assert torch.allclose(logsnr, uniform, atol=1e-4)
+
+
+@pytest.mark.parametrize("sde_name", ["vp", "sub_vp"])
+def test_logsnr_differs_from_uniform_for_vp_family(sde_name):
+    """En VP/sub-VP sí cambia la grilla (y concentra pasos en t chico)."""
+    sde = make_sde(sde_name)
+    logsnr = _NoOpSampler(
+        sde, _zero_score, n_steps=40, t_eps=1e-3, time_grid="logsnr"
+    )._time_grid()
+    uniform = _NoOpSampler(
+        sde, _zero_score, n_steps=40, t_eps=1e-3, time_grid="uniform"
+    )._time_grid()
+    assert not torch.allclose(logsnr, uniform, atol=1e-3)
+    # Más de la mitad de los pasos por debajo del punto medio de la grilla uniforme.
+    assert int((logsnr < 0.5).sum()) > int((uniform < 0.5).sum())
+
+
+def test_callable_time_grid_is_accepted_and_used():
+    """El escape hatch: un callable (n_steps, t_min, t_max) propio gobierna la grilla."""
+
+    def quadratic(n_steps, t_min, t_max):
+        u = torch.linspace(0.0, 1.0, n_steps + 1)
+        return t_max + (t_min - t_max) * u ** 2
+
+    sde = make_sde("vp")
+    s = _NoOpSampler(sde, _zero_score, n_steps=12, t_eps=1e-3, time_grid=quadratic)
+    grid = s._time_grid()
+    assert torch.allclose(grid, quadratic(12, 1e-3, sde.T), atol=1e-6)
+    assert not torch.allclose(grid, torch.linspace(sde.T, 1e-3, 13), atol=1e-3)
+
+
+def test_callable_time_grid_accepts_numpy_output():
+    np = pytest.importorskip("numpy")
+
+    def np_grid(n_steps, t_min, t_max):
+        return np.linspace(t_max, t_min, n_steps + 1)
+
+    sde = make_sde("vp")
+    grid = _NoOpSampler(
+        sde, _zero_score, n_steps=6, t_eps=1e-3, time_grid=np_grid
+    )._time_grid()
+    assert grid.dtype == torch.float32
+    assert grid.shape == (7,)
+
+
+def test_unknown_time_grid_name_raises_listing_options():
+    sde = make_sde("vp")
+    with pytest.raises(ValueError, match="Grilla temporal desconocida"):
+        _NoOpSampler(sde, _zero_score, time_grid="karras")
+
+
+def test_time_grid_rejects_non_str_non_callable():
+    sde = make_sde("vp")
+    with pytest.raises(ValueError, match="nombre de una grilla registrada o un callable"):
+        _NoOpSampler(sde, _zero_score, time_grid=123)
+
+
+@pytest.mark.parametrize(
+    "bad_fn, match",
+    [
+        (lambda n, a, b: torch.linspace(b, a, n + 5), r"n_steps \+ 1"),
+        (lambda n, a, b: torch.linspace(a, b, n + 1), "decreciente"),
+        (lambda n, a, b: torch.full((n + 1,), float("nan")), "no finitos"),
+        (lambda n, a, b: torch.linspace(0.5, a, n + 1), "de T="),
+    ],
+)
+def test_callable_time_grid_validates_output(bad_fn, match):
+    """Una grilla mal formada falla con mensaje claro, no rompe la integración."""
+    sde = make_sde("vp")
+    s = _NoOpSampler(sde, _zero_score, n_steps=5, t_eps=1e-3, time_grid=bad_fn)
+    with pytest.raises(ValueError, match=match):
+        s._time_grid()
+
+
+@pytest.mark.parametrize("sampler_name", ["euler", "pf_ode", "heun", "pc"])
+def test_all_samplers_accept_time_grid_via_factory(sampler_name):
+    """make_sampler propaga time_grid a los 4 samplers (incl. `pc`, que define su __init__)."""
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    s = make_sampler(
+        sampler_name, sde, _linear_score, n_steps=8, t_eps=1e-3, time_grid="logsnr"
+    )
+    assert s.time_grid.name == "logsnr"
+    expected = _vp_logsnr_grid_closed_form(8, 1e-3, sde.T)
+    assert torch.allclose(s._time_grid(), expected, atol=1e-4)
+    x0 = s.sample(4, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (4, 2)
+    assert bool(torch.isfinite(x0).all())
+
+
+def test_time_grid_changes_samples_but_not_shape():
+    """Cambiar la grilla cambia el resultado numérico sin tocar el contrato de salida."""
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp")
+    init = sde.prior_sampling((8, 2), generator=torch.Generator().manual_seed(0))
+    a = make_sampler("pf_ode", sde, _linear_score, n_steps=10).sample(8, init=init)
+    b = make_sampler(
+        "pf_ode", sde, _linear_score, n_steps=10, time_grid="logsnr"
+    ).sample(8, init=init)
+    assert a.shape == b.shape == (8, 2)
+    assert not torch.equal(a, b)
+
+
+def test_logsnr_grid_works_on_image_event_shape():
+    """La grilla es independiente de la geometría del dato: anda en (B, C, H, W)."""
+    from diffusion.samplers import make_sampler
+
+    sde = make_sde("vp", data_dim=(3, 8, 8))
+    s = make_sampler("heun", sde, _linear_score, n_steps=6, time_grid="logsnr")
+    x0 = s.sample(2, generator=torch.Generator().manual_seed(0))
+    assert x0.shape == (2, 3, 8, 8)
+    assert bool(torch.isfinite(x0).all())

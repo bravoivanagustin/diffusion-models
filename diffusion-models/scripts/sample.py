@@ -25,7 +25,11 @@ _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from diffusion.samplers import available_samplers, generate_from_checkpoint
+from diffusion.samplers import (
+    available_samplers,
+    available_time_grids,
+    generate_from_checkpoint,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Cantidad de muestras a generar.")
     p.add_argument("--n-steps", dest="n_steps", type=int, default=500,
                    help="Cantidad de pasos de integración del sampler.")
+    p.add_argument("--t-eps", dest="t_eps", type=float, default=None,
+                   help="Tiempo terminal de la integración (0 < t_eps < T); default del "
+                        "sampler: 1e-3. Conviene no bajarlo del t_eps de entrenamiento.")
+    p.add_argument("--time-grid", dest="time_grid", type=str, default=None,
+                   choices=available_time_grids(),
+                   help="Distribución de los tiempos de integración: 'uniform' (default, "
+                        "espaciado constante en t) o 'logsnr' (constante en log-SNR).")
     p.add_argument("--seed", type=int, default=None,
                    help="Semilla para reproducibilidad (prior y pasos estocásticos).")
     p.add_argument("--out", type=str, default=None,
@@ -69,6 +80,10 @@ def main(argv=None) -> int:
     # Solo reenviar los kwargs del sampler que el usuario haya provisto; el factory descarta
     # los que no apliquen al sampler elegido (criterio 4.4).
     sampler_kwargs = {}
+    if args.t_eps is not None:
+        sampler_kwargs["t_eps"] = args.t_eps
+    if args.time_grid is not None:
+        sampler_kwargs["time_grid"] = args.time_grid
     if args.snr is not None:
         sampler_kwargs["snr"] = args.snr
     if args.n_corrector is not None:

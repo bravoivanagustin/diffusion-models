@@ -30,6 +30,7 @@ import math
 import torch
 
 from .base import ReverseSampler, ScoreFn
+from .time_grid import TimeGridFn
 from diffusion.sde import ForwardSDE
 
 #: Piso del denominador ``‖s‖`` en la fórmula del paso ``ε`` (espíritu de ``sde._std_eps``):
@@ -64,6 +65,7 @@ class PredictorCorrector(ReverseSampler):
         *,
         n_steps: int = 500,
         t_eps: float = 1e-3,
+        time_grid: str | TimeGridFn = "uniform",
         n_corrector: int = 1,
         snr: float = 0.16,
     ) -> None:
@@ -75,6 +77,9 @@ class PredictorCorrector(ReverseSampler):
             score_fn: Función pura ``(x, t) -> score`` que aproxima ``∇_x log p_t(x)``.
             n_steps: Número de pasos (intervalos) de integración; ``>= 1``.
             t_eps: Tiempo terminal de la integración, un piso ``> 0`` con ``0 < t_eps < sde.T``.
+            time_grid: Distribución de los tiempos de la grilla (``"uniform"`` por default,
+                ``"logsnr"``, o un callable propio); ver
+                :mod:`diffusion.samplers.time_grid`. Se reenvía a la base.
             n_corrector: Número de correcciones de Langevin por paso (``>= 0``); con ``0`` el
                 paso se reduce al predictor de Euler–Maruyama.
             snr: Target de *signal-to-noise ratio* que fija el tamaño de paso ``ε`` del
@@ -84,7 +89,9 @@ class PredictorCorrector(ReverseSampler):
             ValueError: Si ``n_steps < 1``, ``t_eps`` cae fuera de ``(0, sde.T)`` o
                 ``n_corrector < 0``.
         """
-        super().__init__(sde, score_fn, n_steps=n_steps, t_eps=t_eps)
+        super().__init__(
+            sde, score_fn, n_steps=n_steps, t_eps=t_eps, time_grid=time_grid
+        )
         if n_corrector < 0:
             raise ValueError(
                 f"n_corrector debe ser >= 0; recibí n_corrector={n_corrector}"

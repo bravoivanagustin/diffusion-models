@@ -27,6 +27,8 @@ import torch
 
 from diffusion.sde import ForwardSDE
 
+from .time_grid import TimeGridFn, make_time_grid
+
 #: Contrato de inyección del score: ``(x: (B, *E), t: (B,) | (B,1)) -> (B, *E)`` para
 #: cualquier forma de evento ``E`` (``(2,)`` en el toy 2D, ``(C, H, W)`` en imágenes).
 #: Tanto una :class:`diffusion.models.ScoreMLP` entrenada como un score analítico en forma
@@ -55,6 +57,7 @@ class ReverseSampler(abc.ABC):
         *,
         n_steps: int = 500,
         t_eps: float = 1e-3,
+        time_grid: str | TimeGridFn = "uniform",
     ) -> None:
         """Inicializa el sampler.
 
@@ -65,9 +68,16 @@ class ReverseSampler(abc.ABC):
             n_steps: Número de pasos (intervalos) de integración; ``>= 1``.
             t_eps: Tiempo terminal de la integración, un piso ``> 0`` que evita integrar
                 hasta ``t = 0`` exacto; debe cumplir ``0 < t_eps < sde.T``.
+            time_grid: Cómo se distribuyen los tiempos de la grilla entre ``T`` y ``t_eps``
+                (ver :mod:`diffusion.samplers.time_grid`). Nombre registrado —``"uniform"``
+                (default, espaciado constante en ``t``, idéntico al comportamiento previo) o
+                ``"logsnr"`` (espaciado constante en el log-SNR)— **o** un callable propio
+                ``(n_steps, t_min, t_max) -> (n_steps + 1,)`` decreciente. Es una elección
+                puramente numérica: **no** obliga a reentrenar (Eje 2).
 
         Raises:
-            ValueError: Si ``n_steps < 1`` o ``t_eps`` cae fuera de ``(0, sde.T)``.
+            ValueError: Si ``n_steps < 1``, si ``t_eps`` cae fuera de ``(0, sde.T)``, o si
+                ``time_grid`` no es un nombre registrado ni un callable.
         """
         if n_steps < 1:
             raise ValueError(f"n_steps debe ser >= 1; recibí n_steps={n_steps}")
@@ -79,6 +89,7 @@ class ReverseSampler(abc.ABC):
         self.score_fn = score_fn
         self.n_steps = int(n_steps)
         self.t_eps = float(t_eps)
+        self.time_grid = make_time_grid(time_grid, sde, self.t_eps)
 
     # --------------------------------------------------------------- a implementar
 
@@ -201,13 +212,17 @@ class ReverseSampler(abc.ABC):
     # ----------------------------------------------------------- helpers compartidos
 
     def _time_grid(self) -> torch.Tensor:
-        """Grilla temporal uniforme de ``T`` a ``t_eps``.
+        """Grilla temporal de ``T`` a ``t_eps``, según :attr:`time_grid`.
+
+        Delega en la :class:`~diffusion.samplers.time_grid.TimeGrid` construida en
+        ``__init__``. Con el default ``"uniform"`` es ``torch.linspace(T, t_eps,
+        n_steps + 1)``, idéntico al comportamiento previo a que la grilla fuese configurable.
 
         Returns:
             Tensor ``float32`` de shape ``(n_steps + 1,)``, decreciente, con extremos
             ``T`` (primero) y ``t_eps`` (último).
         """
-        return torch.linspace(self.sde.T, self.t_eps, self.n_steps + 1, dtype=torch.float32)
+        return self.time_grid.grid(self.n_steps)
 
     def _reverse_drift(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Drift de la SDE reversa ``f - g^2 s``.

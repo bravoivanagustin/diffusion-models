@@ -25,6 +25,12 @@ from .euler_maruyama import EulerMaruyama
 from .heun import HeunODE
 from .pf_ode import ProbabilityFlowODE
 from .predictor_corrector import PredictorCorrector
+from .time_grid import (
+    TimeGrid,
+    TimeGridFn,
+    available_time_grids,
+    make_time_grid,
+)
 from diffusion.sde import ForwardSDE
 
 REGISTRY: dict[str, type[ReverseSampler]] = {
@@ -52,8 +58,9 @@ def make_sampler(
         name: Clave del registry (``"euler"``, ``"pf_ode"``, ``"heun"``, ``"pc"``).
         sde: Proceso forward (Eje 1) del que el sampler deriva ``(f, g)`` y el prior.
         score_fn: Función pura ``(x, t) -> score`` que aproxima ``∇_x log p_t(x)``.
-        **kwargs: Parámetros opcionales del sampler (p. ej. ``n_steps``, ``t_eps``, y para
-            ``pc`` también ``n_corrector``/``snr``); los no aplicables se descartan.
+        **kwargs: Parámetros opcionales del sampler (p. ej. ``n_steps``, ``t_eps``,
+            ``time_grid``, y para ``pc`` también ``n_corrector``/``snr``); los no aplicables
+            se descartan.
 
     Returns:
         La instancia del sampler correspondiente.
@@ -89,4 +96,8 @@ __all__ = [
     "ProbabilityFlowODE",
     "HeunODE",
     "PredictorCorrector",
+    "TimeGrid",
+    "TimeGridFn",
+    "available_time_grids",
+    "make_time_grid",
 ]
